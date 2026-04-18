@@ -1,0 +1,68 @@
+name: Build and Push Image
+
+on:
+  push:
+    tags:
+      - 'knowledgebase/v*-dev.*'
+      - 'knowledgebase/v*-stg1.*'
+
+permissions:
+  contents: read
+
+env:
+  HARBOR_REGISTRY: ${{ vars.HARBOR_REGISTRY }}
+  HARBOR_PROJECT: ${{ vars.HARBOR_PROJECT }}
+  HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+  HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Parse tag
+        id: parse
+        run: |
+          TAG="${GITHUB_REF_NAME}"             # e.g. knowledgebase/v1.0.0-dev.0
+          VERSION="${TAG#*/}"                  # v1.0.0-dev.0
+          IMAGE_TAG="${VERSION#v}"             # 1.0.0-dev.0
+          SHORT_SHA="${GITHUB_SHA::7}"         # e.g. a3b480b
+
+          # Extract env from pre-release segment (1.0.0-dev.0 → dev)
+          PRERELEASE="${IMAGE_TAG#*-}"
+          if [ "$PRERELEASE" = "$IMAGE_TAG" ]; then
+            ENV="dev"
+          else
+            ENV="${PRERELEASE%%.*}"
+          fi
+          ENV="${ENV:-dev}"
+
+          echo "image_tag=$IMAGE_TAG"   >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA"   >> $GITHUB_OUTPUT
+          echo "env=$ENV"               >> $GITHUB_OUTPUT
+
+      - name: Login to Harbor
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.HARBOR_REGISTRY }}
+          username: ${{ env.HARBOR_USERNAME }}
+          password: ${{ env.HARBOR_PASSWORD }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: data-plane
+          file: data-plane/Dockerfile
+          push: true
+          build-args: |
+            VERSION=${{ steps.parse.outputs.image_tag }}
+            GIT_COMMIT=${{ steps.parse.outputs.short_sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+          tags: |
+            ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/knowledgebase:${{ steps.parse.outputs.image_tag }}
+            ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/knowledgebase:${{ steps.parse.outputs.short_sha }}
+            ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/knowledgebase:latest-${{ steps.parse.outputs.env }}
