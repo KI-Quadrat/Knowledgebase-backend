@@ -5,10 +5,6 @@ __pycache__/
 
 # C extensions
 *.so
-.env
-.env.*
-.env.original
-!.env.example
 
 # Distribution / packaging
 .Python
@@ -143,6 +139,7 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
 .envrc
 .venv
 env/
@@ -212,3 +209,6 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+.env.original
+!.env.example

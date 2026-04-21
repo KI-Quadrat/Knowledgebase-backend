@@ -23,10 +23,11 @@ http://localhost:8000/api/v1
 
 ### 1. Online Mode — Knowledgebase from Web Content
 Update the knowledgebase using online URLs and cloud services.
-- Scrape web pages via Crawl4AI
+- Scrape web pages via Crawl4AI (default) or the Jina Reader API — selectable per request
 - Parse documents from any public URL — uses LlamaParse (cloud)
 - All online endpoints live under `/api/v1/online/`
-- Requires: `CRAWL4AI_URL`, `LLAMA_CLOUD_API_KEY`, `OPENAI_API_KEY`
+- **AT funding assistant** has a dedicated endpoint — `POST /api/v1/online/ingest/at` — that writes to a separate Qdrant instance (`QDRANT_URL_AT` + `QDRANT_PORT_AT` + `QDRANT_API_KEY_AT`) using a caller-supplied single collection. Dense embeddings come from a self-hosted TEI server (`TEI_EMBED_URL_AT`) at 1024 dim. See the endpoint docs below.
+- Requires: `CRAWL4AI_URL`, `LLAMA_CLOUD_API_KEY`, `OPENAI_API_KEY`; optional `JINA_API_KEY` to enable the Jina backend; `QDRANT_URL_AT` / `QDRANT_PORT_AT` (optional — leave unset when the port is embedded in `QDRANT_URL_AT`) / `QDRANT_API_KEY_AT` / `TEI_EMBED_URL_AT` / `TEI_EMBED_API_KEY_AT` for the AT pipeline
 
 ### 2. Local Mode — Fully Offline Document Processing
 Process documents entirely locally without any third-party APIs.
@@ -131,6 +132,8 @@ Readiness check. Returns minimal response without auth, full response with HMAC 
   "services": {
     "qdrant": true,
     "bge_m3": true,
+    "openai_embedder": true,
+    "bge_gemma2": true,
     "parser": true,
     "crawl4ai": true,
     "ldap": false,
@@ -144,7 +147,7 @@ Readiness check. Returns minimal response without auth, full response with HMAC 
 }
 ```
 
-Core services required for `ready: true`: **qdrant**, **bge_m3**, **parser**, **crawl4ai**.
+Core services required for `ready: true`: **qdrant**, **bge_m3**, **parser**, **crawl4ai**. The **openai_embedder** and **bge_gemma2** statuses are informational — at least one must be healthy for online ingest/search to work.
 
 ---
 
@@ -226,8 +229,8 @@ Classify content into 9 categories and extract structured entities. Designed for
 Permission-aware semantic or hybrid search. **No search is ever unfiltered** — every request requires a user context.
 
 **Search modes:**
-- `semantic` (default) — dense-only cosine search via OpenAI `text-embedding-3-small` (1536-dim)
-- `hybrid` — dense (OpenAI) + sparse (BM25) combined with **Reciprocal Rank Fusion (RRF)**. Requires the collection to have been ingested with `search_mode: hybrid`.
+- `semantic` (default) — dense-only cosine search via OpenAI `text-embedding-3-small` (1536-dim). Automatically falls back to BGE-Gemma2 via LiteLLM (`dense_bge_gemma2` vector) when OpenAI is unavailable.
+- `hybrid` — dense (OpenAI or BGE-Gemma2 fallback) + sparse (BM25) combined with **Reciprocal Rank Fusion (RRF)**. Requires the collection to have been ingested with `search_mode: hybrid`.
 
 **Permission model:**
 - `citizen` → sees only `visibility: "public"` documents
@@ -291,7 +294,7 @@ Permission-aware semantic or hybrid search. **No search is ever unfiltered** —
         },
         "metadata": {
           "title": "Solarförderung 2025",
-          "organization_id": "org_wiener_neudorf",
+          "municipality_id": "wiener-neudorf",
           "department": ["Bauamt"],
           "source_type": "web"
         }
@@ -492,7 +495,8 @@ curl -X GET "https://your-domain/api/v1/online/available_collections" \
 
 ## `POST /api/v1/online/scrape`
 
-Scrape a single webpage using Crawl4AI with JavaScript rendering. Results are cached in Redis.
+Scrape a single webpage using **Crawl4AI** (JavaScript rendering) or the **Jina Reader API**.
+Backend is selectable per request via the `scraper` field. Results are cached in Redis.
 
 **Request:**
 ```bash
@@ -511,6 +515,27 @@ curl -X POST "https://your-domain/api/v1/online/scrape" \
 }
 ```
 
+**Request body (use Jina Reader instead of Crawl4AI):**
+```json
+{
+  "url": "https://www.wiener-neudorf.gv.at/foerderungen",
+  "scraper": "jina"
+}
+```
+
+### Request fields
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `url` | string | Yes | — | Full URL to scrape (must start with `http://` or `https://`) |
+| `scraper` | string | No | `crawl4ai` | Preferred backend: `crawl4ai` or `jina`. The non-selected backend (and raw httpx) remain as automatic fallbacks if the primary fails. |
+| `markdown_type` | string | No | `fit` | `fit` (main content only), `raw` (full page), or `citations` (Crawl4AI only) |
+| `exclude_tags` | string[] | No | `null` | CSS selectors / tag names to drop before extraction |
+| `css_selector` | string | No | `null` | CSS selector to scope extraction to a specific element |
+| `inner_img` | bool | No | `false` | Extract and OCR-parse images linked on the page |
+| `inner_docs` | bool | No | `false` | Extract and parse documents (PDF, DOCX, …) linked on the page |
+| `links_summary` | bool | No | `false` | Return deduped `urls` list extracted from the **raw** page HTML (not the fit-filtered version, so nav/footer links aren't dropped). `documents` / `images` sub-lists are populated only when `inner_docs` / `inner_img` are also true. Triggers one extra raw-HTML fetch. |
+
 **Response (success):**
 ```json
 {
@@ -525,6 +550,43 @@ curl -X POST "https://your-domain/api/v1/online/scrape" \
     "last_modified": null
   },
   "request_id": "..."
+}
+```
+
+**Response with `links_summary: true`** (only `urls` populated):
+```json
+{
+  "success": true,
+  "data": {
+    "url": "https://www.wiener-neudorf.gv.at/foerderungen",
+    "title": "Förderungen - Gemeinde Wiener Neudorf",
+    "content": "# Förderungen\n…",
+    "content_length": 5200,
+    "language": "de",
+    "links_found": 45,
+    "last_modified": null,
+    "links_summary": {
+      "urls": [
+        "https://www.wiener-neudorf.gv.at/",
+        "https://www.wiener-neudorf.gv.at/kontakt",
+        "https://www.wiener-neudorf.gv.at/service/"
+      ],
+      "documents": [],
+      "images": []
+    }
+  },
+  "request_id": "..."
+}
+```
+
+**Response with `links_summary: true` + `inner_docs: true` + `inner_img: true`** (all three lists populated):
+```json
+{
+  "links_summary": {
+    "urls": ["https://www.wiener-neudorf.gv.at/", "…"],
+    "documents": ["https://www.wiener-neudorf.gv.at/downloads/antrag.pdf"],
+    "images": ["https://www.wiener-neudorf.gv.at/images/logo.png"]
+  }
 }
 ```
 
@@ -636,6 +698,7 @@ curl -X POST "https://your-domain/api/v1/online/crawl" \
 | `method` | string | Yes | — | `sitemap` or `crawl` |
 | `max_depth` | int | No | 3 | Max link-following depth (1-5) |
 | `max_urls` | int | No | 500 | Max URLs to return (1-5000) |
+| `scraper` | string | No | `crawl4ai` | Preferred backend during BFS discovery (`crawl4ai` or `jina`). Ignored when `method="sitemap"`. |
 
 ### Error codes
 `VALIDATION_URL_INVALID`, `CRAWL_SITEMAP_NOT_FOUND`
@@ -768,15 +831,21 @@ const response = await fetch("/api/v1/online/document-parse/upload", {
 
 ## `POST /api/v1/online/ingest`
 
-The RAG pipeline endpoint for web content. Takes parsed text and runs: **chunk -> classify -> embed (OpenAI text-embedding-3-small) -> store (Qdrant)**.
+The RAG pipeline endpoint for web content. Takes parsed text and runs: **chunk -> classify -> embed (OpenAI + BGE-Gemma2 via LiteLLM) -> store (Qdrant)**.
 
 Uses `url` instead of `file_path` to identify the source. The `url` is automatically stored as `source_url` in every Qdrant point's metadata.
 
+Every point stores **multi-vector** embeddings: `dense_openai` (primary, 1536-dim) and `dense_bge_gemma2` (fallback, configurable dim via `BGE_GEMMA2_DENSE_DIM`). If one embedder is unavailable during ingest, the point is still stored with the other's vector.
+
 The collection is **auto-created** if it does not exist, using the specified `vector_config` settings.
 
+**Content-type gating:** When `assistant_type` is `"funding"`, the content is pre-classified before ingestion. If the detected content type does not include `funding`, the request is rejected with `CONTENT_TYPE_MISMATCH` and nothing is stored. This prevents non-funding content from polluting a funding-specific knowledge base.
+
+**Funding metadata extraction:** When `assistant_type` is `"funding"` and the content passes the content-type gate, an additional OpenAI call extracts structured funding metadata (titel, region, zielgruppe, förderart, status, förderhöhe, etc.). This metadata is stored in every Qdrant point under `metadata.funding_metadata` for rich filtering and display during search.
+
 **Vector modes** (via `vector_config.search_mode`):
-- `semantic` (default) — stores only dense cosine vectors. Best for pure semantic similarity search.
-- `hybrid` — stores both dense cosine vectors **and** sparse vectors. Enables combined semantic + lexical (BM25-style) search for higher recall.
+- `semantic` (default) — stores `dense_openai` + `dense_bge_gemma2` cosine vectors.
+- `hybrid` — stores `dense_openai` + `dense_bge_gemma2` + `sparse` (BM25) vectors. Enables combined semantic + lexical search for higher recall.
 
 **Request (semantic mode — default):**
 ```bash
@@ -846,18 +915,31 @@ curl -X POST "https://your-domain/api/v1/online/ingest" \
 }
 ```
 
+**Response (content-type mismatch — `assistant_type: "funding"` but content is not funding):**
+```json
+{
+  "success": false,
+  "data": null,
+  "error": "CONTENT_TYPE_MISMATCH",
+  "detail": "Content not ingested: assistant_type is 'funding' but detected content type is ['event', 'community']. Only funding content is accepted for this assistant type.",
+  "request_id": "..."
+}
+```
+
 ### Request fields
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `collection_name` | string | Yes | — | Qdrant collection to store in (auto-created if missing) |
-| `source_id` | string | Yes | — | Unique document ID (for updates/deletes) |
-| `url` | string | Yes | — | Source URL — stored as `source_url` in Qdrant point metadata |
-| `content` | string | Yes | — | Parsed text from `/online/scrape` or `/online/document-parse` |
-| `language` | string | No | auto-detect | ISO 639-1 language code |
-| `metadata` | object | Yes | — | Document metadata (see Online Metadata object below) |
-| `chunking` | object | No | defaults | Chunking configuration (see Chunking config below) |
-| `vector_config` | object | No | defaults | Vector storage settings (see Vector config below) |
+| `collection_name` | string | Required | — | Qdrant collection to store in (auto-created if missing) |
+| `source_id` | string | Required | — | Unique document ID (for updates/deletes) |
+| `url` | string | Required | — | Source URL — stored as `source_url` in Qdrant point metadata |
+| `content` | string | Required | — | Parsed text from `/online/scrape` or `/online/document-parse` |
+| `language` | string | Optional | auto-detect | ISO 639-1 language code |
+| `assistant_type` | string | Optional | `null` | Type of assistant processing this content (e.g. `municipal`, `internal`, `public`). Stored in Qdrant metadata for search filtering. When set to `funding`, the content is pre-classified and **rejected** with `CONTENT_TYPE_MISMATCH` if the detected content type is not funding. |
+| `country` | string | Required when `assistant_type` is `funding`, otherwise Optional | `null` | ISO 3166-1 alpha-2 country code (e.g. `AT`, `DE`, `RO`). Used by the funding extractor to constrain `state_or_province` to the official list for that country, preventing hallucinated region names. Supported: `AT`, `DE`, `CH`, `RO`, `IT`, `FR`, `HU`, `CZ`, `SK`, `SI`, `HR`. |
+| `metadata` | object | Required | — | Document metadata (see Online Metadata object below) |
+| `chunking` | object | Optional | defaults | Chunking configuration (see Chunking config below) |
+| `vector_config` | object | Optional | defaults | Vector storage settings (see Vector config below) |
 
 ### Online Metadata object
 
@@ -865,35 +947,38 @@ At least one of `assistant_id` or `municipality_id` must be provided. If neither
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `assistant_id` | string | No* | `null` | Identifier of the assistant that owns this content |
-| `title` | string | No | `null` | Document/page title (shown in search results) |
-| `uploaded_by` | string | No | `null` | User or service that triggered ingestion |
-| `source_type` | string | No | `"web"` | Origin type (typically `web` for online content) |
-| `mime_type` | string | No | `null` | Original content MIME type |
-| `municipality_id` | string | No* | `null` | Municipality/tenant identifier |
-| `department` | array of strings | No | `[]` | Departments within the organization |
-
-> *At least one of `assistant_id` or `municipality_id` must be provided.
+| `assistant_id` | string | Optional | `null` | Identifier of the assistant that owns this content. At least one of `assistant_id` or `municipality_id` must be provided. |
+| `title` | string | Optional | `null` | Document/page title (shown in search results) |
+| `uploaded_by` | string | Optional | `null` | User or service that triggered ingestion |
+| `source_type` | string | Optional | `"web"` | Origin type (typically `web` for online content) |
+| `mime_type` | string | Optional | `null` | Original content MIME type |
+| `municipality_id` | string | Optional | `null` | Municipality/tenant identifier. At least one of `assistant_id` or `municipality_id` must be provided. |
+| `department` | array of strings | Optional | `[]` | Departments within the organization |
 
 ### Vector config
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `vector_size` | int | `1536` | Dimensionality of the dense cosine vector (64–4096). Must match embedding model output. |
-| `search_mode` | string | `"semantic"` | `"semantic"` — dense vectors only. `"hybrid"` — dense + sparse vectors for combined semantic + lexical search. |
+| `vector_size` | int | `1536` | Dimensionality of the OpenAI dense vector (`dense_openai`, 64–4096). The BGE-Gemma2 fallback dimension is configured server-side via `BGE_GEMMA2_DENSE_DIM`. |
+| `search_mode` | string | `"semantic"` | `"semantic"` — `dense_openai` + `dense_bge_gemma2` vectors. `"hybrid"` — `dense_openai` + `dense_bge_gemma2` + `sparse` (BM25) vectors. |
 
 ### Qdrant point payload structure
 
-The payload has top-level fields for tenant/agent isolation (`organization_id`, `assistant_id`, `department`), plus `content` and nested `metadata`.
+The payload has top-level fields for tenant/agent isolation (`municipality_id`, `assistant_id`, `department`), plus `content` and nested `metadata`.
 
-> **Note:** The API request field `municipality_id` is stored as `organization_id` in the Qdrant payload.
+When `assistant_type` is `"funding"`, extracted funding fields are merged flat into `metadata` (not nested). If the request body and the extracted metadata share a field (e.g. `title`), the request body value takes priority.
 
+**Standard payload (non-funding):**
 ```json
 {
   "id": "uuid",
-  "vector": {"dense": [...]},
+  "vector": {
+    "dense_openai": [1536-dim float array],
+    "dense_bge_gemma2": [3584-dim float array],
+    "sparse": {"indices": [...], "values": [...]}
+  },
   "payload": {
-    "organization_id": "org_wiener_neudorf",
+    "municipality_id": "wiener-neudorf",
     "assistant_id": "asst_wiener_neudorf_01",
     "department": ["Bürgerservice", "Förderungen"],
     "content": "The chunk text content...",
@@ -914,9 +999,51 @@ The payload has top-level fields for tenant/agent isolation (`organization_id`, 
 }
 ```
 
+**Funding payload (`assistant_type: "funding"`) — includes extracted fields in metadata:**
+```json
+{
+  "id": "uuid",
+  "vector": { "dense_openai": [...], "dense_bge_gemma2": [...] },
+  "payload": {
+    "municipality_id": "wiener-neudorf",
+    "assistant_id": "asst_wiener_neudorf_01",
+    "department": ["Bürgerservice", "Förderungen"],
+    "content": "The chunk text content...",
+    "metadata": {
+      "chunk_id": "web_foerderungen_001_chunk_0000",
+      "source_id": "web_foerderungen_001",
+      "chunk_index": 0,
+      "source_url": "https://www.wiener-neudorf.gv.at/foerderungen",
+      "source_path": "https://www.wiener-neudorf.gv.at/foerderungen",
+      "content_type": ["funding", "renewable_energy"],
+      "language": "de",
+      "title": "Förderungen - Gemeinde Wiener Neudorf",
+      "source_type": "web",
+      "mime_type": "text/html",
+      "uploaded_by": "scraper",
+      "country_code": "AT",
+      "state_or_province": ["carinthia"],
+      "city": ["villach"],
+      "target_group": ["Vereine"],
+      "funding_type": "Direkte Förderungen",
+      "status": "active",
+      "funding_amount": "",
+      "thematic_focus": ["Sport"],
+      "eligibility_criteria": "Schriftliche Antragstellung, Vereinssitz in Villach",
+      "legal_basis": "Bereichssubventionsordnung Sport, Basis-Subventionsordnung",
+      "funding_provider": ["Stadt Villach"],
+      "reference_number": 1052992,
+      "start_date": "01.01.2020",
+      "end_date": "unlimited",
+      "scraped_at": "2025-06-25"
+    }
+  }
+}
+```
+
 | Field | Location | Description |
 |-------|----------|-------------|
-| `organization_id` | `payload` (top-level) | Organization/tenant boundary |
+| `municipality_id` | `payload` (top-level) | Municipality/tenant boundary |
 | `assistant_id` | `payload` (top-level) | Assistant/agent isolation |
 | `department` | `payload` (top-level) | Departments (array of strings) |
 | `content` | `payload` (top-level) | The text content of this chunk |
@@ -932,8 +1059,149 @@ The payload has top-level fields for tenant/agent isolation (`organization_id`, 
 | `mime_type` | `payload.metadata` | MIME type |
 | `uploaded_by` | `payload.metadata` | Uploader identity |
 
+### Funding metadata fields (assistant_type: "funding" only)
+
+Extracted automatically via OpenAI when `assistant_type` is `"funding"`. Merged flat into `payload.metadata` alongside the standard fields. If a field name conflicts with the request body (e.g. `title`), the request body value wins.
+
+When `country` is provided in the request body (e.g. `"AT"`), the extractor constrains `state_or_province` to the official administrative divisions for that country. If the LLM returns a value not in the known list, it is reset to empty string. This prevents hallucinated region names and ensures clean filtering.
+
+**Supported countries:** `AT`, `DE`, `CH`, `RO`, `IT`, `FR`, `HU`, `CZ`, `SK`, `SI`, `HR`. Other country codes are accepted — the extractor still works but without province validation.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `title` | string | Title of the funding program |
+| `country_code` | string | ISO 3166-1 alpha-2 (e.g. `AT`, `DE`). From request `country` or inferred from content. |
+| `state_or_province` | array of strings | Official first-level admin divisions in **english lowercase** (e.g. `["carinthia"]`, `["bavaria", "tyrol"]`). Each value validated against known list when `country` is provided — invalid entries are dropped. Empty list if unknown. |
+| `city` | array of strings | City names in **english lowercase** (e.g. `["villach"]`, `["villach", "klagenfurt"]`). Empty list if unknown. |
+| `target_group` | array of strings | Target groups (e.g. Vereine, Privatpersonen) |
+| `funding_type` | string | Funding type (e.g. Direkte Förderungen, Zuschuss) |
+| `status` | string | `active`, `inactive`, `expiring`, or `unknown` |
+| `funding_amount` | string | Funding amount or range (empty if unknown) |
+| `thematic_focus` | array of strings | Thematic focus areas (e.g. Sport, Umwelt) |
+| `eligibility_criteria` | string | Eligibility criteria and requirements |
+| `legal_basis` | string | Legal basis or regulation |
+| `funding_provider` | array of strings | Funding provider organizations |
+| `reference_number` | string/null | Reference number or ID |
+| `start_date` | string | Start date (DD.MM.YYYY) or empty |
+| `end_date` | string | End date (DD.MM.YYYY), `unlimited`, or empty |
+| `scraped_at` | string | Date of extraction (YYYY-MM-DD) |
+
 ### Error codes
-`VALIDATION_EMPTY_CONTENT`, `EMBEDDING_MODEL_NOT_LOADED`, `EMBEDDING_FAILED`, `EMBEDDING_OOM`, `QDRANT_CONNECTION_FAILED`, `QDRANT_COLLECTION_NOT_FOUND`, `QDRANT_UPSERT_FAILED`, `QDRANT_DISK_FULL`, `CLASSIFY_FAILED`
+`VALIDATION_EMPTY_CONTENT`, `CONTENT_TYPE_MISMATCH`, `EMBEDDING_MODEL_NOT_LOADED`, `EMBEDDING_FAILED`, `EMBEDDING_OOM`, `QDRANT_CONNECTION_FAILED`, `QDRANT_COLLECTION_NOT_FOUND`, `QDRANT_UPSERT_FAILED`, `QDRANT_DISK_FULL`, `CLASSIFY_FAILED`
+
+---
+
+## `POST /api/v1/online/ingest/at`
+
+Dedicated ingest for the **Austrian funding assistant**. Runs the pipeline (chunk → contextual enrichment → embed → store) against a single caller-supplied collection on a separate Qdrant instance.
+
+The country (`AT`) and assistant type (`funding`) are **implicit** — don't send them in the body.
+
+### How the AT endpoint differs from `/online/ingest`
+
+| Aspect | `/online/ingest` | `/online/ingest/at` |
+|---|---|---|
+| Qdrant target | `QDRANT_URL` (host:port combined) | `QDRANT_URL_AT` + `QDRANT_PORT_AT` + `QDRANT_API_KEY_AT` (URL and port split, matching the upstream qdrant-client pattern; `QDRANT_PORT_AT` has no default — leave it unset when the port is already embedded in `QDRANT_URL_AT`, including the implicit 443 for `https://` URLs). Falls back to `QDRANT_URL` / `QDRANT_API_KEY` when `QDRANT_URL_AT` is unset. |
+| Embedding model | OpenAI (`text-embedding-3-small`, 1536 dim) | Self-hosted TEI at `TEI_EMBED_URL_AT` (OpenAI-compatible `/v1/embeddings`, bearer `TEI_EMBED_API_KEY_AT`), **1024 dim** |
+| Collection schema | Named multi-vector (`dense_openai`, `dense_bge_gemma2`, optional `sparse`) | Single unnamed **1024-dim** cosine vector (legacy schema) |
+| Collection(s) per request | One (from `collection_name`) | One (from `collection_name`) |
+| Point ID | `uuid5` string | Deterministic 64-bit integer |
+| `country` / `assistant_type` / `vector_config` | Required | **Not accepted** — implicit |
+
+### Funding-extractor metadata
+
+The OpenAI-based funding extractor runs unconditionally on every request and its output is merged into `metadata.*` on every stored point:
+
+- `title`, `program_name` (falls back to `title` when the extractor doesn't find a distinct program name)
+- `processing_office` (list) — a funding doc may route through more than one office
+- `contract_email` (list), `contract_phone` (list) — a funding doc may list multiple contacts
+- `state_or_province` (list, english lowercase), `city` (list)
+- `target_group`, `funding_type`, `status`, `funding_amount`
+- `thematic_focus`, `eligibility_criteria`, `legal_basis`, `funding_provider`
+- `reference_number`, `start_date`, `end_date`, `scraped_at`, `country_code`
+
+Request-body fields take precedence — values present in `body.metadata` overwrite the extractor's output on the point.
+
+### `state_or_province`
+
+`body.state_or_province` overrides the extractor's value for the stored `metadata.state_or_province` only. There is no collection routing — the target collection always comes from `body.collection_name`. Normalized to lowercase + deduped before storage.
+
+### Idempotency
+
+Before upserting, the endpoint deletes prior points for the same `source_id` via the indexed `metadata.source_id` filter. This fully clears the document's existing chunks before writing the fresh ones — re-ingesting the same `source_id` replaces the stored content, even if the chunk count changes between ingests. Point IDs are deterministic over `(source_id, chunk_index)`.
+
+### Request
+
+```bash
+curl -X POST "https://your-domain/api/v1/online/ingest/at" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key" \
+  -d '{
+    "source_id": "web_salzburg_sport_001",
+    "collection_name": "foerder_at",
+    "url": "https://www.salzburg.gv.at/sport-foerderung",
+    "content": "Sportförderung Salzburg ...",
+    "content_type": ["funding", "sport"],
+    "language": "de",
+    "metadata": {
+      "assistant_id": "asst_foerder_at_01",
+      "municipality_id": "land-salzburg",
+      "title": "Sportförderung Salzburg",
+      "source_type": "web"
+    }
+  }'
+```
+
+### Response
+
+```json
+{
+  "success": true,
+  "data": {
+    "source_id": "web_salzburg_sport_001",
+    "chunks_created": 12,
+    "vectors_stored": 12,
+    "collection_name": "foerder_at",
+    "content_type": ["funding", "sport"],
+    "embedding_time_ms": 480,
+    "total_time_ms": 1320
+  },
+  "request_id": "..."
+}
+```
+
+### Request fields
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `source_id` | string | Yes | — | Unique document ID. Keys the `metadata.source_url` delete-before-upsert. |
+| `collection_name` | string | Yes | — | Target collection on the AT Qdrant instance. **Auto-created** with the AT legacy schema (single unnamed 1024-dim cosine vector + keyword indexes on `metadata.source_id` / `metadata.source_url`) on first use. If the collection already exists with a different vector dim, the ingest fails with `QDRANT_COLLECTION_NOT_FOUND`. |
+| `url` | string | Yes | — | Source URL (stored as `metadata.source_url`). |
+| `source_name` | string | No | `null` | Human-readable label for the source (e.g. `"Land Salzburg — Sportförderung"`). Stored verbatim as `metadata.source_name` when supplied; the field is omitted from stored metadata when null/empty. |
+| `content` | string | Yes | — | Parsed/scraped text. Must not be whitespace-only. |
+| `content_type` | string[] | Yes | — | Categories from upstream `/scrape` or `/document-parse`. |
+| `language` | string | No | `"de"` | ISO 639-1 code. |
+| `state_or_province` | string[] | No | `null` | Override for stored `metadata.state_or_province` (english lowercase). |
+| `entities` | object | No | `null` | Structured entities from upstream scrape/parse. |
+| `metadata` | object | Yes | — | Same shape as `/online/ingest` metadata. At least one of `assistant_id` / `municipality_id` required. |
+| `chunking` | object | No | `null` | Override chunking strategy / max size / overlap. When omitted, the endpoint uses AT-specific defaults tuned for German funding pages: `max_chunk_size=1000`, `overlap=150`, `strategy="contextual"`. |
+
+No `country`, `assistant_type`, or `vector_config` fields — they're fixed by the endpoint.
+
+### Response fields
+
+| Field | Type | Description |
+|---|---|---|
+| `source_id` | string | Echoed from the request. |
+| `chunks_created` | int | Chunks produced from the content. |
+| `vectors_stored` | int | Vectors upserted into the target collection. |
+| `collection_name` | string | Echoed from the request. |
+| `content_type` | string[] | Echoed from the request. |
+| `embedding_time_ms` | int | TEI embedding call duration. |
+| `total_time_ms` | int | End-to-end pipeline time. |
+
+### Error codes
+`VALIDATION_EMPTY_CONTENT`, `EMBEDDING_MODEL_NOT_LOADED`, `EMBEDDING_FAILED`, `EMBEDDING_OOM`, `QDRANT_CONNECTION_FAILED`, `QDRANT_COLLECTION_NOT_FOUND`, `QDRANT_UPSERT_FAILED`, `QDRANT_DISK_FULL`
 
 ---
 
@@ -968,7 +1236,7 @@ curl -X DELETE "https://your-domain/api/v1/online/vectors/web_foerderungen_001?c
 
 Delete vectors matching metadata filters. All filters are combined with **AND** logic — only points matching every condition are deleted.
 
-**Filterable metadata fields:** `source_id`, `source_url`, `source_type`, `content_type`, `assistant_id`, `organization_id`, `department`, `language`, `uploaded_by`, `mime_type`, `title`
+**Filterable metadata fields:** `source_id`, `source_url`, `source_type`, `content_type`, `assistant_id`, `municipality_id`, `department`, `language`, `uploaded_by`, `mime_type`, `title`
 
 ### Case 1: Delete all vectors for an assistant
 
@@ -993,7 +1261,7 @@ curl -X POST "https://your-domain/api/v1/online/vectors/delete-by-filter" \
   "collection_name": "wiener-neudorf",
   "filters": [
     {"key": "content_type", "value": "funding"},
-    {"key": "organization_id", "value": "org_wiener_neudorf"}
+    {"key": "municipality_id", "value": "wiener-neudorf"}
   ]
 }
 ```
@@ -1006,7 +1274,7 @@ curl -X POST "https://your-domain/api/v1/online/vectors/delete-by-filter" \
     "vectors_deleted": 12,
     "filters_applied": [
       {"key": "content_type", "value": "funding"},
-      {"key": "organization_id", "value": "org_wiener_neudorf"}
+      {"key": "municipality_id", "value": "wiener-neudorf"}
     ]
   },
   "request_id": "..."
@@ -1024,6 +1292,46 @@ curl -X POST "https://your-domain/api/v1/online/vectors/delete-by-filter" \
 
 ### Error codes
 `QDRANT_CONNECTION_FAILED`, `QDRANT_DELETE_FAILED`
+
+---
+
+## `POST /api/v1/online/vectors/sparse-encode`
+
+Encode arbitrary text into a Qdrant-compatible BM25 sparse vector using the same encoder that `POST /online/ingest` runs in `hybrid` mode (and that hybrid search uses for query encoding). Useful when a caller needs to reproduce the exact `sparse` vector that ingest would have stored, without going through the full ingest pipeline.
+
+**Tokenization:** lowercased, split on non-alphanumeric, German + English stopwords removed, single-character tokens dropped. Each surviving token is hashed (MD5 mod 2^31-1) into the sparse index space; the value is the raw term frequency. Qdrant's IDF modifier on the collection handles inverse-document-frequency weighting at query time.
+
+**Request:**
+```bash
+curl -X POST "https://your-domain/api/v1/online/vectors/sparse-encode" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key" \
+  -d '{
+    "content": "Förderungen der Gemeinde Wiener Neudorf für Photovoltaik."
+  }'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "data": {
+    "indices": [1115783198, 1136366200, 1236662434, 1585432512, 1740055052, 1864074548],
+    "values": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+    "term_count": 6
+  },
+  "request_id": "..."
+}
+```
+
+### Request fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `content` | string | Yes | Text to encode (must be non-empty after trim) |
+
+### Error codes
+`VALIDATION_EMPTY_CONTENT`
 
 ---
 
@@ -1299,7 +1607,7 @@ curl -X POST "https://your-domain/api/v1/local/ingest" \
       "uploaded_by": "moderator_01",
       "source_type": "smb",
       "mime_type": "application/pdf",
-      "organization_id": "org_wiener_neudorf",
+      "municipality_id": "wiener-neudorf",
       "department": ["Bauamt"]
     },
     "chunking": {
@@ -1394,7 +1702,7 @@ curl -X POST "https://your-domain/api/v1/local/ingest" \
 | `uploaded_by` | string | No | User or service that uploaded |
 | `source_type` | string | No | `smb`, `r2`, or `web` |
 | `mime_type` | string | No | Original file MIME type |
-| `organization_id` | string | No | Organization/tenant ID (stored at payload root in Qdrant) |
+| `municipality_id` | string | No | Municipality/tenant ID (stored at payload root in Qdrant) |
 | `department` | array of strings | No | Departments within organization (stored at payload root in Qdrant) |
 
 ### Chunking config
@@ -1462,7 +1770,7 @@ curl -X DELETE "https://your-domain/api/v1/local/vectors/doc_abc123?collection_n
 
 Delete vectors matching metadata filters. All filters are combined with **AND** logic — only points matching every condition are deleted.
 
-**Filterable metadata fields:** `source_id`, `source_type`, `content_type`, `acl_visibility`, `acl_department`, `organization_id`, `department`, `language`, `uploaded_by`, `mime_type`, `title`
+**Filterable metadata fields:** `source_id`, `source_type`, `content_type`, `acl_visibility`, `acl_department`, `municipality_id`, `department`, `language`, `uploaded_by`, `mime_type`, `title`
 
 ### Case 1: Delete all vectors from a department
 
@@ -1498,7 +1806,7 @@ curl -X POST "https://your-domain/api/v1/local/vectors/delete-by-filter" \
 {
   "collection_name": "wiener-neudorf",
   "filters": [
-    {"key": "organization_id", "value": "org_wiener_neudorf"}
+    {"key": "municipality_id", "value": "wiener-neudorf"}
   ]
 }
 ```
@@ -1599,13 +1907,14 @@ curl -X PUT "https://your-domain/api/v1/local/vectors/update-acl" \
 
 | Method | Endpoint | Purpose | Auth |
 |--------|----------|---------|------|
-| POST | `/api/v1/online/scrape` | Scrape webpage (Crawl4AI) | HMAC + API Key |
+| POST | `/api/v1/online/scrape` | Scrape webpage (Crawl4AI or Jina) | HMAC + API Key |
 | POST | `/api/v1/online/crawl` | Discover URLs from site/sitemap | HMAC + API Key |
 | POST | `/api/v1/online/document-parse` | Parse document from URL | HMAC + API Key |
 | POST | `/api/v1/online/document-parse/upload` | Parse uploaded file | HMAC + API Key |
 | POST | `/api/v1/online/ingest` | Chunk + embed + store web content | HMAC + API Key |
 | DELETE | `/api/v1/online/vectors/{source_id}` | Delete document vectors | HMAC + API Key |
 | POST | `/api/v1/online/vectors/delete-by-filter` | Delete vectors by metadata filter | HMAC + API Key |
+| POST | `/api/v1/online/vectors/sparse-encode` | BM25 sparse-encode arbitrary text | HMAC + API Key |
 
 ## Local Endpoints (trusted network)
 

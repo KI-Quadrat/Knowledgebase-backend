@@ -1,6 +1,7 @@
 """
 DELETE /api/v1/online/vectors/{source_id}      — Remove all vectors for a document
 POST   /api/v1/online/vectors/delete-by-filter — Remove vectors matching metadata filters
+POST   /api/v1/online/vectors/sparse-encode    — BM25 sparse-encode arbitrary text
 """
 
 from fastapi import APIRouter, Query, Request
@@ -10,9 +11,14 @@ from app.models.online.vectors import (
     OnlineDeleteByFilterData,
     OnlineDeleteByFilterRequest,
     OnlineDeleteVectorsData,
+    OnlineSparseEncodeData,
+    OnlineSparseEncodeRequest,
 )
+from app.services.embedding.bm25_encoder import BM25Encoder
 from app.services.embedding.qdrant_service import QdrantError
 from app.utils.logger import get_logger
+
+_bm25 = BM25Encoder()
 
 log = get_logger(__name__)
 
@@ -73,7 +79,7 @@ async def delete_vectors(
         "- `source_type` — Origin type (`web`)\n"
         "- `content_type` — Content categories (`funding`, `event`, `policy`, etc.)\n"
         "- `assistant_id` — Assistant identifier\n"
-        "- `organization_id` — Organization/tenant ID\n"
+        "- `municipality_id` — Municipality/tenant ID\n"
         "- `department` — Department\n"
         "- `language` — Document language\n"
         "- `uploaded_by` — Uploader ID\n"
@@ -90,7 +96,7 @@ async def delete_by_filter(
     qdrant = request.app.state.qdrant
 
     # Build Qdrant filter — top-level fields stay at root, others are nested under metadata
-    top_level_fields = {"organization_id", "assistant_id", "department"}
+    top_level_fields = {"municipality_id", "assistant_id", "department"}
     must_conditions = [
         {"key": f.key if f.key in top_level_fields else f"metadata.{f.key}", "match": {"value": f.value}}
         for f in body.filters
@@ -119,6 +125,48 @@ async def delete_by_filter(
         data=OnlineDeleteByFilterData(
             vectors_deleted=deleted,
             filters_applied=body.filters,
+        ),
+        request_id=request_id,
+    )
+
+
+@router.post(
+    "/vectors/sparse-encode",
+    summary="Encode text into a BM25 sparse vector",
+    description=(
+        "Run the same BM25 encoder used during `POST /online/ingest` (in `hybrid` "
+        "search mode) and during hybrid search query encoding. Useful when a caller "
+        "needs to reproduce the exact `sparse` vector that ingest would have stored, "
+        "without going through the full ingest pipeline.\n\n"
+        "**Tokenization:** lowercased, split on non-alphanumeric, German + English "
+        "stopwords removed, single-character tokens dropped. Each surviving token is "
+        "hashed (MD5 mod 2^31-1) into the sparse index space, and the value is the "
+        "raw term frequency. Qdrant's IDF modifier on the collection handles the "
+        "inverse-document-frequency weighting at query time.\n\n"
+        "**Error codes:** `VALIDATION_EMPTY_CONTENT`"
+    ),
+    response_description="Sparse vector indices and term-frequency values",
+)
+async def sparse_encode(
+    body: OnlineSparseEncodeRequest, request: Request,
+) -> ResponseEnvelope[OnlineSparseEncodeData]:
+    request_id = request.state.request_id
+
+    if not body.content.strip():
+        return ResponseEnvelope(
+            success=False,
+            error=ErrorCode.VALIDATION_EMPTY_CONTENT,
+            detail="Content must not be empty",
+            request_id=request_id,
+        )
+
+    sparse = _bm25.encode(body.content)
+    return ResponseEnvelope(
+        success=True,
+        data=OnlineSparseEncodeData(
+            indices=sparse["indices"],
+            values=sparse["values"],
+            term_count=len(sparse["indices"]),
         ),
         request_id=request_id,
     )
