@@ -78,7 +78,7 @@ COPY --from=builder /app/app   /app/app
 COPY --from=builder /app/pyproject.toml /app/pyproject.toml
 
 # Non-root user — never run application code as root in production
-RUN groupadd -r dataplane && useradd -r -g dataplane dataplane \
+RUN groupadd -r dataplane && useradd -r -u 1000 -g dataplane dataplane \
     && mkdir -p /tmp/uv-cache \
     && chown -R dataplane:dataplane /app /tmp/uv-cache
 
@@ -89,7 +89,7 @@ ENV UV_CACHE_DIR=/tmp/uv-cache \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/app/.venv/bin:$PATH"
 
-USER dataplane
+USER 1000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:8000/api/v1/health || exit 1
