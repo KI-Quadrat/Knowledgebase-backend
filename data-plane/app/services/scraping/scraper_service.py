@@ -11,7 +11,7 @@ from app.services.cache import ContentCache
 from app.services.metrics import mark_cache_hit, mark_cache_miss, set_active_jobs
 from app.services.rate_limiter import DomainRateLimiter
 from app.services.scraping.crawl4ai_client import Crawl4AIClient
-from app.services.scraping.document_discovery import DiscoveredDoc, discover_documents
+from app.services.scraping.document_discovery import DiscoveredDoc, discover_documents, split_documents_and_links
 from app.utils.content import count_words, extract_links, extract_metadata
 from app.utils.logger import get_logger
 
@@ -24,8 +24,12 @@ class ScrapeOptions(BaseModel):
     js_render: bool = True
     wait_for: str | None = None
     extract_links: bool = True
+    with_links_summary: bool = False
     css_selector: str | None = None
     timeout: int = Field(30, ge=1, le=120)
+    markdown_type: str = "fit"
+    exclude_tags: list[str] | None = None
+    scraper: str = "crawl4ai"
 
 
 class PageMetadata(BaseModel):
@@ -143,6 +147,10 @@ class ScraperService:
                 wait_for=options.wait_for,
                 css_selector=options.css_selector,
                 timeout=options.timeout,
+                markdown_type=options.markdown_type,
+                exclude_tags=options.exclude_tags,
+                with_links_summary=options.with_links_summary,
+                scraper=options.scraper,
             )
 
             if not crawl_result.success:
@@ -181,10 +189,23 @@ class ScraperService:
                     )
                     for d in raw_docs
                 ]
+            elif crawl_result.links:
+                raw_docs, _ = split_documents_and_links(crawl_result.links, found_on=url)
+                discovered_docs = [
+                    DiscoveredDocument(
+                        url=d.url,
+                        type=d.type,
+                        link_text=d.link_text,
+                        found_on=d.found_on,
+                    )
+                    for d in raw_docs
+                ]
 
             discovered_links: list[str] = []
             if html and options.extract_links:
                 discovered_links = extract_links(html, url)
+            elif options.extract_links and crawl_result.links:
+                _, discovered_links = split_documents_and_links(crawl_result.links, found_on=url)
 
             metadata = PageMetadata(
                 title=meta.get("title"),
@@ -250,6 +271,7 @@ class ScraperService:
         max_pages: int = 50,
         same_domain_only: bool = True,
         on_progress: Callable[[int, int, str], None] | None = None,
+        scraper: str = "crawl4ai",
     ) -> tuple[list[str], list[DiscoveredDocument]]:
         """Breadth-first URL discovery using lightweight scraping."""
         visited: set[str] = set()
@@ -258,7 +280,9 @@ class ScraperService:
         queue: deque[tuple[str, int]] = deque([(root_url, 0)])
 
         root_domain = urlparse(root_url).netloc.lower()
-        discover_options = ScrapeOptions(js_render=False, extract_links=True, timeout=15)
+        discover_options = ScrapeOptions(
+            js_render=False, extract_links=True, timeout=15, scraper=scraper
+        )
 
         while queue and len(discovered_pages) < max_pages:
             current_url, depth = queue.popleft()

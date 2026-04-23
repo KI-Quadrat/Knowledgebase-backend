@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.routers.shared import health as health_router
 
 
 @pytest.fixture
@@ -13,6 +14,13 @@ def client():
     app.state._test_mode = True
     with TestClient(app) as c:
         yield c
+
+
+@pytest.fixture(autouse=True)
+def reset_online_api_keys():
+    previous = health_router.settings.online_api_keys
+    yield
+    health_router.settings.online_api_keys = previous
 
 
 def test_health(client):
@@ -128,3 +136,192 @@ def test_request_id_header(client):
 def test_request_id_echo(client):
     response = client.get("/api/v1/health", headers={"X-Request-ID": "test-123"})
     assert response.headers["X-Request-ID"] == "test-123"
+
+
+def test_model_health_requires_api_key(client):
+    health_router.settings.online_api_keys = "secret-key"
+
+    response = client.get("/api/v1/model-health")
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "X-API-Key header is required"
+
+
+def test_model_health_uses_shared_env_api_key_behavior(client, monkeypatch):
+    health_router.settings.online_api_keys = ""
+    monkeypatch.setattr(
+        health_router,
+        "_probe_openai_chat_model",
+        AsyncMock(return_value=(True, None)),
+    )
+    monkeypatch.setattr(
+        health_router,
+        "_probe_jina_reader",
+        AsyncMock(return_value=(True, None)),
+    )
+
+    app.state.scraping = MagicMock(
+        crawl4ai=MagicMock(
+            _jina_key="jina-key",
+            check_health=AsyncMock(return_value=True),
+        )
+    )
+    app.state.embedder = MagicMock(embed=AsyncMock(return_value=object()))
+    app.state.openai_embedder = MagicMock(
+        _api_key="openai-key",
+        _model="text-embedding-3-small",
+        embed=AsyncMock(return_value=object()),
+    )
+    app.state.bge_gemma2_embedder = MagicMock(
+        _model="bge-multilingual-gemma2",
+        embed=AsyncMock(return_value=object()),
+    )
+    app.state.classifier = MagicMock(
+        _llm=MagicMock(_client=object(), _model="gpt-4o-mini")
+    )
+    app.state.contextual_enricher = MagicMock(
+        _api_key="openai-key",
+        _model="gpt-4o-mini",
+    )
+    app.state.funding_extractor = MagicMock(
+        _client=object(),
+        _model="gpt-4o-mini",
+    )
+    app.state.parser = MagicMock(
+        parser_backend="local",
+    )
+
+    response = client.get("/api/v1/model-health")
+
+    assert response.status_code == 200
+
+
+def test_model_health_returns_model_statuses(client, monkeypatch):
+    health_router.settings.online_api_keys = "secret-key"
+    monkeypatch.setattr(
+        health_router,
+        "_probe_openai_chat_model",
+        AsyncMock(return_value=(True, None)),
+    )
+    monkeypatch.setattr(
+        health_router,
+        "_probe_jina_reader",
+        AsyncMock(return_value=(True, None)),
+    )
+
+    app.state.scraping = MagicMock(
+        crawl4ai=MagicMock(
+            _jina_key="jina-key",
+            check_health=AsyncMock(return_value=True),
+        )
+    )
+    app.state.embedder = MagicMock(embed=AsyncMock(return_value=object()))
+    app.state.openai_embedder = MagicMock(
+        _api_key="openai-key",
+        _model="text-embedding-3-small",
+        embed=AsyncMock(return_value=object()),
+    )
+    app.state.bge_gemma2_embedder = MagicMock(
+        _model="bge-multilingual-gemma2",
+        embed=AsyncMock(return_value=object()),
+    )
+    app.state.classifier = MagicMock(
+        _llm=MagicMock(_client=object(), _model="gpt-4o-mini")
+    )
+    app.state.contextual_enricher = MagicMock(
+        _api_key="openai-key",
+        _model="gpt-4o-mini",
+    )
+    app.state.funding_extractor = MagicMock(
+        _client=object(),
+        _model="gpt-4o-mini",
+    )
+    app.state.parser = MagicMock(
+        parser_backend="llamaparse",
+        check_health=AsyncMock(return_value=True),
+    )
+
+    response = client.get(
+        "/api/v1/model-health",
+        headers={"X-API-Key": "secret-key"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["healthy"] is True
+    assert len(data["models"]) == 9
+    assert {item["component"] for item in data["models"]} == {
+        "scraper_crawl4ai",
+        "scraper_jina_reader",
+        "local_embedding",
+        "online_embedding_primary",
+        "online_embedding_fallback",
+        "content_classifier",
+        "contextual_enricher",
+        "funding_extractor",
+        "document_parser",
+    }
+
+
+def test_model_health_reports_unhealthy_components(client, monkeypatch):
+    health_router.settings.online_api_keys = "secret-key"
+    monkeypatch.setattr(
+        health_router,
+        "_probe_openai_chat_model",
+        AsyncMock(return_value=(False, "OpenAI HTTP 500")),
+    )
+    monkeypatch.setattr(
+        health_router,
+        "_probe_jina_reader",
+        AsyncMock(return_value=(False, "Jina HTTP 502")),
+    )
+
+    app.state.scraping = MagicMock(
+        crawl4ai=MagicMock(
+            _jina_key="jina-key",
+            check_health=AsyncMock(return_value=False),
+        )
+    )
+    app.state.embedder = MagicMock(embed=AsyncMock(return_value=object()))
+    app.state.openai_embedder = MagicMock(
+        _api_key="openai-key",
+        _model="text-embedding-3-small",
+        embed=AsyncMock(side_effect=RuntimeError("embedding failed")),
+    )
+    app.state.bge_gemma2_embedder = MagicMock(
+        _model="bge-multilingual-gemma2",
+        embed=AsyncMock(return_value=object()),
+    )
+    app.state.classifier = MagicMock(
+        _llm=MagicMock(_client=object(), _model="gpt-4o-mini")
+    )
+    app.state.contextual_enricher = MagicMock(
+        _api_key="openai-key",
+        _model="gpt-4o-mini",
+    )
+    app.state.funding_extractor = MagicMock(
+        _client=None,
+        _model="gpt-4o-mini",
+    )
+    app.state.parser = MagicMock(
+        parser_backend="local",
+    )
+
+    response = client.get(
+        "/api/v1/model-health",
+        headers={"X-API-Key": "secret-key"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["healthy"] is False
+
+    by_component = {item["component"]: item for item in data["models"]}
+    assert by_component["scraper_crawl4ai"]["healthy"] is False
+    assert by_component["scraper_jina_reader"]["healthy"] is False
+    assert by_component["online_embedding_primary"]["healthy"] is False
+    assert "embedding failed" in by_component["online_embedding_primary"]["detail"]
+    assert by_component["content_classifier"]["healthy"] is False
+    assert by_component["contextual_enricher"]["healthy"] is False
+    assert by_component["funding_extractor"]["configured"] is False
+    assert by_component["document_parser"]["configured"] is False

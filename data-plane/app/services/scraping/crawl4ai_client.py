@@ -1,5 +1,7 @@
 import random
+import re
 import time
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -21,6 +23,8 @@ ACCEPT_LANGUAGES = [
     "de-AT,de;q=0.9,en;q=0.8",
     "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
     "de,en-US;q=0.9,en;q=0.8",
+    "en-US,en;q=0.9",
+    "*",
 ]
 
 
@@ -30,12 +34,14 @@ class CrawlResult:
         *,
         markdown: str = "",
         html: str = "",
+        links: list[str] | None = None,
         success: bool = True,
         error: str | None = None,
         duration_ms: int = 0,
     ):
         self.markdown = markdown
         self.html = html
+        self.links = links or []
         self.success = success
         self.error = error
         self.duration_ms = duration_ms
@@ -81,6 +87,10 @@ class Crawl4AIClient:
         wait_for: str | None = None,
         css_selector: str | None = None,
         timeout: int | None = None,
+        markdown_type: str = "fit",
+        exclude_tags: list[str] | None = None,
+        with_links_summary: bool = False,
+        scraper: str = "crawl4ai",
     ) -> CrawlResult:
         if not self._client:
             raise RuntimeError("Client not started — call start() first")
@@ -88,38 +98,63 @@ class Crawl4AIClient:
         req_timeout = timeout or settings.default_timeout
         start = time.monotonic()
 
-        if js_render:
-            try:
-                result = await self._crawl_via_api(
-                    url,
-                    wait_for=wait_for,
-                    css_selector=css_selector,
-                    timeout=req_timeout,
-                )
-                result.duration_ms = int((time.monotonic() - start) * 1000)
-                if result.success:
-                    mark_crawl4ai("success", time.monotonic() - start)
-                    return result
-                log.warning("crawl4ai_failed_falling_back", url=url, error=result.error)
-            except Exception as exc:
-                log.warning("crawl4ai_unavailable_falling_back", url=url, error=str(exc))
+        # Build prioritized backend list based on client preference. The
+        # non-preferred backend (and raw httpx) remain as automatic fallbacks
+        # so requests stay best-effort even when the chosen backend fails.
+        if scraper == "jina":
+            backend_order = ("jina", "crawl4ai")
+        else:
+            backend_order = ("crawl4ai", "jina")
 
-            mark_crawl4ai("failed", time.monotonic() - start)
+        for backend in backend_order:
+            if backend == "crawl4ai":
+                if not js_render:
+                    continue
+                try:
+                    result = await self._crawl_via_api(
+                        url,
+                        wait_for=wait_for,
+                        css_selector=css_selector,
+                        timeout=req_timeout,
+                        markdown_type=markdown_type,
+                        exclude_tags=exclude_tags,
+                    )
+                    result.duration_ms = int((time.monotonic() - start) * 1000)
+                    if result.success:
+                        mark_crawl4ai("success", time.monotonic() - start)
+                        return result
+                    log.warning("crawl4ai_failed_falling_back", url=url, error=result.error)
+                except Exception as exc:
+                    log.warning("crawl4ai_unavailable_falling_back", url=url, error=str(exc))
+                mark_crawl4ai("failed", time.monotonic() - start)
 
-        # Fallback 2: Jina Reader API
-        if self._jina_key:
-            try:
-                result = await self._scrape_with_jina(url, timeout=req_timeout)
-                result.duration_ms = int((time.monotonic() - start) * 1000)
-                if result.success:
-                    log.info("jina_fallback_success", url=url)
-                    return result
-                log.warning("jina_fallback_failed", url=url, error=result.error)
-            except Exception as exc:
-                log.warning("jina_fallback_error", url=url, error=str(exc))
+            elif backend == "jina":
+                if not self._jina_key:
+                    continue
+                try:
+                    result = await self._scrape_with_jina(
+                        url,
+                        timeout=req_timeout,
+                        markdown_type=markdown_type,
+                        exclude_tags=exclude_tags,
+                        css_selector=css_selector,
+                        with_links_summary=with_links_summary,
+                    )
+                    result.duration_ms = int((time.monotonic() - start) * 1000)
+                    if result.success:
+                        log.info("jina_scrape_success", url=url, primary=(scraper == "jina"))
+                        return result
+                    log.warning("jina_scrape_failed", url=url, error=result.error)
+                except Exception as exc:
+                    log.warning("jina_scrape_error", url=url, error=str(exc))
 
-        # Fallback 3: Raw httpx
-        result = await self._scrape_with_httpx(url, css_selector=css_selector, timeout=req_timeout)
+        # Final fallback: Raw httpx
+        result = await self._scrape_with_httpx(
+            url,
+            css_selector=css_selector,
+            timeout=req_timeout,
+            exclude_tags=exclude_tags,
+        )
         result.duration_ms = int((time.monotonic() - start) * 1000)
         return result
 
@@ -130,16 +165,18 @@ class Crawl4AIClient:
         wait_for: str | None = None,
         css_selector: str | None = None,
         timeout: int = 30,
+        markdown_type: str = "fit",
+        exclude_tags: list[str] | None = None,
     ) -> CrawlResult:
         headers: dict[str, str] = {}
         if self._api_token:
             headers["Authorization"] = f"Bearer {self._api_token}"
 
         crawler_params: dict = {
-            "scan_full_page": True,
-            "wait_until": "networkidle",
+            "scan_full_page": False,
+            "wait_until": "domcontentloaded",
             "page_timeout": timeout * 1000,
-            "delay_before_return_html": 2.0,
+            "delay_before_return_html": 0.5,
             "magic": True,
             "remove_overlay_elements": True,
             "cache_mode": "bypass",
@@ -148,6 +185,23 @@ class Crawl4AIClient:
             crawler_params["wait_for"] = f"css:{wait_for}"
         if css_selector:
             crawler_params["css_selector"] = css_selector
+        if exclude_tags:
+            crawler_params["excluded_tags"] = exclude_tags
+        if markdown_type == "fit":
+            crawler_params["markdown_generator"] = {
+                "type": "DefaultMarkdownGenerator",
+                "params": {
+                    "content_filter": {
+                        "type": "PruningContentFilter",
+                        "params": {
+                            "threshold": 0.48,
+                            "threshold_type": "fixed",
+                            "min_word_threshold": 0,
+                        },
+                    },
+                    "options": {"ignore_links": False, "escape_html": True},
+                },
+            }
 
         payload: dict = {
             "urls": [url],
@@ -177,19 +231,39 @@ class Crawl4AIClient:
             result_data = data.get("result", data)
 
         success = bool(result_data.get("success", data.get("success", False)))
-        markdown = _extract_markdown(result_data.get("markdown"))
+        markdown = _extract_markdown(result_data.get("markdown"), preferred=markdown_type)
         html = _extract_html(result_data)
         error = _extract_error(result_data)
 
         return CrawlResult(markdown=clean_markdown(markdown), html=html, success=success, error=error)
 
-    async def _scrape_with_jina(self, url: str, *, timeout: int = 30) -> CrawlResult:
+    async def _scrape_with_jina(
+        self,
+        url: str,
+        *,
+        timeout: int = 30,
+        markdown_type: str = "fit",
+        exclude_tags: list[str] | None = None,
+        css_selector: str | None = None,
+        with_links_summary: bool = False,
+    ) -> CrawlResult:
         """Scrape a URL via Jina Reader API — returns Markdown directly."""
         headers = {
             "Authorization": f"Bearer {self._jina_key}",
             "Accept": "application/json",
             "X-Return-Format": "markdown",
         }
+        # "fit" → use readerlm-v2 engine for LLM-based main-content extraction
+        # (closest Jina analogue to Crawl4AI's PruningContentFilter).
+        # "raw" / "citations" → default engine (Jina has no citations mode).
+        if markdown_type == "fit":
+            headers["X-Engine"] = "readerlm-v2"
+        if css_selector:
+            headers["X-Target-Selector"] = css_selector
+        if exclude_tags:
+            headers["X-Remove-Selector"] = ",".join(exclude_tags)
+        if with_links_summary:
+            headers["X-With-Links-Summary"] = "true"
 
         try:
             resp = await self._client.get(  # type: ignore[union-attr]
@@ -207,15 +281,22 @@ class Crawl4AIClient:
 
         data = resp.json()
         content = data.get("data", {}).get("content", "")
-        title = data.get("data", {}).get("title", "")
+        links = _extract_jina_links(data, url)
 
         if not content.strip():
             return CrawlResult(success=False, error="Jina returned empty content")
 
         markdown = clean_markdown(content)
-        return CrawlResult(markdown=markdown, html="", success=True)
+        return CrawlResult(markdown=markdown, html="", links=links, success=True)
 
-    async def _scrape_with_httpx(self, url: str, *, css_selector: str | None = None, timeout: int = 30) -> CrawlResult:
+    async def _scrape_with_httpx(
+        self,
+        url: str,
+        *,
+        css_selector: str | None = None,
+        timeout: int = 30,
+        exclude_tags: list[str] | None = None,
+    ) -> CrawlResult:
         headers = {
             "User-Agent": random.choice(USER_AGENTS),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -241,6 +322,10 @@ class Crawl4AIClient:
 
         cleaned = clean_html(raw_html, css_selector)
         soup = BeautifulSoup(cleaned, "lxml")
+        if exclude_tags:
+            for selector in exclude_tags:
+                for el in soup.select(selector):
+                    el.decompose()
         markdown = clean_markdown(_html_to_markdown(soup))
 
         return CrawlResult(markdown=markdown, html=raw_html, success=True)
@@ -274,13 +359,19 @@ def _html_to_markdown(soup: BeautifulSoup) -> str:
     return "\n".join(lines)
 
 
-def _extract_markdown(markdown_value: object) -> str:
+_MARKDOWN_PRIORITY: dict[str, tuple[str, ...]] = {
+    "fit": ("fit_markdown", "markdown_with_citations", "raw_markdown"),
+    "citations": ("markdown_with_citations", "raw_markdown", "fit_markdown"),
+    "raw": ("raw_markdown", "markdown_with_citations", "fit_markdown"),
+}
+
+
+def _extract_markdown(markdown_value: object, *, preferred: str = "fit") -> str:
     if isinstance(markdown_value, str):
         return markdown_value
     if isinstance(markdown_value, dict):
-        # Prefer fit_markdown (main content only, no nav/header/footer/cookie noise)
-        # over raw_markdown (full page including all boilerplate)
-        for key in ("fit_markdown", "markdown_with_citations", "raw_markdown"):
+        keys = _MARKDOWN_PRIORITY.get(preferred, _MARKDOWN_PRIORITY["fit"])
+        for key in keys:
             value = markdown_value.get(key)
             if isinstance(value, str) and value.strip():
                 return value
@@ -289,8 +380,9 @@ def _extract_markdown(markdown_value: object) -> str:
 
 
 def _extract_html(result_data: dict) -> str:
-    # Prefer cleaned_html (noise elements removed) over raw html
-    for key in ("cleaned_html", "fit_html", "html"):
+    # Preserve the full rendered DOM when available so downstream link discovery
+    # can see links that may be dropped from cleaned/fit variants.
+    for key in ("html", "cleaned_html", "fit_html"):
         value = result_data.get(key)
         if isinstance(value, str) and value.strip():
             return value
@@ -303,3 +395,76 @@ def _extract_error(result_data: dict) -> str | None:
         if isinstance(value, str) and value:
             return value
     return None
+
+
+def _extract_jina_links(data: dict, base_url: str) -> list[str]:
+    """Extract Jina links, preferring the returned links_summary.urls payload."""
+    data_section = data.get("data", {})
+    direct_links_summary = data_section.get("links_summary")
+    if not isinstance(direct_links_summary, dict):
+        direct_links_summary = data.get("links_summary")
+
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def _add_url(value: str) -> None:
+        normalized = urljoin(base_url, value.strip())
+        parsed = urlparse(normalized)
+        if parsed.scheme not in {"http", "https"}:
+            return
+        if normalized in seen:
+            return
+        seen.add(normalized)
+        urls.append(normalized)
+
+    if isinstance(direct_links_summary, dict):
+        raw_urls = direct_links_summary.get("urls")
+        if isinstance(raw_urls, list):
+            for value in raw_urls:
+                if isinstance(value, str) and value.strip():
+                    _add_url(value)
+            if urls:
+                return urls
+
+    candidates = (
+        data_section.get("content"),
+        data_section.get("links"),
+        data_section.get("links_summary"),
+        data.get("links"),
+        data.get("links_summary"),
+    )
+
+    def _extract_urls_from_text(text: str) -> None:
+        for match in re.findall(r"https?://[^\s<>)\\]\"']+", text):
+            _add_url(match.rstrip(".,;:!?"))
+
+        for match in re.findall(r"\[[^\]]*\]\((https?://[^)\s]+)\)", text):
+            _add_url(match.rstrip(".,;:!?"))
+
+    def _walk(value: object) -> None:
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return
+            if text.startswith(("http://", "https://")) and " " not in text and "\n" not in text:
+                _add_url(text)
+                return
+            _extract_urls_from_text(text)
+            return
+        if isinstance(value, dict):
+            for key in ("url", "href", "link"):
+                nested = value.get(key)
+                if isinstance(nested, str) and nested.strip():
+                    _add_url(nested)
+                    return
+            for nested in value.values():
+                _walk(nested)
+            return
+        if isinstance(value, list):
+            for nested in value:
+                _walk(nested)
+
+    for candidate in candidates:
+        _walk(candidate)
+
+    return urls

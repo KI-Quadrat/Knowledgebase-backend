@@ -8,6 +8,7 @@ import tempfile
 
 from fastapi import APIRouter, File, Request, UploadFile
 
+from app.models.classify import ExtractedEntities as ClassifyEntities
 from app.models.common import ResponseEnvelope
 from app.models.online.parse import OnlineParseData, OnlineParseRequest
 from app.routers._parse_utils import check_parse_failure
@@ -37,7 +38,7 @@ async def parse_online(body: OnlineParseRequest, request: Request) -> ResponseEn
         mime_type=body.mime_type,
     )
 
-    return _build_response(result, body.url, request_id)
+    return await _build_response(result, body.url, request_id, request.app.state.classifier)
 
 
 @router.post(
@@ -74,20 +75,27 @@ async def parse_online_upload(request: Request, file: UploadFile = File(...)) ->
             filename=file.filename,
         )
 
-        return _build_response(result, file.filename or "upload", request_id)
+        return await _build_response(
+            result, file.filename or "upload", request_id, request.app.state.classifier
+        )
 
     finally:
         if os.path.exists(temp_path):
             os.unlink(temp_path)
 
 
-def _build_response(result, url: str, request_id: str) -> ResponseEnvelope[OnlineParseData]:
+async def _build_response(
+    result, url: str, request_id: str, classifier
+) -> ResponseEnvelope[OnlineParseData]:
     """Convert a ParseResult into the standard API response."""
     error = check_parse_failure(result, request_id)
     if error:
         return ResponseEnvelope(**error)
 
     content = result.text or ""
+    content_type, entities = await _classify_content(
+        classifier, content, language=result.metadata.language, source_url=url
+    )
     return ResponseEnvelope(
         success=True,
         data=OnlineParseData(
@@ -97,6 +105,33 @@ def _build_response(result, url: str, request_id: str) -> ResponseEnvelope[Onlin
             language=result.metadata.language,
             extracted_tables=len(result.tables),
             content_length=len(content),
+            content_type=content_type,
+            entities=entities,
         ),
         request_id=request_id,
     )
+
+
+async def _classify_content(
+    classifier, content: str, language: str | None, source_url: str
+) -> tuple[list[str], ClassifyEntities | None]:
+    """Run the classifier over content and return (content_type, entities).
+
+    Failures are logged and degraded to (['general'], None) — classification
+    is informational on parse, so it should not fail the request.
+    """
+    try:
+        result = await classifier.classify(content, language=language or "de")
+    except Exception as exc:
+        log.warning("classify_after_parse_failed", url=source_url, error=str(exc))
+        return (["general"], None)
+
+    content_type = [result.category.value] + result.sub_categories
+    entities = ClassifyEntities(
+        dates=result.entities.dates,
+        deadlines=result.entities.deadlines,
+        amounts=result.entities.amounts,
+        contacts=result.entities.contacts,
+        departments=result.entities.departments,
+    )
+    return (content_type, entities)

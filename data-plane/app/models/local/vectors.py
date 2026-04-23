@@ -49,7 +49,7 @@ class UpdateACLData(BaseModel):
 class MetadataFilter(BaseModel):
     """A single metadata filter condition."""
 
-    key: str = Field(..., description="Metadata field name (e.g. 'source_type', 'classification', 'acl_department', 'organization_id')")
+    key: str = Field(..., description="Metadata field name (e.g. 'source_type', 'classification', 'acl_department', 'municipality_id')")
     value: str = Field(..., description="Exact value to match")
 
 
