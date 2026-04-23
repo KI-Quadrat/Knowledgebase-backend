@@ -1,5 +1,11 @@
 from app.models.common import ACL, ErrorCode, NtfsACL, ResponseEnvelope
-from app.models.health import HealthResponse, ReadyResponse, ServiceStatus
+from app.models.health import (
+    HealthResponse,
+    ModelHealthItem,
+    ModelHealthResponse,
+    ReadyResponse,
+    ServiceStatus,
+)
 
 __all__ = [
     "ACL",
@@ -7,6 +13,8 @@ __all__ = [
     "NtfsACL",
     "ResponseEnvelope",
     "HealthResponse",
+    "ModelHealthItem",
+    "ModelHealthResponse",
     "ReadyResponse",
     "ServiceStatus",
 ]

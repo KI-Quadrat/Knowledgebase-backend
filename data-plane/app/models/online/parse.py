@@ -1,5 +1,7 @@
 from pydantic import BaseModel, Field
 
+from app.models.classify import ExtractedEntities
+
 
 class OnlineParseRequest(BaseModel):
     """Request to parse a document from a public URL."""
@@ -31,3 +33,5 @@ class OnlineParseData(BaseModel):
     language: str | None = Field(None, description="Detected document language (ISO 639-1)")
     extracted_tables: int = Field(0, description="Number of tables extracted from the document")
     content_length: int = Field(..., description="Length of extracted content in characters")
+    content_type: list[str] = Field(default_factory=list, description="Classifier-derived content categories for the parsed document (e.g. ['funding', 'renewable_energy']). Pass this verbatim to /online/ingest.")
+    entities: ExtractedEntities | None = Field(None, description="Structured entities extracted by the classifier (dates, deadlines, amounts, contacts, departments). Null when classification failed.")

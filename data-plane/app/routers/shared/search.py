@@ -36,18 +36,23 @@ _ERROR_CODE_MAP = {
     description=(
         "Search a specific Qdrant `collection_name` with **mandatory permission filtering** based on user identity.\n\n"
         "**Search modes** (via `search_mode`):\n"
-        "- `semantic` (default) — dense-only cosine search via OpenAI `text-embedding-3-small`\n"
-        "- `hybrid` — dense (OpenAI) + sparse (BM25) combined with **Reciprocal Rank Fusion (RRF)**. "
+        "- `semantic` (default) — dense-only cosine search via OpenAI `text-embedding-3-small` "
+        "(automatic fallback to BGE-Gemma2 via LiteLLM when OpenAI is unavailable)\n"
+        "- `hybrid` — dense (OpenAI or BGE-Gemma2 fallback) + sparse (BM25) combined with "
+        "**Reciprocal Rank Fusion (RRF)**. "
         "Requires the collection to have been created with `search_mode: hybrid` during ingestion.\n\n"
+        "**Embedding fallback:** The search service first attempts to embed the query via OpenAI "
+        "(`dense_openai` vector). If OpenAI is down, it automatically falls back to BGE-Gemma2 via "
+        "LiteLLM (`dense_bge_gemma2` vector).\n\n"
         "**Multi-tenant:** The caller specifies which `collection_name` to search in.\n\n"
         "**Permission model:**\n"
         "- `citizen` — Can only see documents with `visibility: public`\n"
         "- `employee` — Can see `public` + `internal` documents filtered by AD group membership\n\n"
         "**The search pipeline:**\n"
-        "1. Embed the query via OpenAI `text-embedding-3-small` (1536-dim dense vector)\n"
+        "1. Embed the query via OpenAI `text-embedding-3-small` (1536-dim) — falls back to BGE-Gemma2 via LiteLLM if OpenAI fails\n"
         "2. (Hybrid only) Encode query with BM25 for sparse vector\n"
         "3. Build Qdrant filter from user permissions (visibility + group intersection)\n"
-        "4. Execute search — semantic (nearest-neighbor) or hybrid (RRF fusion of dense + sparse)\n"
+        "4. Execute search against `dense_openai` or `dense_bge_gemma2` — semantic (nearest-neighbor) or hybrid (RRF fusion of dense + sparse)\n"
         "5. Return ranked results with transparency on which filters were applied\n\n"
         "**Optional filters:** `content_type` (e.g. `funding`, `event`, `policy`)\n\n"
         "**Error codes:** `VALIDATION_USER_REQUIRED`, `EMBEDDING_MODEL_NOT_LOADED`, `EMBEDDING_FAILED`, "
@@ -76,6 +81,7 @@ async def search(body: SearchRequest, request: Request) -> ResponseEnvelope[Sear
             top_k=body.top_k,
             score_threshold=body.score_threshold,
             search_mode=body.search_mode,
+            enable_fallback=body.enable_fallback,
         )
     except SearchError as e:
         error_code = _ERROR_CODE_MAP.get(e.code, ErrorCode.QDRANT_SEARCH_FAILED)
@@ -101,7 +107,7 @@ async def search(body: SearchRequest, request: Request) -> ResponseEnvelope[Sear
             ),
             metadata=SearchResultMetadata(
                 title=r.title,
-                organization_id=r.organization_id,
+                municipality_id=r.municipality_id,
                 department=r.department,
                 source_type=r.source_type,
             ),

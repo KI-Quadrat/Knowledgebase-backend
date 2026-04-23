@@ -72,6 +72,19 @@ class ExternalSettings(BaseSettings):
     qdrant_api_key: str = ""
     qdrant_collection: str = ""  # Default collection name (tenant-based)
 
+    # Qdrant — AT-specific instance used by POST /api/v1/online/ingest/at.
+    # Host, port, and api-key are split across three env vars (matches the
+    # upstream qdrant-client pattern — QDRANT_URL / QDRANT_PORT / QDRANT_API_KEY).
+    # QDRANT_URL_AT may include the port inline (e.g. https://host:6333) or
+    # carry only the scheme+host with QDRANT_PORT_AT supplying the port.
+    # QDRANT_PORT_AT has no default — leave it unset when the port is already
+    # embedded in the URL (including the implicit 443 for https:// URLs).
+    # When QDRANT_URL_AT is empty, the service reuses the default QDRANT_URL /
+    # QDRANT_API_KEY (port embedded in QDRANT_URL as before).
+    qdrant_url_at: str = ""
+    qdrant_port_at: int | None = None
+    qdrant_api_key_at: str = ""
+
     # Redis
     redis_url: str = "redis://redis:6379/0"
 
@@ -87,9 +100,29 @@ class ExternalSettings(BaseSettings):
     clickhouse_user: str = "dataplane"
     clickhouse_password: str = ""
 
+    # LiteLLM (self-hosted proxy for fallback embedding model)
+    litellm_url: str = "http://litellm:4000"
+    litellm_api_key: str = ""
+    bge_gemma2_model: str = "bge-multilingual-gemma2"
+    bge_gemma2_dense_dim: int = 3584
+
     # OpenAI
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+
+    # TEI — AT-specific embedding endpoint used by POST /api/v1/online/ingest/at.
+    # OpenAI-compatible server exposing POST {TEI_EMBED_URL_AT}/v1/embeddings.
+    # API key is required. TEI_EMBED_MODEL_AT is optional — many TEI servers
+    # ignore the model field since each process serves a single model.
+    #
+    # When the endpoint is behind Cloudflare Access, also supply a service-token
+    # pair — the client sends them as CF-Access-Client-Id / -Client-Secret
+    # headers so Cloudflare lets the request through without the login redirect.
+    tei_embed_url_at: str = "https://embed.ki2.at"
+    tei_embed_api_key_at: str = ""
+    tei_embed_model_at: str = "BAAI/bge-m3"
+    tei_cf_access_client_id_at: str = ""
+    tei_cf_access_client_secret_at: str = ""
 
     # LDAP
     ldap_url: str = ""

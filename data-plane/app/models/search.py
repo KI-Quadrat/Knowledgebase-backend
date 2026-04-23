@@ -30,6 +30,9 @@ class SearchRequest(BaseModel):
     **Search modes:**
     - `semantic` (default) — dense-only cosine search via OpenAI embeddings
     - `hybrid` — dense (OpenAI) + sparse (BM25) with Reciprocal Rank Fusion (RRF)
+
+    Set ``enable_fallback: true`` if the collection was ingested with fallback enabled.
+    This searches ``dense_openai`` and falls back to ``dense_bge_gemma2`` if OpenAI is down.
     """
 
     collection_name: str = Field(..., description="Qdrant collection name to search in")
@@ -37,6 +40,7 @@ class SearchRequest(BaseModel):
     user: UserContext = Field(..., description="User identity for permission filtering (always required)")
     filters: SearchFilters | None = Field(None, description="Optional content filters")
     search_mode: str = Field("semantic", description="'semantic' (dense cosine only, default) or 'hybrid' (dense + BM25 sparse with RRF)")
+    enable_fallback: bool = Field(False, description="Set to true if the collection was ingested with enable_fallback=true. Searches dense_openai first, falls back to dense_bge_gemma2 via LiteLLM when OpenAI is unavailable.")
     top_k: int = Field(10, ge=1, le=100, description="Maximum number of results to return")
     score_threshold: float = Field(0.5, ge=0.0, le=1.0, description="Minimum similarity score (0.0 = all, 1.0 = exact match). Used for semantic mode only.")
 
@@ -74,7 +78,7 @@ class SearchResultMetadata(BaseModel):
     """Metadata from the source document."""
 
     title: str | None = Field(None, description="Document title")
-    organization_id: str | None = Field(None, description="Organization/tenant identifier")
+    municipality_id: str | None = Field(None, description="Municipality/tenant identifier")
     department: list[str] | None = Field(None, description="Source departments")
     source_type: str | None = Field(None, description="Origin: smb, r2, or web")
 

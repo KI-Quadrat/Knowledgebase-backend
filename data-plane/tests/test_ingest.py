@@ -64,7 +64,7 @@ def test_ingest_success(client, mock_ingest):
         chunks_created=5,
         vectors_stored=5,
         collection="wiener-neudorf",
-        classification="policy",
+        classification=["policy"],
         entities_extracted={"dates": 2, "contacts": 1, "amounts": 0},
         embedding_time_ms=150,
         total_time_ms=300,
@@ -79,7 +79,7 @@ def test_ingest_success(client, mock_ingest):
     assert data["data"]["chunks_created"] == 5
     assert data["data"]["vectors_stored"] == 5
     assert data["data"]["collection"] == "wiener-neudorf"
-    assert data["data"]["classification"] == "policy"
+    assert data["data"]["content_type"] == ["policy"]
     assert data["data"]["entities_extracted"]["dates"] == 2
     assert data["data"]["embedding_time_ms"] == 150
     assert data["data"]["total_time_ms"] == 300
@@ -92,7 +92,7 @@ def test_ingest_with_chunking_config(client, mock_ingest):
         chunks_created=10,
         vectors_stored=10,
         collection="test",
-        classification="general",
+        classification=["general"],
         entities_extracted={"dates": 0, "contacts": 0, "amounts": 0},
         embedding_time_ms=200,
         total_time_ms=400,
@@ -185,7 +185,7 @@ def test_ingest_request_id(client, mock_ingest):
         chunks_created=1,
         vectors_stored=1,
         collection="test",
-        classification="general",
+        classification=["general"],
         entities_extracted={"dates": 0, "contacts": 0, "amounts": 0},
         embedding_time_ms=10,
         total_time_ms=20,

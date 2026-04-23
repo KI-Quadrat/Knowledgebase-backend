@@ -160,3 +160,44 @@ def extract_documents_and_links(html: str, base_url: str, found_on: str | None =
             doc.found_on = found_on
 
     return docs, links
+
+
+def split_documents_and_links(urls: list[str], found_on: str | None = None) -> tuple[list[DiscoveredDoc], list[str]]:
+    """Split a flat list of absolute URLs into documents and non-document page links."""
+    docs: list[DiscoveredDoc] = []
+    links: list[str] = []
+    seen_docs: set[str] = set()
+    seen_links: set[str] = set()
+
+    for url in urls:
+        if not isinstance(url, str):
+            continue
+        normalized = url.strip()
+        if not normalized:
+            continue
+
+        parsed = urlparse(normalized)
+        if parsed.scheme not in {"http", "https"}:
+            continue
+
+        doc_kind = document_type(normalized)
+        if doc_kind:
+            if normalized in seen_docs:
+                continue
+            seen_docs.add(normalized)
+            docs.append(
+                DiscoveredDoc(
+                    url=normalized,
+                    type=doc_kind,
+                    link_text=None,
+                    found_on=found_on,
+                )
+            )
+            continue
+
+        if normalized in seen_links:
+            continue
+        seen_links.add(normalized)
+        links.append(normalized)
+
+    return docs, links
