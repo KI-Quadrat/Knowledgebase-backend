@@ -86,9 +86,18 @@ jobs:
           sudo wget -O /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
           sudo chmod +x /usr/local/bin/yq
 
+      - name: Resolve values file path
+        id: resolve
+        run: |
+          if [ "${{ needs.build-and-push.outputs.env }}" = "stg1" ]; then
+            echo "file=apps/core-services/dev/knowledgebasestg/values.yaml" >> $GITHUB_OUTPUT
+          else
+            echo "file=apps/core-services/dev/knowledgebase/values.yaml" >> $GITHUB_OUTPUT
+          fi
+
       - name: Update image tag in values.yaml
         run: |
-          FILE="apps/core-services/dev/knowledgebase/values.yaml"
+          FILE="${{ steps.resolve.outputs.file }}"
           export TAG="${{ needs.build-and-push.outputs.image_tag }}"
 
           yq -i '.image.tag = strenv(TAG)' "$FILE"
@@ -98,7 +107,7 @@ jobs:
 
       - name: Commit and push changes
         run: |
-          FILE="apps/core-services/dev/knowledgebase/values.yaml"
+          FILE="${{ steps.resolve.outputs.file }}"
           TAG="${{ needs.build-and-push.outputs.image_tag }}"
 
           git config user.name "github-actions[bot]"
