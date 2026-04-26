@@ -41,6 +41,7 @@ import time
 from fastapi import APIRouter, Request
 
 from app.models.common import ErrorCode, ResponseEnvelope
+from app.models.online.ingest import EmbeddingModel
 from app.models.online.ingest_at import OnlineIngestATData, OnlineIngestATRequest
 from app.services.embedding.bge_m3_client import EmbeddingError
 from app.services.embedding.qdrant_service import QdrantError
@@ -269,9 +270,19 @@ async def ingest_online_at(
 
     chunker = request.app.state.chunker
     contextual_enricher = request.app.state.contextual_enricher
-    tei_embedder = request.app.state.tei_embedder_at
     qdrant = request.app.state.qdrant_at
     extractor = request.app.state.funding_extractor
+
+    # Embedder selection — bge_m3 (default) hits the TEI endpoint (1024-dim);
+    # openai uses text-embedding-3-small (1536-dim). The AT collection is
+    # auto-created at the matching dim below, so switching models requires a
+    # fresh collection name.
+    if body.embedding_model == EmbeddingModel.openai:
+        embedder = request.app.state.openai_embedder
+        dense_dim = 1536
+    else:
+        embedder = request.app.state.tei_embedder_at
+        dense_dim = 1024
 
     # ── 1. Funding extraction (once) ──
     extracted = await _safe_extract_funding(
@@ -308,10 +319,10 @@ async def ingest_online_at(
         except Exception as e:
             log.warning("ingest_online_at_contextual_failed", source_id=body.source_id, error=str(e))
 
-    # ── 3. Embed once via TEI (unnamed 1024-dim cosine vector) ──
+    # ── 3. Embed once via selected model (unnamed cosine vector) ──
     embed_start = time.monotonic()
     try:
-        embeddings = await tei_embedder.embed_batch(chunks)
+        embeddings = await embedder.embed_batch(chunks)
     except EmbeddingError as e:
         msg = str(e).lower()
         if "oom" in msg or "memory" in msg:
@@ -354,7 +365,7 @@ async def ingest_online_at(
     # ── 5. Build + upsert points (single collection) ──
     collection = body.collection_name
     try:
-        await qdrant.ensure_at_collection(collection)
+        await qdrant.ensure_at_collection(collection, dense_dim=dense_dim)
     except QdrantError as e:
         msg = str(e).lower()
         if "connection" in msg:

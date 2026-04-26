@@ -140,7 +140,7 @@ async def health(request: Request) -> HealthResponse:
 
 **Without HMAC auth headers:** Returns minimal `{ready: true/false}` — suitable for load balancer health checks.
 
-**With HMAC auth headers (X-Signature + X-Timestamp):** Returns full dependency status including Qdrant, BGE-M3, OpenAI embedder, BGE-Gemma2 (LiteLLM), Parser (LlamaParse/Unstructured), Crawl4AI, LDAP, and Redis.
+**With HMAC auth headers (X-Signature + X-Timestamp):** Returns full dependency status including Qdrant, BGE-M3, OpenAI embedder, TEI BGE-M3 (embed.ki2.at), TEI sparse (sparse.ki2.at), Parser (LlamaParse/Unstructured), Crawl4AI, LDAP, and Redis.
 
 Core services that must be healthy for `ready: true`: Qdrant, BGE-M3, Parser, Crawl4AI.""",
     response_description="Readiness status with optional service details",
@@ -183,13 +183,21 @@ async def ready(request: Request) -> ReadyResponse:
         except Exception:
             services.openai_embedder = False
 
-    # BGE-Gemma2 (LiteLLM)
-    bge_gemma2 = getattr(request.app.state, "bge_gemma2_embedder", None)
-    if bge_gemma2:
+    # TEI BGE-M3 (embed.ki2.at)
+    tei_embedder_at = getattr(request.app.state, "tei_embedder_at", None)
+    if tei_embedder_at:
         try:
-            services.bge_gemma2 = await bge_gemma2.check_health()
+            services.tei_embedder_at = await tei_embedder_at.check_health()
         except Exception:
-            services.bge_gemma2 = False
+            services.tei_embedder_at = False
+
+    # TEI sparse (sparse.ki2.at)
+    sparse_embedder = getattr(request.app.state, "sparse_embedder", None)
+    if sparse_embedder:
+        try:
+            services.sparse_embedder = await sparse_embedder.check_health()
+        except Exception:
+            services.sparse_embedder = False
 
     # Parser (LlamaParse or Unstructured)
     parser = getattr(request.app.state, "parser", None)
@@ -310,8 +318,8 @@ async def model_health(request: Request) -> ModelHealthResponse:
     )
     models.append(
         _item(
-            component="online_embedding_primary",
-            task="online embedding and query embedding",
+            component="online_embedding_openai",
+            task="OpenAI online embedding (dense_openai)",
             provider="openai",
             model=getattr(openai_embedder, "_model", "text-embedding-3-small"),
             configured=openai_configured,
@@ -320,21 +328,41 @@ async def model_health(request: Request) -> ModelHealthResponse:
         )
     )
 
-    bge_gemma2 = getattr(request.app.state, "bge_gemma2_embedder", None)
-    bge_gemma2_ok, bge_gemma2_detail = (
-        await _probe_component(bge_gemma2, "embed")
-        if bge_gemma2
-        else (False, "service not initialized")
+    tei_embedder_at = getattr(request.app.state, "tei_embedder_at", None)
+    tei_configured = bool(tei_embedder_at and getattr(tei_embedder_at, "_api_key", ""))
+    tei_ok, tei_detail = (
+        await _probe_component(tei_embedder_at, "embed")
+        if tei_configured
+        else (False, "TEI_EMBED_API_KEY_AT not configured" if tei_embedder_at else "service not initialized")
     )
     models.append(
         _item(
-            component="online_embedding_fallback",
-            task="fallback online embeddings",
-            provider="litellm",
-            model=getattr(bge_gemma2, "_model", ext.bge_gemma2_model),
-            configured=bge_gemma2 is not None,
-            healthy=bge_gemma2_ok,
-            detail=bge_gemma2_detail,
+            component="online_embedding_bge_m3",
+            task="BGE-M3 online embedding (dense_bge_m3)",
+            provider="tei",
+            model=getattr(tei_embedder_at, "_model", ext.tei_embed_model_at),
+            configured=tei_configured,
+            healthy=tei_ok,
+            detail=tei_detail,
+        )
+    )
+
+    sparse_embedder = getattr(request.app.state, "sparse_embedder", None)
+    sparse_configured = bool(sparse_embedder and getattr(sparse_embedder, "_api_key", ""))
+    sparse_ok, sparse_detail = (
+        await _probe_component(sparse_embedder, "encode")
+        if sparse_configured
+        else (False, "SPARSE_EMBED_API_KEY_AT not configured" if sparse_embedder else "service not initialized")
+    )
+    models.append(
+        _item(
+            component="online_embedding_sparse",
+            task="TEI sparse embedding for hybrid search",
+            provider="tei",
+            model=getattr(sparse_embedder, "_model", ext.sparse_embed_model_at),
+            configured=sparse_configured,
+            healthy=sparse_ok,
+            detail=sparse_detail,
         )
     )
 

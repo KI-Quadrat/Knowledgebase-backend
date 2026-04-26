@@ -1,7 +1,7 @@
 """
 DELETE /api/v1/online/vectors/{source_id}      — Remove all vectors for a document
 POST   /api/v1/online/vectors/delete-by-filter — Remove vectors matching metadata filters
-POST   /api/v1/online/vectors/sparse-encode    — BM25 sparse-encode arbitrary text
+POST   /api/v1/online/vectors/sparse-encode    — TEI sparse-encode arbitrary text
 """
 
 from fastapi import APIRouter, Query, Request
@@ -14,11 +14,9 @@ from app.models.online.vectors import (
     OnlineSparseEncodeData,
     OnlineSparseEncodeRequest,
 )
-from app.services.embedding.bm25_encoder import BM25Encoder
+from app.services.embedding.bge_m3_client import EmbeddingError
 from app.services.embedding.qdrant_service import QdrantError
 from app.utils.logger import get_logger
-
-_bm25 = BM25Encoder()
 
 log = get_logger(__name__)
 
@@ -132,18 +130,15 @@ async def delete_by_filter(
 
 @router.post(
     "/vectors/sparse-encode",
-    summary="Encode text into a BM25 sparse vector",
+    summary="Encode text into a TEI sparse vector",
     description=(
-        "Run the same BM25 encoder used during `POST /online/ingest` (in `hybrid` "
-        "search mode) and during hybrid search query encoding. Useful when a caller "
-        "needs to reproduce the exact `sparse` vector that ingest would have stored, "
-        "without going through the full ingest pipeline.\n\n"
-        "**Tokenization:** lowercased, split on non-alphanumeric, German + English "
-        "stopwords removed, single-character tokens dropped. Each surviving token is "
-        "hashed (MD5 mod 2^31-1) into the sparse index space, and the value is the "
-        "raw term frequency. Qdrant's IDF modifier on the collection handles the "
-        "inverse-document-frequency weighting at query time.\n\n"
-        "**Error codes:** `VALIDATION_EMPTY_CONTENT`"
+        "Proxy the TEI sparse embedding server at `SPARSE_EMBED_URL_AT` "
+        "(sparse.ki2.at) — the same endpoint used during `POST /online/ingest` "
+        "with `search_mode: hybrid` and during hybrid search query encoding. "
+        "Useful when a caller needs to reproduce the exact `sparse` vector that "
+        "ingest would have stored, without going through the full ingest pipeline.\n\n"
+        "**Error codes:** `VALIDATION_EMPTY_CONTENT`, `EMBEDDING_MODEL_NOT_LOADED`, "
+        "`EMBEDDING_FAILED`"
     ),
     response_description="Sparse vector indices and term-frequency values",
 )
@@ -160,13 +155,30 @@ async def sparse_encode(
             request_id=request_id,
         )
 
-    sparse = _bm25.encode(body.content)
+    sparse_embedder = request.app.state.sparse_embedder
+    try:
+        sparse = await sparse_embedder.encode(body.content)
+    except EmbeddingError as e:
+        msg = str(e).lower()
+        code = (
+            ErrorCode.EMBEDDING_MODEL_NOT_LOADED
+            if ("not initialized" in msg or "not configured" in msg)
+            else ErrorCode.EMBEDDING_FAILED
+        )
+        log.warning("online_sparse_encode_failed", error=str(e))
+        return ResponseEnvelope(
+            success=False,
+            error=code,
+            detail=str(e),
+            request_id=request_id,
+        )
+
     return ResponseEnvelope(
         success=True,
         data=OnlineSparseEncodeData(
-            indices=sparse["indices"],
-            values=sparse["values"],
-            term_count=len(sparse["indices"]),
+            indices=sparse.indices,
+            values=sparse.values,
+            term_count=len(sparse.indices),
         ),
         request_id=request_id,
     )

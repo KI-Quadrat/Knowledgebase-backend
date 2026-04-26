@@ -7,7 +7,6 @@ from collections.abc import Awaitable
 
 from app.config import settings
 from app.services.embedding.bge_m3_client import EmbeddingError
-from app.services.embedding.bm25_encoder import BM25Encoder
 from app.services.embedding.qdrant_service import QdrantError, QdrantService
 from app.services.intelligence.chunker import Chunker
 from app.services.intelligence.classifier import Classifier
@@ -47,11 +46,10 @@ class IngestResult:
 class IngestService:
     """Orchestrates the full ingest pipeline: chunk → classify → embed → store.
 
-    When a ``fallback_embedder`` is provided (BGE-Gemma2 via LiteLLM) and
-    ``fallback_dense_dim`` is passed to ``ingest()``, the service stores
-    multi-vector points with ``dense_openai`` + ``dense_bge_gemma2`` (and
-    optionally ``sparse`` for hybrid mode). If one embedder fails during
-    ingest, the point is still stored with the other's vector.
+    One dense vector per point, named after the selected embedder
+    (``dense_openai`` or ``dense_bge_m3``). When ``search_mode`` is
+    ``hybrid`` an additional ``sparse`` vector is produced by the injected
+    TEI sparse client (``sparse.ki2.at``).
     """
 
     def __init__(
@@ -61,15 +59,14 @@ class IngestService:
         embedder,
         qdrant: QdrantService,
         contextual_enricher=None,
-        fallback_embedder=None,
+        sparse_embedder=None,
     ) -> None:
         self._chunker = chunker
         self._classifier = classifier
         self._embedder = embedder
         self._qdrant = qdrant
         self._contextual_enricher = contextual_enricher
-        self._fallback_embedder = fallback_embedder
-        self._bm25 = BM25Encoder()
+        self._sparse_embedder = sparse_embedder
 
     async def ingest(
         self,
@@ -85,16 +82,20 @@ class IngestService:
         chunk_overlap: int | None = None,
         vector_size: int = 1536,
         search_mode: str = "semantic",
-        fallback_dense_dim: int | None = None,
         content_type: list[str] | None = None,
         entities: dict | None = None,
         deferred_metadata_task: Awaitable[dict] | None = None,
         progress_queue: asyncio.Queue | None = None,
+        primary_embedder=None,
+        primary_vector_name: str = "dense_openai",
     ) -> IngestResult:
         start = time.monotonic()
         collection = collection_name
         use_sparse = search_mode == "hybrid"
-        use_multi_vector = self._fallback_embedder is not None and fallback_dense_dim is not None
+        # Per-request override of the configured primary embedder (e.g. swap
+        # OpenAI for the TEI BGE-M3 client). Defaults to the service-wide
+        # embedder injected at startup.
+        embedder = primary_embedder or self._embedder
 
         async def _emit(phase: str, **payload) -> None:
             if progress_queue is not None:
@@ -107,14 +108,11 @@ class IngestService:
 
         # Ensure collection exists with correct vector config
         try:
-            multi_vec = {"dense_openai": vector_size}
-            if use_multi_vector:
-                multi_vec["dense_bge_gemma2"] = fallback_dense_dim
             await self._qdrant.create_collection(
                 name=collection,
                 sparse=use_sparse,
                 distance="Cosine",
-                multi_vector=multi_vec,
+                multi_vector={primary_vector_name: vector_size},
             )
         except QdrantError as e:
             raise IngestError(str(e), code="QDRANT_CONNECTION_FAILED") from e
@@ -172,60 +170,51 @@ class IngestService:
             "amounts": len(classify_result.entities.amounts) if classify_result else 0,
         }
 
-        # 3. Embed all chunks — primary + fallback run in parallel so
-        # total embed latency is max(primary, fallback) instead of the sum.
+        # 3. Embed all chunks. Dense runs in parallel with sparse (when
+        # hybrid) so total embed latency is max(dense, sparse).
         embed_start = time.monotonic()
 
-        primary_task = asyncio.create_task(self._embedder.embed_batch(chunk_result.chunks))
-        fallback_task: asyncio.Task | None = None
-        if use_multi_vector:
-            fallback_task = asyncio.create_task(self._fallback_embedder.embed_batch(chunk_result.chunks))
+        dense_task = asyncio.create_task(embedder.embed_batch(chunk_result.chunks))
+        sparse_task: asyncio.Task | None = None
+        if use_sparse:
+            if self._sparse_embedder is None:
+                raise IngestError(
+                    "search_mode='hybrid' requested but no sparse embedder is configured",
+                    code="EMBEDDING_MODEL_NOT_LOADED",
+                )
+            sparse_task = asyncio.create_task(self._sparse_embedder.encode_batch(chunk_result.chunks))
 
-        openai_embeddings = None
-        primary_error: EmbeddingError | None = None
         try:
-            openai_embeddings = await primary_task
+            dense_embeddings = await dense_task
         except EmbeddingError as e:
-            primary_error = e
-            log.warning("ingest_primary_embed_failed", source_id=source_id, error=str(e))
-
-        fallback_embeddings = None
-        if fallback_task is not None:
-            try:
-                fallback_embeddings = await fallback_task
-            except EmbeddingError as e:
-                log.warning("ingest_fallback_embed_failed", source_id=source_id, error=str(e))
-
-        # If the only embedder failed and there's no fallback, surface the original error.
-        if not use_multi_vector and primary_error is not None:
-            error_msg = str(primary_error).lower()
+            error_msg = str(e).lower()
             if "oom" in error_msg or "memory" in error_msg:
-                raise IngestError(str(primary_error), code="EMBEDDING_OOM") from primary_error
+                raise IngestError(str(e), code="EMBEDDING_OOM") from e
             if "not initialized" in error_msg or "not loaded" in error_msg:
-                raise IngestError(str(primary_error), code="EMBEDDING_MODEL_NOT_LOADED") from primary_error
-            raise IngestError(str(primary_error), code="EMBEDDING_FAILED") from primary_error
+                raise IngestError(str(e), code="EMBEDDING_MODEL_NOT_LOADED") from e
+            raise IngestError(str(e), code="EMBEDDING_FAILED") from e
 
-        # At least one embedding source must succeed
-        if openai_embeddings is None and fallback_embeddings is None:
-            raise IngestError(
-                "Both primary and fallback embedding models failed",
-                code="EMBEDDING_FAILED",
-            )
+        sparse_embeddings: list | None = None
+        if sparse_task is not None:
+            try:
+                sparse_embeddings = await sparse_task
+            except EmbeddingError as e:
+                raise IngestError(f"Sparse embed failed: {e}", code="EMBEDDING_FAILED") from e
 
         embedding_time_ms = int((time.monotonic() - embed_start) * 1000)
         log.info(
             "ingest_embedded",
             source_id=source_id,
             chunks=len(chunk_result.chunks),
-            has_openai=openai_embeddings is not None,
-            has_bge_gemma2=fallback_embeddings is not None,
+            primary_vector=primary_vector_name,
+            has_sparse=sparse_embeddings is not None,
             duration_ms=embedding_time_ms,
         )
         await _emit(
             "embedded",
             chunks=len(chunk_result.chunks),
-            has_openai=openai_embeddings is not None,
-            has_bge_gemma2=fallback_embeddings is not None,
+            primary_vector=primary_vector_name,
+            has_sparse=sparse_embeddings is not None,
             duration_ms=embedding_time_ms,
         )
 
@@ -310,17 +299,12 @@ class IngestService:
                 "metadata": point_metadata,
             }
 
-            # Build vectors dict — always use dense_openai as the primary name
-            vectors: dict = {}
-
-            if openai_embeddings:
-                vectors["dense_openai"] = openai_embeddings[i].dense
-            if use_multi_vector and fallback_embeddings:
-                vectors["dense_bge_gemma2"] = fallback_embeddings[i].dense
-
-            # Include BM25 sparse vector for hybrid search mode
-            if use_sparse:
-                vectors["sparse"] = self._bm25.encode(chunk_text)
+            # Build vectors dict — one dense vector named after the selected
+            # embedder (dense_openai / dense_bge_m3) plus an optional TEI
+            # sparse vector when hybrid mode is on.
+            vectors: dict = {primary_vector_name: dense_embeddings[i].dense}
+            if use_sparse and sparse_embeddings is not None:
+                vectors["sparse"] = sparse_embeddings[i].as_dict()
 
             point = {
                 "id": str(uuid.uuid5(uuid.NAMESPACE_URL, chunk_id)),
