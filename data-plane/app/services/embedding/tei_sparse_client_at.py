@@ -105,7 +105,29 @@ class TEISparseClientAT:
             raise EmbeddingError("TEI sparse client not initialized")
         if not self._api_key:
             raise EmbeddingError("SPARSE_EMBED_API_KEY_AT not configured")
+        if not texts:
+            return []
 
+        # The TEI sparse server enforces --max-client-batch-size (default 32).
+        # Split larger inputs into sequential windows; window=0 disables split.
+        max_batch = ext.sparse_embed_max_batch_at or len(texts)
+        start = time.monotonic()
+        results: list[SparseVector] = []
+        for offset in range(0, len(texts), max_batch):
+            window = texts[offset : offset + max_batch]
+            results.extend(await self._encode_window(window))
+        duration = int((time.monotonic() - start) * 1000)
+
+        log.info(
+            "tei_sparse_encode_complete",
+            count=len(texts),
+            duration_ms=duration,
+            windows=(len(texts) + max_batch - 1) // max_batch,
+        )
+        return results
+
+    async def _encode_window(self, texts: list[str]) -> list[SparseVector]:
+        """POST a single ≤max_batch window to /embed_sparse and parse the response."""
         payload: dict = {"texts": texts}
 
         headers = {
@@ -186,5 +208,4 @@ class TEISparseClientAT:
                 )
             )
 
-        log.info("tei_sparse_encode_complete", count=len(texts), duration_ms=duration)
         return results

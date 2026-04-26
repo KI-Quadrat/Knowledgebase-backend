@@ -62,7 +62,29 @@ class TEIEmbedClientAT:
             raise EmbeddingError("TEI AT embed client not initialized")
         if not self._api_key:
             raise EmbeddingError("TEI_EMBED_API_KEY_AT not configured")
+        if not texts:
+            return []
 
+        # The TEI dense server enforces --max-client-batch-size (default 32).
+        # Split larger inputs into sequential windows; window=0 disables split.
+        max_batch = ext.tei_embed_max_batch_at or len(texts)
+        start = time.monotonic()
+        results: list[EmbeddingResult] = []
+        for offset in range(0, len(texts), max_batch):
+            window = texts[offset : offset + max_batch]
+            results.extend(await self._embed_window(window))
+        duration = int((time.monotonic() - start) * 1000)
+
+        log.info(
+            "tei_embed_at_complete",
+            count=len(texts),
+            duration_ms=duration,
+            windows=(len(texts) + max_batch - 1) // max_batch,
+        )
+        return results
+
+    async def _embed_window(self, texts: list[str]) -> list[EmbeddingResult]:
+        """POST a single ≤max_batch window to /v1/embeddings and parse the response."""
         # The embed.ki2.at deployment returns an empty 200 body when ``model``
         # is missing, so always send it — default comes from TEI_EMBED_MODEL_AT.
         payload: dict = {"input": texts, "model": self._model}
@@ -119,9 +141,7 @@ class TEIEmbedClientAT:
                 f"TEI AT response had no 'data' entries (got: {preview})"
             )
 
-        results = [
+        return [
             EmbeddingResult(dense=item["embedding"], sparse=None, duration_ms=duration)
             for item in items
         ]
-        log.info("tei_embed_at_complete", count=len(texts), duration_ms=duration)
-        return results
