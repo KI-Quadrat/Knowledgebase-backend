@@ -118,9 +118,11 @@ class ExternalSettings(BaseSettings):
     tei_cf_access_client_id_at: str = ""
     tei_cf_access_client_secret_at: str = ""
 
-    # TEI sparse endpoint (SPLADE / BGE-M3 sparse head) used for hybrid-search
-    # sparse vectors. Same auth pattern as tei_embed_* above — bearer token
-    # plus optional Cloudflare Access service-token headers.
+    # Sparse embedding endpoint used for hybrid-search sparse vectors.
+    # Dedicated POST {sparse_embed_url_at}/embed_sparse with body {"texts": [...]};
+    # bearer ``sparse_embed_api_key_at`` plus optional Cloudflare Access
+    # service-token headers. ``sparse_embed_model_at`` is unused by the request
+    # (the endpoint serves a fixed model) and is retained only for logging.
     sparse_embed_url_at: str = "https://sparse.ki2.at"
     sparse_embed_api_key_at: str = ""
     sparse_embed_model_at: str = "BAAI/bge-m3"

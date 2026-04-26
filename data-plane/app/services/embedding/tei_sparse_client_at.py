@@ -1,10 +1,12 @@
 """TEI sparse embedding client for hybrid search.
 
-Talks to a self-hosted TEI server (e.g. SPLADE) at ``SPARSE_EMBED_URL_AT`` that
-exposes an OpenAI-compatible ``POST /v1/embeddings`` endpoint and returns
-sparse vectors. Auth pattern mirrors :mod:`tei_client_at` (bearer + optional
-Cloudflare Access service-token headers) so the sparse service can live behind
-the same CF Access perimeter as ``embed.ki2.at``.
+Talks to the self-hosted sparse-embedding server at ``SPARSE_EMBED_URL_AT``
+via its dedicated ``POST /embed_sparse`` endpoint, which accepts a batch of
+texts in ``{"texts": [...]}`` form and returns one sparse vector per text.
+Auth: bearer ``SPARSE_EMBED_API_KEY_AT`` plus optional Cloudflare Access
+service-token headers (``CF-Access-Client-Id`` / ``CF-Access-Client-Secret``)
+so the sparse service can live behind the same CF Access perimeter as
+``embed.ki2.at``.
 
 Used by the online ingest pipeline (``vector_config.search_mode = "hybrid"``)
 and the query side of :class:`SearchService` when the caller asks for hybrid
@@ -65,13 +67,12 @@ def _parse_sparse_entry(entry) -> tuple[list[int], list[float]]:
 
 
 class TEISparseClientAT:
-    """HTTP client for the TEI sparse embedding server (OpenAI-compatible)."""
+    """HTTP client for the sparse embedding server (POST /embed_sparse)."""
 
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
         self._base_url = ext.sparse_embed_url_at.rstrip("/")
         self._api_key = ext.sparse_embed_api_key_at
-        self._model = ext.sparse_embed_model_at
         self._cf_client_id = ext.sparse_cf_access_client_id_at
         self._cf_client_secret = ext.sparse_cf_access_client_secret_at
 
@@ -85,7 +86,6 @@ class TEISparseClientAT:
         log.info(
             "tei_sparse_client_at_started",
             url=self._base_url,
-            model=self._model or "<server-default>",
             cf_access=bool(self._cf_client_id and self._cf_client_secret),
         )
 
@@ -106,7 +106,7 @@ class TEISparseClientAT:
         if not self._api_key:
             raise EmbeddingError("SPARSE_EMBED_API_KEY_AT not configured")
 
-        payload: dict = {"input": texts, "model": self._model}
+        payload: dict = {"texts": texts}
 
         headers = {
             "Accept": "application/json",
@@ -120,7 +120,7 @@ class TEISparseClientAT:
         start = time.monotonic()
         try:
             resp = await self._client.post(
-                f"{self._base_url}/v1/embeddings",
+                f"{self._base_url}/embed_sparse",
                 headers=headers,
                 json=payload,
             )
@@ -142,18 +142,25 @@ class TEISparseClientAT:
                 f"body[:300]={preview!r})"
             ) from e
 
-        # Two response shapes covered:
-        #   OpenAI-compat → {"data": [{"embedding": <sparse-entry>, "index": i}, ...]}
-        #   TEI native    → [<sparse-entry>, ...]
+        # Response shapes covered (one entry per input text, batch-ordered):
+        #   list-wrapped     → [<sparse-entry>, ...]
+        #   dict-wrapped     → {"embeddings": [<sparse-entry>, ...]} or
+        #                       {"data": [{"embedding": <sparse-entry>, "index": i}, ...]}
+        # A <sparse-entry> itself is one of the shapes _parse_sparse_entry handles.
         entries: list
-        if isinstance(data, dict):
-            items = data.get("data", [])
-            if not items:
-                raise EmbeddingError(f"TEI sparse response had no 'data' entries (got: {str(data)[:300]})")
-            items = sorted(items, key=lambda x: x.get("index", 0))
-            entries = [item.get("embedding") for item in items]
-        elif isinstance(data, list):
+        if isinstance(data, list):
             entries = data
+        elif isinstance(data, dict):
+            if isinstance(data.get("embeddings"), list):
+                entries = data["embeddings"]
+            elif isinstance(data.get("data"), list):
+                items = sorted(data["data"], key=lambda x: x.get("index", 0))
+                entries = [item.get("embedding") for item in items]
+            else:
+                raise EmbeddingError(
+                    f"TEI sparse response had no recognizable batch field "
+                    f"(got keys: {list(data.keys())[:10]})"
+                )
         else:
             raise EmbeddingError(f"TEI sparse: unexpected response type {type(data).__name__}")
 

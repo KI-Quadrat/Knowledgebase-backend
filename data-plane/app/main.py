@@ -239,12 +239,35 @@ tags_metadata = [
     {
         "name": "Online - Ingestion Pipeline (AT)",
         "description": "Dedicated ingest for the Austrian funding assistant (`POST /api/v1/online/ingest/at`). "
-        "Runs against a separate Qdrant instance (configured via `QDRANT_URL_AT` / `QDRANT_PORT_AT` / `QDRANT_API_KEY_AT`) "
-        "with per-province collections: `Burgenland`, `Kärnten`, `Niederösterreich`, `Oberösterreich`, "
-        "`Salzburg`, `Steiermark`, `Tirol`, `Vorarlberg`, `Wien`.\n\n"
-        "Country (AT) and assistant type (funding) are implicit. The funding extractor's "
-        "`state_or_province` output selects target collections; an empty list fans out to all nine. "
-        "Callers can override by supplying `state_or_province` (German or English lowercase forms).",
+        "Runs against a separate Qdrant instance (configured via `QDRANT_URL_AT` / `QDRANT_PORT_AT` / `QDRANT_API_KEY_AT`).\n\n"
+        "**Caller picks the target collection** via `collection_name` — it is auto-created on first use "
+        "with the AT legacy schema (single unnamed cosine vector at the embedder's dim, plus keyword "
+        "indexes on `metadata.source_id` / `metadata.source_url`). There is **no per-province collection "
+        "routing** — `state_or_province` is stored as metadata only (English lowercase) for search-time "
+        "filtering, with the request-body value overriding the funding extractor's output when supplied.\n\n"
+        "Country (AT) and assistant type (funding) are implicit. The funding extractor always runs and "
+        "its output is merged into `metadata.*`.\n\n"
+        "**Embedding model** is selectable per request via `embedding_model`: `bge_m3` (default) uses "
+        "TEI at `TEI_EMBED_URL_AT` (1024-dim); `openai` uses `text-embedding-3-small` (1536-dim). "
+        "Switching models requires a new collection name.",
+    },
+    {
+        "name": "Online - Vector Management",
+        "description": "Delete or sparse-encode vectors on the default online Qdrant instance.\n\n"
+        "- `DELETE /online/vectors/{source_id}?collection_name=...` — remove all vectors for a document\n"
+        "- `POST /online/vectors/delete-by-filter` — remove vectors matching metadata filters (AND-combined)\n"
+        "- `POST /online/vectors/sparse-encode` — return the TEI sparse vector for arbitrary text "
+        "(same encoder used by hybrid ingest/search at `SPARSE_EMBED_URL_AT`)\n\n"
+        "**Optional X-API-Key header** — required only when `DP_ONLINE_API_KEYS` is configured.",
+    },
+    {
+        "name": "Online - Vector Management (AT)",
+        "description": "Delete vectors on the AT Qdrant instance (`QDRANT_URL_AT` / `QDRANT_PORT_AT` / `QDRANT_API_KEY_AT`).\n\n"
+        "- `DELETE /online/vectors/at/{source_id}?collection_name=...` — mirrors the default delete "
+        "endpoint, only the target Qdrant instance differs. `collection_name` must be one of the "
+        "nine AT province collections (`Burgenland`, `Kärnten`, `Niederösterreich`, `Oberösterreich`, "
+        "`Salzburg`, `Steiermark`, `Tirol`, `Vorarlberg`, `Wien`).\n\n"
+        "**Optional X-API-Key header** — required only when `DP_ONLINE_API_KEYS` is configured.",
     },
     {
         "name": "Content Intelligence",
