@@ -66,6 +66,9 @@ class ExternalSettings(BaseSettings):
 
     # BGE-M3
     bge_m3_url: str = "http://bge-m3:8080"
+    # Per-request batch cap for the self-hosted BGE-M3 server. embed_batch
+    # splits larger inputs into windows of this size. 0 disables splitting.
+    bge_m3_max_batch: int = 32
 
     # Qdrant
     qdrant_url: str = "http://qdrant:6333"
@@ -103,6 +106,15 @@ class ExternalSettings(BaseSettings):
     # OpenAI
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+    # Per-request batch cap for OpenAI /v1/embeddings. The API allows up to
+    # 2048 inputs (and ~300K tokens) per request; smaller windows keep
+    # individual requests bounded. 0 disables splitting.
+    openai_embed_max_batch: int = 256
+    # Per-call cap for the contextual enricher's batched chat-completion path
+    # (one JSON array of contexts per call). Larger inputs are split into
+    # parallel windows of this size. 0 disables splitting (single call for
+    # all chunks — risks max_tokens truncation on big docs).
+    openai_contextual_max_batch: int = 32
 
     # TEI — AT-specific embedding endpoint used by POST /api/v1/online/ingest/at.
     # OpenAI-compatible server exposing POST {TEI_EMBED_URL_AT}/v1/embeddings.
@@ -117,6 +129,9 @@ class ExternalSettings(BaseSettings):
     tei_embed_model_at: str = "BAAI/bge-m3"
     tei_cf_access_client_id_at: str = ""
     tei_cf_access_client_secret_at: str = ""
+    # Per-request cap enforced by the TEI dense server (--max-client-batch-size).
+    # embed_batch splits larger inputs into sequential windows. 0 disables split.
+    tei_embed_max_batch_at: int = 32
 
     # Sparse embedding endpoint used for hybrid-search sparse vectors.
     # Dedicated POST {sparse_embed_url_at}/embed_sparse with body {"texts": [...]};
@@ -128,6 +143,10 @@ class ExternalSettings(BaseSettings):
     sparse_embed_model_at: str = "BAAI/bge-m3"
     sparse_cf_access_client_id_at: str = ""
     sparse_cf_access_client_secret_at: str = ""
+    # Per-request cap enforced by the TEI sparse server (max-client-batch-size).
+    # Larger inputs to ``encode_batch`` are split into windows of this size and
+    # POSTed sequentially. Set to 0 to disable splitting (single request).
+    sparse_embed_max_batch_at: int = 32
 
     # LDAP
     ldap_url: str = ""

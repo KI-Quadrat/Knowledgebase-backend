@@ -64,7 +64,29 @@ class BGEM3Client:
         """Generate embeddings for a batch of texts."""
         if not self._client:
             raise EmbeddingError("BGE-M3 client not initialized")
+        if not texts:
+            return []
 
+        # Self-hosted BGE-M3 has finite GPU memory; split larger inputs into
+        # sequential windows of ext.bge_m3_max_batch. 0 disables splitting.
+        max_batch = ext.bge_m3_max_batch or len(texts)
+        start = time.monotonic()
+        results: list[EmbeddingResult] = []
+        for offset in range(0, len(texts), max_batch):
+            window = texts[offset : offset + max_batch]
+            results.extend(await self._embed_window(window))
+        duration = int((time.monotonic() - start) * 1000)
+
+        log.info(
+            "bge_m3_embed_complete",
+            count=len(texts),
+            duration_ms=duration,
+            windows=(len(texts) + max_batch - 1) // max_batch,
+        )
+        return results
+
+    async def _embed_window(self, texts: list[str]) -> list[EmbeddingResult]:
+        """POST a single ≤max_batch window to /embed and parse the response."""
         start = time.monotonic()
         try:
             resp = await self._client.post(
@@ -83,11 +105,11 @@ class BGEM3Client:
         dense_embeddings = data.get("dense", [])
         sparse_embeddings = data.get("sparse", [None] * len(texts))
 
-        results = []
-        for i in range(len(texts)):
-            dense = dense_embeddings[i] if i < len(dense_embeddings) else []
-            sparse = sparse_embeddings[i] if i < len(sparse_embeddings) else None
-            results.append(EmbeddingResult(dense=dense, sparse=sparse, duration_ms=duration))
-
-        log.info("bge_m3_embed_complete", count=len(texts), duration_ms=duration)
-        return results
+        return [
+            EmbeddingResult(
+                dense=dense_embeddings[i] if i < len(dense_embeddings) else [],
+                sparse=sparse_embeddings[i] if i < len(sparse_embeddings) else None,
+                duration_ms=duration,
+            )
+            for i in range(len(texts))
+        ]

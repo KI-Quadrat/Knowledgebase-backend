@@ -77,7 +77,12 @@ class ContextualEnricher:
     ) -> list[str]:
         """Prepend contextual descriptions to each chunk.
 
-        Returns a list of enriched chunks: "{context}\n\n{original_chunk}"
+        Returns a list of enriched chunks: "{context}\n\n{original_chunk}".
+
+        Splits chunks into windows of ext.openai_contextual_max_batch and runs
+        one batched OpenAI call per window in parallel. Each window falls back
+        to per-chunk independently if its batched call fails (so successful
+        windows aren't discarded alongside failed ones).
         """
         if not chunks:
             return chunks
@@ -87,37 +92,43 @@ class ContextualEnricher:
         # Truncate document to ~6000 chars for the prompt to stay within token limits
         doc_summary = document[:6000]
 
-        # Try the batched single-call path first.
-        contexts = await self._enrich_batch_single_call(doc_summary, chunks)
-        if contexts is not None:
-            enriched = [
-                f"{ctx}\n\n{chunk}" if ctx else chunk
-                for ctx, chunk in zip(contexts, chunks)
-            ]
-            duration = int((time.monotonic() - start) * 1000)
-            log.info(
-                "contextual_enrichment_complete",
-                chunks=len(chunks),
-                duration_ms=duration,
-                mode="batch",
-            )
-            return enriched
-
-        # Fallback: per-chunk parallel calls (higher cost, used only when batch fails).
-        tasks = [
-            self._enrich_single(doc_summary, chunk)
-            for chunk in chunks
+        max_batch = ext.openai_contextual_max_batch or len(chunks)
+        windows = [
+            chunks[i : i + max_batch] for i in range(0, len(chunks), max_batch)
         ]
-        enriched = await asyncio.gather(*tasks)
+
+        window_results = await asyncio.gather(
+            *(self._enrich_window(doc_summary, w) for w in windows)
+        )
+        enriched = [item for window_enriched, _ in window_results for item in window_enriched]
+        fallbacks = sum(1 for _, fell_back in window_results if fell_back)
 
         duration = int((time.monotonic() - start) * 1000)
         log.info(
             "contextual_enrichment_complete",
             chunks=len(chunks),
             duration_ms=duration,
-            mode="per_chunk_fallback",
+            windows=len(windows),
+            fallback_windows=fallbacks,
         )
         return enriched
+
+    async def _enrich_window(
+        self, document: str, chunks: list[str]
+    ) -> tuple[list[str], bool]:
+        """Enrich one window of chunks. Returns (enriched, fell_back_to_per_chunk)."""
+        contexts = await self._enrich_batch_single_call(document, chunks)
+        if contexts is not None:
+            return [
+                f"{ctx}\n\n{chunk}" if ctx else chunk
+                for ctx, chunk in zip(contexts, chunks)
+            ], False
+
+        # Per-chunk fallback for this window only.
+        enriched = await asyncio.gather(
+            *(self._enrich_single(document, chunk) for chunk in chunks)
+        )
+        return list(enriched), True
 
     async def _enrich_batch_single_call(
         self, document: str, chunks: list[str]
