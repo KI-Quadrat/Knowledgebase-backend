@@ -144,8 +144,9 @@ class TEISparseClientAT:
 
         # Response shapes covered (one entry per input text, batch-ordered):
         #   list-wrapped     → [<sparse-entry>, ...]
-        #   dict-wrapped     → {"embeddings": [<sparse-entry>, ...]} or
-        #                       {"data": [{"embedding": <sparse-entry>, "index": i}, ...]}
+        #   dict-wrapped     → {"embeddings": [<sparse-entry>, ...]},
+        #                       {"sparse":     [<sparse-entry>, ...]} (sparse.ki2.at), or
+        #                       {"data":       [{"embedding": <sparse-entry>, "index": i}, ...]}
         # A <sparse-entry> itself is one of the shapes _parse_sparse_entry handles.
         entries: list
         if isinstance(data, list):
@@ -153,6 +154,8 @@ class TEISparseClientAT:
         elif isinstance(data, dict):
             if isinstance(data.get("embeddings"), list):
                 entries = data["embeddings"]
+            elif isinstance(data.get("sparse"), list):
+                entries = data["sparse"]
             elif isinstance(data.get("data"), list):
                 items = sorted(data["data"], key=lambda x: x.get("index", 0))
                 entries = [item.get("embedding") for item in items]
