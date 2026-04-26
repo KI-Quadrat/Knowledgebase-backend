@@ -5,9 +5,10 @@ class ServiceStatus(BaseModel):
     """Status of each external dependency checked during readiness."""
 
     qdrant: bool = Field(False, description="Qdrant vector database reachable")
-    bge_m3: bool = Field(False, description="BGE-M3 embedding model loaded and responding")
-    openai_embedder: bool = Field(False, description="OpenAI embeddings API reachable (primary online embedder)")
-    bge_gemma2: bool = Field(False, description="BGE-Gemma2 via LiteLLM reachable (fallback online embedder)")
+    bge_m3: bool = Field(False, description="Local BGE-M3 embedding service reachable")
+    openai_embedder: bool = Field(False, description="OpenAI embeddings API reachable")
+    tei_embedder_at: bool = Field(False, description="TEI BGE-M3 embedding endpoint (embed.ki2.at) reachable")
+    sparse_embedder: bool = Field(False, description="TEI sparse embedding endpoint (sparse.ki2.at) reachable")
     parser: bool = Field(False, description="Document parser available (LlamaParse or Unstructured)")
     crawl4ai: bool = Field(False, description="Crawl4AI web scraping service available")
     ldap: bool = Field(False, description="LDAP/Active Directory server reachable")
@@ -64,7 +65,8 @@ class ReadyResponse(BaseModel):
                         "qdrant": True,
                         "bge_m3": True,
                         "openai_embedder": True,
-                        "bge_gemma2": True,
+                        "tei_embedder_at": True,
+                        "sparse_embedder": True,
                         "parser": True,
                         "crawl4ai": True,
                         "ldap": True,

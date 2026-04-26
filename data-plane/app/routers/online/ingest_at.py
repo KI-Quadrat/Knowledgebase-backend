@@ -41,6 +41,7 @@ import time
 from fastapi import APIRouter, Request
 
 from app.models.common import ErrorCode, ResponseEnvelope
+from app.models.online.ingest import EmbeddingModel
 from app.models.online.ingest_at import OnlineIngestATData, OnlineIngestATRequest
 from app.services.embedding.bge_m3_client import EmbeddingError
 from app.services.embedding.qdrant_service import QdrantError
@@ -217,11 +218,13 @@ async def _delete_existing_by_source_id(qdrant, collection: str, source_id: str)
     description=(
         "AT funding-assistant ingest. The country (AT) and assistant type "
         "(funding) are implicit — do not pass them in the body.\n\n"
-        "**Flow:** chunk → optional contextual enrichment → TEI embed "
-        "(1024-dim, cosine) → upsert to `body.collection_name` on the AT "
-        "Qdrant instance. The collection is auto-created with the AT legacy "
-        "schema (single unnamed 1024-dim cosine vector + keyword indexes on "
-        "`metadata.source_id` / `metadata.source_url`) on first use.\n\n"
+        "**Flow:** chunk → optional contextual enrichment → embed "
+        "(model picked by `embedding_model`) → upsert to `body.collection_name` "
+        "on the AT Qdrant instance. The collection is auto-created on first use "
+        "with the AT legacy schema (single unnamed cosine vector at the "
+        "embedder's dim + keyword indexes on `metadata.source_id` / "
+        "`metadata.source_url`); a dim mismatch with the chosen model fails "
+        "fast with `QDRANT_COLLECTION_NOT_FOUND`.\n\n"
         "**Metadata:** the funding extractor runs unconditionally and its "
         "output (title, program_name, processing_office, contract_email, "
         "contract_phone, state_or_province, funding_type, status, …) is "
@@ -232,8 +235,11 @@ async def _delete_existing_by_source_id(qdrant, collection: str, source_id: str)
         "the indexed `metadata.source_id` field before upsert — a repeat ingest "
         "fully replaces stored chunks, correctly handling cases where the new "
         "content produces a different chunk count.\n\n"
-        "**Embedding:** uses the TEI server at `TEI_EMBED_URL_AT` "
-        "(OpenAI-compatible, bearer-auth via `TEI_EMBED_API_KEY_AT`).\n\n"
+        "**Embedding:** picked by `embedding_model`. `bge_m3` (default) uses "
+        "the TEI server at `TEI_EMBED_URL_AT` (OpenAI-compatible, bearer-auth "
+        "via `TEI_EMBED_API_KEY_AT`, 1024-dim, stored in the AT collection's "
+        "single unnamed vector slot). `openai` uses `text-embedding-3-small` "
+        "(1536-dim) and requires a fresh collection sized to that dim.\n\n"
         "**Qdrant target:** uses `QDRANT_URL_AT` / `QDRANT_PORT_AT` / `QDRANT_API_KEY_AT` "
         "when set, falling back to the default Qdrant endpoint otherwise. "
         "`QDRANT_PORT_AT` has no default — leave it unset when the port is "
@@ -269,9 +275,19 @@ async def ingest_online_at(
 
     chunker = request.app.state.chunker
     contextual_enricher = request.app.state.contextual_enricher
-    tei_embedder = request.app.state.tei_embedder_at
     qdrant = request.app.state.qdrant_at
     extractor = request.app.state.funding_extractor
+
+    # Embedder selection — bge_m3 (default) hits the TEI endpoint (1024-dim);
+    # openai uses text-embedding-3-small (1536-dim). The AT collection is
+    # auto-created at the matching dim below, so switching models requires a
+    # fresh collection name.
+    if body.embedding_model == EmbeddingModel.openai:
+        embedder = request.app.state.openai_embedder
+        dense_dim = 1536
+    else:
+        embedder = request.app.state.tei_embedder_at
+        dense_dim = 1024
 
     # ── 1. Funding extraction (once) ──
     extracted = await _safe_extract_funding(
@@ -308,10 +324,10 @@ async def ingest_online_at(
         except Exception as e:
             log.warning("ingest_online_at_contextual_failed", source_id=body.source_id, error=str(e))
 
-    # ── 3. Embed once via TEI (unnamed 1024-dim cosine vector) ──
+    # ── 3. Embed once via selected model (unnamed cosine vector) ──
     embed_start = time.monotonic()
     try:
-        embeddings = await tei_embedder.embed_batch(chunks)
+        embeddings = await embedder.embed_batch(chunks)
     except EmbeddingError as e:
         msg = str(e).lower()
         if "oom" in msg or "memory" in msg:
@@ -354,7 +370,7 @@ async def ingest_online_at(
     # ── 5. Build + upsert points (single collection) ──
     collection = body.collection_name
     try:
-        await qdrant.ensure_at_collection(collection)
+        await qdrant.ensure_at_collection(collection, dense_dim=dense_dim)
     except QdrantError as e:
         msg = str(e).lower()
         if "connection" in msg:
