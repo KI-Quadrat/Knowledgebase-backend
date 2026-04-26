@@ -1,0 +1,125 @@
+name: Build and Push Image
+
+on:
+  push:
+    tags:
+      - 'knowledgebase/v*-dev.*'
+      - 'knowledgebase/v*-stg1.*'
+
+permissions:
+  contents: read
+
+env:
+  HARBOR_REGISTRY: ${{ vars.HARBOR_REGISTRY }}
+  HARBOR_PROJECT: ${{ vars.HARBOR_PROJECT }}
+  HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+  HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.parse.outputs.image_tag }}
+      env: ${{ steps.parse.outputs.env }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Parse tag
+        id: parse
+        run: |
+          TAG="${GITHUB_REF_NAME}"             # e.g. knowledgebase/v1.0.0-dev.0
+          VERSION="${TAG#*/}"                  # v1.0.0-dev.0
+          IMAGE_TAG="${VERSION#v}"             # 1.0.0-dev.0
+          SHORT_SHA="${GITHUB_SHA::7}"         # e.g. a3b480b
+
+          # Extract env from pre-release segment (1.0.0-dev.0 → dev)
+          PRERELEASE="${IMAGE_TAG#*-}"
+          if [ "$PRERELEASE" = "$IMAGE_TAG" ]; then
+            ENV="dev"
+          else
+            ENV="${PRERELEASE%%.*}"
+          fi
+          ENV="${ENV:-dev}"
+
+          echo "image_tag=$IMAGE_TAG"   >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA"   >> $GITHUB_OUTPUT
+          echo "env=$ENV"               >> $GITHUB_OUTPUT
+
+      - name: Login to Harbor
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.HARBOR_REGISTRY }}
+          username: ${{ env.HARBOR_USERNAME }}
+          password: ${{ env.HARBOR_PASSWORD }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: data-plane
+          file: data-plane/Dockerfile
+          push: true
+          build-args: |
+            VERSION=${{ steps.parse.outputs.image_tag }}
+            GIT_COMMIT=${{ steps.parse.outputs.short_sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+          tags: |
+            ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/knowledgebase:${{ steps.parse.outputs.image_tag }}
+            ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/knowledgebase:${{ steps.parse.outputs.short_sha }}
+            ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/knowledgebase:latest-${{ steps.parse.outputs.env }}
+
+  update-values:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - name: Checkout config repo
+        uses: actions/checkout@v4
+        with:
+          repository: KI-Quadrat/k8s-platform-config
+          ssh-key: ${{ secrets.K8S_CONFIG_DEPLOY_KEY }}
+          ref: dev
+
+      - name: Install yq
+        run: |
+          sudo wget -O /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Resolve values file path
+        id: resolve
+        run: |
+          if [ "${{ needs.build-and-push.outputs.env }}" = "stg1" ]; then
+            echo "file=apps/core-services/dev/knowledgebasestg/values.yaml" >> $GITHUB_OUTPUT
+          else
+            echo "file=apps/core-services/dev/knowledgebase/values.yaml" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update image tag in values.yaml
+        run: |
+          FILE="${{ steps.resolve.outputs.file }}"
+          export TAG="${{ needs.build-and-push.outputs.image_tag }}"
+
+          yq -i '.image.tag = strenv(TAG)' "$FILE"
+
+          echo "Updated $FILE"
+          cat "$FILE"
+
+      - name: Commit and push changes
+        run: |
+          FILE="${{ steps.resolve.outputs.file }}"
+          TAG="${{ needs.build-and-push.outputs.image_tag }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "$FILE"
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "chore: update knowledgebase image tag to ${TAG}"
+          git push origin dev
+#ggjggkhgkgkgggg
