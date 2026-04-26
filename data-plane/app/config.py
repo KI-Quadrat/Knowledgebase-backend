@@ -100,12 +100,6 @@ class ExternalSettings(BaseSettings):
     clickhouse_user: str = "dataplane"
     clickhouse_password: str = ""
 
-    # LiteLLM (self-hosted proxy for fallback embedding model)
-    litellm_url: str = "http://litellm:4000"
-    litellm_api_key: str = ""
-    bge_gemma2_model: str = "bge-multilingual-gemma2"
-    bge_gemma2_dense_dim: int = 3584
-
     # OpenAI
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
@@ -123,6 +117,15 @@ class ExternalSettings(BaseSettings):
     tei_embed_model_at: str = "BAAI/bge-m3"
     tei_cf_access_client_id_at: str = ""
     tei_cf_access_client_secret_at: str = ""
+
+    # TEI sparse endpoint (SPLADE / BGE-M3 sparse head) used for hybrid-search
+    # sparse vectors. Same auth pattern as tei_embed_* above — bearer token
+    # plus optional Cloudflare Access service-token headers.
+    sparse_embed_url_at: str = "https://sparse.ki2.at"
+    sparse_embed_api_key_at: str = ""
+    sparse_embed_model_at: str = "BAAI/bge-m3"
+    sparse_cf_access_client_id_at: str = ""
+    sparse_cf_access_client_secret_at: str = ""
 
     # LDAP
     ldap_url: str = ""

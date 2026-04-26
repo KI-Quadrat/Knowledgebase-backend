@@ -1,5 +1,7 @@
 from pydantic import BaseModel, Field
 
+from app.models.online.ingest import EmbeddingModel
+
 
 class UserContext(BaseModel):
     """User identity for permission-filtered search.
@@ -28,19 +30,26 @@ class SearchRequest(BaseModel):
     are visible based on ACL visibility and group membership.
 
     **Search modes:**
-    - `semantic` (default) — dense-only cosine search via OpenAI embeddings
-    - `hybrid` — dense (OpenAI) + sparse (BM25) with Reciprocal Rank Fusion (RRF)
+    - `semantic` (default) — dense-only cosine search
+    - `hybrid` — dense + sparse (TEI sparse at `SPARSE_EMBED_URL_AT`) with Reciprocal Rank Fusion (RRF)
 
-    Set ``enable_fallback: true`` if the collection was ingested with fallback enabled.
-    This searches ``dense_openai`` and falls back to ``dense_bge_gemma2`` if OpenAI is down.
+    ``embedding_model`` must match the model that ingested the collection
+    (``openai`` → ``dense_openai`` vector, ``bge_m3`` → ``dense_bge_m3``).
     """
 
     collection_name: str = Field(..., description="Qdrant collection name to search in")
     query: str = Field(..., min_length=1, description="Natural language search query")
     user: UserContext = Field(..., description="User identity for permission filtering (always required)")
     filters: SearchFilters | None = Field(None, description="Optional content filters")
-    search_mode: str = Field("semantic", description="'semantic' (dense cosine only, default) or 'hybrid' (dense + BM25 sparse with RRF)")
-    enable_fallback: bool = Field(False, description="Set to true if the collection was ingested with enable_fallback=true. Searches dense_openai first, falls back to dense_bge_gemma2 via LiteLLM when OpenAI is unavailable.")
+    search_mode: str = Field("semantic", description="'semantic' (dense cosine only, default) or 'hybrid' (dense + TEI sparse with RRF)")
+    embedding_model: EmbeddingModel = Field(
+        EmbeddingModel.openai,
+        description=(
+            "Which dense vector to query. Must match the model used at ingest "
+            "time: `openai` → `dense_openai` (1536-dim, text-embedding-3-small); "
+            "`bge_m3` → `dense_bge_m3` (1024-dim, BGE-M3 via TEI)."
+        ),
+    )
     top_k: int = Field(10, ge=1, le=100, description="Maximum number of results to return")
     score_threshold: float = Field(0.5, ge=0.0, le=1.0, description="Minimum similarity score (0.0 = all, 1.0 = exact match). Used for semantic mode only.")
 

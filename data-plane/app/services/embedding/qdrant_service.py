@@ -148,7 +148,7 @@ class QdrantService:
 
         Args:
             multi_vector: Optional mapping of vector names to dimensions, e.g.
-                ``{"dense_openai": 1536, "dense_bge_gemma2": 3584}``.
+                ``{"dense_openai": 1536}`` or ``{"dense_bge_m3": 1024}``.
                 When provided, ``dense_dim`` is ignored and each entry
                 becomes a named vector in the collection.
         """

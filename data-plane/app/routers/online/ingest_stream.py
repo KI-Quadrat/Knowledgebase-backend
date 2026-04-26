@@ -22,9 +22,9 @@ from collections.abc import AsyncIterator
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
-from app.config import ext
 from app.models.online.ingest import OnlineIngestRequest
 from app.routers._ingest_utils import INGEST_ERROR_CODE_MAP
+from app.routers.online.ingest import _resolve_primary_embedder
 from app.services.ingest.ingest_service import IngestError
 from app.utils.logger import get_logger
 
@@ -38,7 +38,7 @@ PROGRESS_PHASES = (
     "started",            # {source_id}
     "chunked",            # {chunks}
     "enriched",           # {chunks} — only when chunking.strategy = "contextual"
-    "embedded",           # {chunks, has_openai, has_bge_gemma2, duration_ms}
+    "embedded",           # {chunks, primary_vector, has_sparse, duration_ms}
     "funding_extracted",  # {fields: [...]} — only when assistant_type = "funding"
     "stored",             # {vectors, collection}
 )
@@ -81,7 +81,7 @@ data: <JSON>
 | `started` | `source_id` |
 | `chunked` | `chunks` |
 | `enriched` | `chunks` (may include `error` if contextual enrichment failed — non-fatal). Only emitted when `chunking.strategy = "contextual"`. |
-| `embedded` | `chunks`, `has_openai`, `has_bge_gemma2`, `duration_ms` |
+| `embedded` | `chunks`, `primary_vector` (name of the dense field — `dense_openai` or `dense_bge_m3`), `has_sparse` (true when hybrid mode produced a sparse vector via `sparse.ki2.at`), `duration_ms` |
 | `funding_extracted` | `fields` — list of metadata keys extracted. Only emitted when `assistant_type = "funding"`. |
 | `stored` | `vectors`, `collection` |
 
@@ -255,6 +255,10 @@ async def ingest_online_stream(body: OnlineIngestRequest, request: Request) -> S
 
         chunking = body.chunking
         vcfg = body.vector_config
+        primary_embedder, default_dim, primary_vector_name = _resolve_primary_embedder(
+            request.app.state, body.embedding_model
+        )
+        vector_size = vcfg.vector_size if (vcfg and vcfg.vector_size is not None) else default_dim
         metadata_dict = body.metadata.model_dump()
         metadata_dict["source_url"] = body.url
         metadata_dict["assistant_type"] = body.assistant_type
@@ -274,13 +278,14 @@ async def ingest_online_stream(body: OnlineIngestRequest, request: Request) -> S
                 chunking_strategy=chunking.strategy if chunking else "contextual",
                 max_chunk_size=chunking.max_chunk_size if chunking else None,
                 chunk_overlap=chunking.overlap if chunking else None,
-                vector_size=vcfg.vector_size if vcfg else 1536,
+                vector_size=vector_size,
                 search_mode=vcfg.search_mode.value if vcfg else "semantic",
-                fallback_dense_dim=ext.bge_gemma2_dense_dim if (vcfg and vcfg.enable_fallback) else None,
                 content_type=body.content_type,
                 entities=body.entities.model_dump() if body.entities else None,
                 deferred_metadata_task=funding_task,
                 progress_queue=queue,
+                primary_embedder=primary_embedder,
+                primary_vector_name=primary_vector_name,
             )
         )
 
