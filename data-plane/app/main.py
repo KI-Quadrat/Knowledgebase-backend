@@ -1,6 +1,6 @@
 import time
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -56,111 +56,114 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         log.info("app_stopped_test_mode")
         return
 
-    # ── Scraping ─────────────────────────────────────
-    scraping_svc = ScraperService()
-    await scraping_svc.startup()
-    app.state.scraping = scraping_svc
+    # AsyncExitStack runs cleanup callbacks in LIFO order on normal exit AND
+    # on partial-startup failure — so a raise from any startup() below still
+    # closes every client/pool that already came up. Without this, a failed
+    # qdrant_at.startup() would leak the embedders, scraper, parser, etc.
+    async with AsyncExitStack() as stack:
+        # ── Scraping ─────────────────────────────────────
+        scraping_svc = ScraperService()
+        await scraping_svc.startup()
+        stack.push_async_callback(scraping_svc.shutdown)
+        app.state.scraping = scraping_svc
 
-    sitemap_parser = SitemapParser()
-    app.state.sitemap_parser = sitemap_parser
+        sitemap_parser = SitemapParser()
+        stack.push_async_callback(sitemap_parser.close)
+        app.state.sitemap_parser = sitemap_parser
 
-    # ── Parsing ──────────────────────────────────────
-    parser_svc = ParserService()
-    await parser_svc.startup()
-    app.state.parser = parser_svc
+        # ── Parsing ──────────────────────────────────────
+        parser_svc = ParserService()
+        await parser_svc.startup()
+        stack.push_async_callback(parser_svc.shutdown)
+        app.state.parser = parser_svc
 
-    # ── Intelligence ─────────────────────────────────
-    classifier = Classifier()
-    app.state.classifier = classifier
+        # ── Intelligence ─────────────────────────────────
+        classifier = Classifier()
+        app.state.classifier = classifier
 
-    contextual_enricher = ContextualEnricher()
-    await contextual_enricher.startup()
-    app.state.contextual_enricher = contextual_enricher
+        contextual_enricher = ContextualEnricher()
+        await contextual_enricher.startup()
+        stack.push_async_callback(contextual_enricher.shutdown)
+        app.state.contextual_enricher = contextual_enricher
 
-    funding_extractor = FundingExtractor()
-    funding_extractor.startup()
-    app.state.funding_extractor = funding_extractor
+        funding_extractor = FundingExtractor()
+        funding_extractor.startup()
+        app.state.funding_extractor = funding_extractor
 
-    # ── Embedding + Storage ──────────────────────────
-    embedder = BGEM3Client()
-    await embedder.startup()
-    app.state.embedder = embedder
+        # ── Embedding + Storage ──────────────────────────
+        embedder = BGEM3Client()
+        await embedder.startup()
+        stack.push_async_callback(embedder.shutdown)
+        app.state.embedder = embedder
 
-    openai_embedder = OpenAIEmbedClient()
-    await openai_embedder.startup()
-    app.state.openai_embedder = openai_embedder
+        openai_embedder = OpenAIEmbedClient()
+        await openai_embedder.startup()
+        stack.push_async_callback(openai_embedder.shutdown)
+        app.state.openai_embedder = openai_embedder
 
-    tei_embedder_at = TEIEmbedClientAT()
-    await tei_embedder_at.startup()
-    app.state.tei_embedder_at = tei_embedder_at
+        tei_embedder_at = TEIEmbedClientAT()
+        await tei_embedder_at.startup()
+        stack.push_async_callback(tei_embedder_at.shutdown)
+        app.state.tei_embedder_at = tei_embedder_at
 
-    tei_sparse_embedder = TEISparseClientAT()
-    await tei_sparse_embedder.startup()
-    app.state.sparse_embedder = tei_sparse_embedder
+        tei_sparse_embedder = TEISparseClientAT()
+        await tei_sparse_embedder.startup()
+        stack.push_async_callback(tei_sparse_embedder.shutdown)
+        app.state.sparse_embedder = tei_sparse_embedder
 
-    qdrant = QdrantService()
-    await qdrant.startup()
-    app.state.qdrant = qdrant
+        qdrant = QdrantService()
+        await qdrant.startup()
+        stack.push_async_callback(qdrant.shutdown)
+        app.state.qdrant = qdrant
 
-    # AT-specific Qdrant instance (used by POST /api/v1/online/ingest/at).
-    # URL / port / api-key come from separate env vars — matches the upstream
-    # qdrant-client pattern. Port defaults to 443 (standard HTTPS). When the
-    # AT URL env var is unset, we fall back to the default qdrant_url and
-    # skip the port kwarg so the URL's embedded port wins.
-    if ext.qdrant_url_at:
-        qdrant_at = QdrantService(
-            url=ext.qdrant_url_at,
-            port=ext.qdrant_port_at,
-            api_key=ext.qdrant_api_key_at or ext.qdrant_api_key,
+        # AT-specific Qdrant instance (used by POST /api/v1/online/ingest/at).
+        # URL / port / api-key come from separate env vars — matches the upstream
+        # qdrant-client pattern. Port defaults to 443 (standard HTTPS). When the
+        # AT URL env var is unset, we fall back to the default qdrant_url and
+        # skip the port kwarg so the URL's embedded port wins.
+        if ext.qdrant_url_at:
+            qdrant_at = QdrantService(
+                url=ext.qdrant_url_at,
+                port=ext.qdrant_port_at,
+                api_key=ext.qdrant_api_key_at or ext.qdrant_api_key,
+            )
+        else:
+            qdrant_at = QdrantService(
+                url=ext.qdrant_url,
+                api_key=ext.qdrant_api_key,
+            )
+        await qdrant_at.startup()
+        stack.push_async_callback(qdrant_at.shutdown)
+        app.state.qdrant_at = qdrant_at
+
+        # ── Discovery ────────────────────────────────────
+        smb_client = SMBClient()
+        r2_client = R2Client()
+        await r2_client.startup()
+        stack.push_async_callback(r2_client.shutdown)
+        app.state.discovery = DiscoveryService(smb_client, r2_client)
+        app.state.r2_client = r2_client
+
+        # ── Ingest + Search ──────────────────────────────
+        chunker = Chunker()
+        app.state.chunker = chunker
+        app.state.ingest = IngestService(
+            chunker, classifier, embedder, qdrant, contextual_enricher,
+            sparse_embedder=tei_sparse_embedder,
         )
-    else:
-        qdrant_at = QdrantService(
-            url=ext.qdrant_url,
-            api_key=ext.qdrant_api_key,
+        app.state.online_ingest = IngestService(
+            chunker, classifier, openai_embedder, qdrant, contextual_enricher,
+            sparse_embedder=tei_sparse_embedder,
         )
-    await qdrant_at.startup()
-    app.state.qdrant_at = qdrant_at
+        app.state.search = SearchService(
+            openai_embedder,
+            qdrant,
+            sparse_embedder=tei_sparse_embedder,
+            bge_m3_embedder=tei_embedder_at,
+        )
 
-    # ── Discovery ────────────────────────────────────
-    smb_client = SMBClient()
-    r2_client = R2Client()
-    await r2_client.startup()
-    app.state.discovery = DiscoveryService(smb_client, r2_client)
-    app.state.r2_client = r2_client
-
-    # ── Ingest + Search ──────────────────────────────
-    chunker = Chunker()
-    app.state.chunker = chunker
-    app.state.ingest = IngestService(
-        chunker, classifier, embedder, qdrant, contextual_enricher,
-        sparse_embedder=tei_sparse_embedder,
-    )
-    app.state.online_ingest = IngestService(
-        chunker, classifier, openai_embedder, qdrant, contextual_enricher,
-        sparse_embedder=tei_sparse_embedder,
-    )
-    app.state.search = SearchService(
-        openai_embedder,
-        qdrant,
-        sparse_embedder=tei_sparse_embedder,
-        bge_m3_embedder=tei_embedder_at,
-    )
-
-    log.info("app_started", mode=settings.mode, version=settings.version)
-    yield
-
-    # ── Shutdown ─────────────────────────────────────
-    await scraping_svc.shutdown()
-    await parser_svc.shutdown()
-    await embedder.shutdown()
-    await openai_embedder.shutdown()
-    await tei_embedder_at.shutdown()
-    await tei_sparse_embedder.shutdown()
-    await contextual_enricher.shutdown()
-    await qdrant.shutdown()
-    await qdrant_at.shutdown()
-    await r2_client.shutdown()
-    await sitemap_parser.close()
+        log.info("app_started", mode=settings.mode, version=settings.version)
+        yield
 
     log.info("app_stopped")
 

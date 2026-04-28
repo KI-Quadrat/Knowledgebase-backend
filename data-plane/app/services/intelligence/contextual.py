@@ -89,8 +89,11 @@ class ContextualEnricher:
 
         start = time.monotonic()
 
-        # Truncate document to ~6000 chars for the prompt to stay within token limits
-        doc_summary = document[:6000]
+        # Truncate document for the prompt to stay within token limits.
+        cap = ext.contextual_doc_max_chars
+        if len(document) > cap:
+            log.info("contextual_truncated", chars_in=len(document), chars_kept=cap)
+        doc_summary = document[:cap]
 
         max_batch = ext.openai_contextual_max_batch or len(chunks)
         windows = [
@@ -157,24 +160,16 @@ class ContextualEnricher:
         max_tokens = min(16000, 200 + 160 * len(chunks))
 
         try:
-            resp = await self._client.post(
-                OPENAI_CHAT_URL,
-                headers={
-                    "Authorization": f"Bearer {self._api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": self._model,
-                    "messages": [
-                        {"role": "system", "content": BATCH_CONTEXT_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    "max_tokens": max_tokens,
-                    "temperature": 0.0,
-                    "response_format": {"type": "json_object"},
-                },
-            )
-            resp.raise_for_status()
+            resp = await self._post_with_rate_limit_retry({
+                "model": self._model,
+                "messages": [
+                    {"role": "system", "content": BATCH_CONTEXT_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "response_format": {"type": "json_object"},
+            })
             raw = resp.json()["choices"][0]["message"]["content"]
             data = json.loads(raw)
         except Exception as e:
@@ -199,31 +194,55 @@ class ContextualEnricher:
 
         async with self._semaphore:
             try:
-                resp = await self._client.post(
-                    OPENAI_CHAT_URL,
-                    headers={
-                        "Authorization": f"Bearer {self._api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": self._model,
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": CONTEXT_PROMPT.format(
-                                    document=document,
-                                    chunk=chunk,
-                                ),
-                            }
-                        ],
-                        "max_tokens": 200,
-                        "temperature": 0.0,
-                    },
-                )
-                resp.raise_for_status()
+                resp = await self._post_with_rate_limit_retry({
+                    "model": self._model,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": CONTEXT_PROMPT.format(
+                                document=document,
+                                chunk=chunk,
+                            ),
+                        }
+                    ],
+                    "max_tokens": 200,
+                    "temperature": 0.0,
+                })
                 data = resp.json()
                 context = data["choices"][0]["message"]["content"].strip()
                 return f"{context}\n\n{chunk}"
             except Exception as e:
                 log.warning("contextual_enrichment_failed", error=str(e))
                 return chunk
+
+    async def _post_with_rate_limit_retry(self, body: dict) -> httpx.Response:
+        """POST to OPENAI_CHAT_URL, retrying up to 3x on 429 with exponential backoff.
+
+        Raises ``httpx.HTTPStatusError`` for non-429 4xx/5xx and for the final
+        429 after all retries are exhausted. Callers wrap in their own
+        try/except for soft fallback behavior.
+        """
+        last_exc: httpx.HTTPStatusError | None = None
+        for attempt in range(3):
+            resp = await self._client.post(
+                OPENAI_CHAT_URL,
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+            )
+            if resp.status_code != 429:
+                resp.raise_for_status()
+                return resp
+            last_exc = httpx.HTTPStatusError(
+                f"OpenAI rate limit (429): {resp.text[:200]}",
+                request=resp.request,
+                response=resp,
+            )
+            if attempt < 2:
+                wait = 2 ** attempt
+                log.warning("contextual_rate_limit_retry", attempt=attempt + 1, wait_s=wait)
+                await asyncio.sleep(wait)
+        assert last_exc is not None
+        raise last_exc
