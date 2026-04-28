@@ -9,10 +9,11 @@ When a ``country`` code is provided, the system prompt constrains
 divisions for that country, preventing hallucinated region names.
 """
 
+import asyncio
 import json
 from datetime import datetime, timezone
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError, RateLimitError
 
 from app.config import ext
 from app.utils.logger import get_logger
@@ -193,19 +194,24 @@ class FundingExtractor:
         if not self._client:
             raise RuntimeError("Funding extractor not available (no OpenAI key)")
 
-        truncated = content[:6000] if len(content) > 6000 else content
+        cap = ext.funding_max_input_chars
+        if len(content) > cap:
+            log.info("funding_extract_truncated", chars_in=len(content), chars_kept=cap)
+        truncated = content[:cap]
         system_prompt = _build_system_prompt(country)
 
-        response = await self._client.chat.completions.create(
-            model=self._model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": truncated},
-            ],
-            temperature=0.0,
-            max_tokens=1000,
-            response_format={"type": "json_object"},
-        )
+        try:
+            response = await self._chat_with_rate_limit_retry(system_prompt, truncated)
+        except BadRequestError as exc:
+            if "context_length_exceeded" not in str(exc).lower():
+                raise
+            half = truncated[: len(truncated) // 2]
+            log.warning(
+                "funding_extract_context_exceeded_retry",
+                chars_in=len(truncated),
+                chars_retry=len(half),
+            )
+            response = await self._chat_with_rate_limit_retry(system_prompt, half)
 
         raw = response.choices[0].message.content or "{}"
         data = json.loads(raw)
@@ -260,6 +266,30 @@ class FundingExtractor:
         )
 
         return result
+
+    async def _chat_with_rate_limit_retry(self, system_prompt: str, user_content: str):
+        """Call chat.completions.create with 3-attempt exponential backoff on 429."""
+        last_exc: RateLimitError | None = None
+        for attempt in range(3):
+            try:
+                return await self._client.chat.completions.create(
+                    model=self._model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_content},
+                    ],
+                    temperature=0.0,
+                    max_tokens=1000,
+                    response_format={"type": "json_object"},
+                )
+            except RateLimitError as exc:
+                last_exc = exc
+                if attempt < 2:
+                    wait = 2 ** attempt
+                    log.warning("funding_extract_rate_limit_retry", attempt=attempt + 1, wait_s=wait)
+                    await asyncio.sleep(wait)
+        assert last_exc is not None
+        raise last_exc
 
 
 def _as_list(val: object) -> list[str]:

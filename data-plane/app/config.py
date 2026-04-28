@@ -115,6 +115,12 @@ class ExternalSettings(BaseSettings):
     # parallel windows of this size. 0 disables splitting (single call for
     # all chunks — risks max_tokens truncation on big docs).
     openai_contextual_max_batch: int = 32
+    # Char caps on OpenAI inputs. Sized for gpt-4o-mini's 128K-token window at
+    # ~4 chars/token, leaving headroom for system prompt scaffolding + response.
+    # If you swap to a smaller-window model, drop these.
+    classify_max_input_chars: int = 120_000
+    funding_max_input_chars: int = 120_000
+    contextual_doc_max_chars: int = 60_000
 
     # TEI — AT-specific embedding endpoint used by POST /api/v1/online/ingest/at.
     # OpenAI-compatible server exposing POST {TEI_EMBED_URL_AT}/v1/embeddings.

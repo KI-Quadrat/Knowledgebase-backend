@@ -4,9 +4,10 @@ Uses structured outputs to classify content into predefined categories
 and extract entities. Falls back to rule-based classifier on failure.
 """
 
+import asyncio
 import json
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError, RateLimitError
 
 from app.config import ext
 from app.services.intelligence.models import (
@@ -76,19 +77,23 @@ class LLMClassifier:
         if not self._client:
             raise RuntimeError("LLM classifier not available")
 
-        # Truncate very long content to save tokens
-        truncated = content[:4000] if len(content) > 4000 else content
+        cap = ext.classify_max_input_chars
+        if len(content) > cap:
+            log.info("classify_truncated", chars_in=len(content), chars_kept=cap)
+        truncated = content[:cap]
 
-        response = await self._client.chat.completions.create(
-            model=self._model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": truncated},
-            ],
-            temperature=0.1,
-            max_tokens=500,
-            response_format={"type": "json_object"},
-        )
+        try:
+            response = await self._chat_with_rate_limit_retry(truncated)
+        except BadRequestError as exc:
+            if "context_length_exceeded" not in str(exc).lower():
+                raise
+            half = truncated[: len(truncated) // 2]
+            log.warning(
+                "llm_classify_context_exceeded_retry",
+                chars_in=len(truncated),
+                chars_retry=len(half),
+            )
+            response = await self._chat_with_rate_limit_retry(half)
 
         raw = response.choices[0].message.content or "{}"
         data = json.loads(raw)
@@ -128,3 +133,27 @@ class LLMClassifier:
             entities=entities,
             summary=summary,
         )
+
+    async def _chat_with_rate_limit_retry(self, user_content: str):
+        """Call chat.completions.create with 3-attempt exponential backoff on 429."""
+        last_exc: RateLimitError | None = None
+        for attempt in range(3):
+            try:
+                return await self._client.chat.completions.create(
+                    model=self._model,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_content},
+                    ],
+                    temperature=0.1,
+                    max_tokens=500,
+                    response_format={"type": "json_object"},
+                )
+            except RateLimitError as exc:
+                last_exc = exc
+                if attempt < 2:
+                    wait = 2 ** attempt
+                    log.warning("llm_classify_rate_limit_retry", attempt=attempt + 1, wait_s=wait)
+                    await asyncio.sleep(wait)
+        assert last_exc is not None
+        raise last_exc
