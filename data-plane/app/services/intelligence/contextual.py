@@ -14,11 +14,30 @@ import time
 import httpx
 
 from app.config import ext
+from app.services.intelligence import llm_fallback
 from app.utils.logger import get_logger
 
 log = get_logger(__name__)
 
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
+
+
+def _is_outage_error(exc: Exception) -> bool:
+    """True for errors that signal "OpenAI is unavailable" (vs. input errors).
+
+    Triggers a LiteLLM fallback attempt. Excludes 4xx (other than 429) since
+    those usually mean the request itself is malformed and the fallback can't
+    help.
+    """
+    if isinstance(
+        exc,
+        (httpx.NetworkError, httpx.TimeoutException, httpx.RemoteProtocolError),
+    ):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return status == 429 or 500 <= status < 600
+    return False
 
 CONTEXT_PROMPT = """\
 <document>
@@ -159,21 +178,25 @@ class ContextualEnricher:
         # don't blow through the response limit.
         max_tokens = min(16000, 200 + 160 * len(chunks))
 
+        body = {
+            "model": self._model,
+            "messages": [
+                {"role": "system", "content": BATCH_CONTEXT_SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
+        }
+
+        raw = await self._chat_with_fallback(body, label="contextual_batch")
+        if raw is None:
+            return None
+
         try:
-            resp = await self._post_with_rate_limit_retry({
-                "model": self._model,
-                "messages": [
-                    {"role": "system", "content": BATCH_CONTEXT_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_msg},
-                ],
-                "max_tokens": max_tokens,
-                "temperature": 0.0,
-                "response_format": {"type": "json_object"},
-            })
-            raw = resp.json()["choices"][0]["message"]["content"]
             data = json.loads(raw)
         except Exception as e:
-            log.warning("contextual_batch_call_failed", error=str(e))
+            log.warning("contextual_batch_parse_failed", error=str(e))
             return None
 
         contexts = data.get("contexts")
@@ -193,27 +216,61 @@ class ContextualEnricher:
             return chunk
 
         async with self._semaphore:
-            try:
-                resp = await self._post_with_rate_limit_retry({
-                    "model": self._model,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": CONTEXT_PROMPT.format(
-                                document=document,
-                                chunk=chunk,
-                            ),
-                        }
-                    ],
-                    "max_tokens": 200,
-                    "temperature": 0.0,
-                })
-                data = resp.json()
-                context = data["choices"][0]["message"]["content"].strip()
-                return f"{context}\n\n{chunk}"
-            except Exception as e:
-                log.warning("contextual_enrichment_failed", error=str(e))
+            body = {
+                "model": self._model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": CONTEXT_PROMPT.format(
+                            document=document,
+                            chunk=chunk,
+                        ),
+                    }
+                ],
+                "max_tokens": 200,
+                "temperature": 0.0,
+            }
+            raw = await self._chat_with_fallback(body, label="contextual_enrichment")
+            if raw is None:
                 return chunk
+            return f"{raw.strip()}\n\n{chunk}"
+
+    async def _chat_with_fallback(self, body: dict, label: str) -> str | None:
+        """POST chat completion to OpenAI; on outage, try LiteLLM fallback.
+
+        Returns the assistant message content on success, or None when
+        OpenAI errored out (and either the error wasn't an outage, or the
+        fallback is disabled / also failed). Callers handle None as
+        graceful-degradation (per-chunk fallback or unenriched chunk).
+        """
+        try:
+            resp = await self._post_with_rate_limit_retry(body)
+            return resp.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            if not _is_outage_error(e):
+                log.warning(f"{label}_call_failed", error=str(e))
+                return None
+            log.warning(
+                f"{label}_openai_unavailable_falling_back",
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+
+        try:
+            fb = await llm_fallback.chat_completion(
+                messages=body["messages"],
+                temperature=body.get("temperature", 0.0),
+                max_tokens=body.get("max_tokens"),
+                response_format=body.get("response_format"),
+            )
+        except Exception as fb_exc:
+            log.warning(f"{label}_fallback_failed", error=str(fb_exc))
+            return None
+        if fb is None:
+            log.warning(f"{label}_fallback_disabled")
+            return None
+        log.info(f"{label}_via_fallback", model=llm_fallback.model())
+        return fb.choices[0].message.content or ""
 
     async def _post_with_rate_limit_retry(self, body: dict) -> httpx.Response:
         """POST to OPENAI_CHAT_URL, retrying up to 3x on 429 with exponential backoff.

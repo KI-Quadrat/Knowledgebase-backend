@@ -22,6 +22,7 @@ from app.models.online.scrape import (
 )
 from app.services.parsing.models import ParseStatus
 from app.services.scraping.document_discovery import (
+    DiscoveredImage,
     discover_images,
     document_type,
     extract_documents_and_links,
@@ -96,7 +97,8 @@ def _is_thin_output(markdown: str | None, html: str | None) -> bool:
         "2. **Markdown extraction** — controlled by `markdown_type`:\n"
         "   - `fit` (default) — Crawl4AI runs `PruningContentFilter` (text/link-density heuristic) "
         "on top of `DefaultMarkdownGenerator` to return main content only. "
-        "Jina fallback uses the `readerlm-v2` engine for equivalent LLM-based cleanup.\n"
+        "Jina fallback returns the markdown produced by its Chromium browser engine "
+        "(`X-Engine: browser`, `X-Retain-Images: none`).\n"
         "   - `raw` — full page Markdown including headers/nav/footer.\n"
         "   - `citations` — full content with citation links preserved (Crawl4AI only; "
         "Jina/httpx fallbacks return `raw` equivalent).\n"
@@ -115,7 +117,7 @@ def _is_thin_output(markdown: str | None, html: str | None) -> bool:
         "|-------|------|----------|---------|-------------|\n"
         "| `url` | string | Required | — | Full URL to scrape (must start with `http://` or `https://`) |\n"
         "| `markdown_type` | string | Optional | `fit` | `fit` = main content only (PruningContentFilter on Crawl4AI, "
-        "readerlm-v2 engine on Jina fallback). `raw` = full page. `citations` = full content with citation links "
+        "Chromium browser-engine markdown on Jina fallback). `raw` = full page. `citations` = full content with citation links "
         "(Crawl4AI only; falls back to `raw` on Jina/httpx). |\n"
         "| `exclude_tags` | string[] | Optional | `null` | CSS selectors / tag names to drop before extraction "
         "(e.g. `['nav','footer','.sidebar']`). Applied on all three backends. |\n"
@@ -192,7 +194,7 @@ def _is_thin_output(markdown: str | None, html: str | None) -> bool:
         "each backend — fallbacks respect your request rather than silently reverting to defaults.\n\n"
         "| Field | Crawl4AI | Jina Reader | Raw httpx |\n"
         "|---|---|---|---|\n"
-        "| `markdown_type=\"fit\"` | `PruningContentFilter` on `DefaultMarkdownGenerator` | header `X-Engine: readerlm-v2` | built-in noise strip |\n"
+        "| `markdown_type=\"fit\"` | `PruningContentFilter` on `DefaultMarkdownGenerator` | `X-Engine: browser` + `X-Retain-Images: none` | built-in noise strip |\n"
         "| `markdown_type=\"raw\"` / `\"citations\"` | no filter (default generator) | default engine (citations → same as raw) | default |\n"
         "| `exclude_tags` | `excluded_tags` param | header `X-Remove-Selector` | BeautifulSoup `decompose()` |\n"
         "| `css_selector` | `css_selector` param | header `X-Target-Selector` | pre-filter in `clean_html` |\n\n"
@@ -229,6 +231,7 @@ async def scrape(body: ScrapeRequest, request: Request) -> ResponseEnvelope[Scra
         js_render=True,
         extract_links=True,
         with_links_summary=body.links_summary,
+        inner_img=body.inner_img,
         timeout=30,
         markdown_type=body.markdown_type,
         exclude_tags=body.exclude_tags,
@@ -300,8 +303,15 @@ async def scrape(body: ScrapeRequest, request: Request) -> ResponseEnvelope[Scra
     # ── Parse inner images if requested ──
     parser = request.app.state.parser
     inner_images: list[InnerImageData] | None = None
-    if body.inner_img and result.html:
-        discovered = discover_images(result.html, body.url)
+    if body.inner_img:
+        if result.html:
+            discovered = discover_images(result.html, body.url)
+        elif result.discovered_images:
+            # Jina path: no rendered HTML, so use the URLs Jina already
+            # surfaced via X-With-Images-Summary. No alt/title from Jina.
+            discovered = [DiscoveredImage(url=u) for u in result.discovered_images]
+        else:
+            discovered = []
         if discovered:
             inner_images = await _parse_inner_images(parser, discovered, request_id)
 
@@ -323,11 +333,13 @@ async def scrape(body: ScrapeRequest, request: Request) -> ResponseEnvelope[Scra
                 include_documents=body.inner_docs,
                 include_images=body.inner_img,
             )
-        elif result.discovered_links or result.discovered_documents:
+        elif result.discovered_links or result.discovered_documents or result.discovered_images:
+            # Jina path (no HTML) — fall back to what the backend reported
+            # directly. ``discovered_images`` is only populated by Jina.
             links_summary = LinksSummary(
                 urls=result.discovered_links,
                 documents=[doc.url for doc in result.discovered_documents] if body.inner_docs else [],
-                images=[],
+                images=result.discovered_images if body.inner_img else [],
             )
         else:
             raw_html = await _fetch_raw_html(result.url)

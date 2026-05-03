@@ -34,14 +34,24 @@ class CrawlResult:
         *,
         markdown: str = "",
         html: str = "",
+        title: str | None = None,
         links: list[str] | None = None,
+        images: list[str] | None = None,
         success: bool = True,
         error: str | None = None,
         duration_ms: int = 0,
     ):
         self.markdown = markdown
         self.html = html
+        # Title reported directly by the backend (Jina ``data.title``). For
+        # Crawl4AI / httpx the rendered HTML is available so the title is
+        # extracted via ``extract_metadata`` downstream — this stays None.
+        self.title = title
         self.links = links or []
+        # Image URLs harvested by the backend (Jina X-With-Images-Summary).
+        # Crawl4AI / httpx leave this empty — the router still has the rendered
+        # HTML and uses ``discover_images`` for those backends.
+        self.images = images or []
         self.success = success
         self.error = error
         self.duration_ms = duration_ms
@@ -90,6 +100,7 @@ class Crawl4AIClient:
         markdown_type: str = "fit",
         exclude_tags: list[str] | None = None,
         with_links_summary: bool = False,
+        inner_img: bool = False,
         scraper: str = "crawl4ai",
     ) -> CrawlResult:
         if not self._client:
@@ -139,6 +150,7 @@ class Crawl4AIClient:
                         exclude_tags=exclude_tags,
                         css_selector=css_selector,
                         with_links_summary=with_links_summary,
+                        inner_img=inner_img,
                     )
                     result.duration_ms = int((time.monotonic() - start) * 1000)
                     if result.success:
@@ -246,24 +258,32 @@ class Crawl4AIClient:
         exclude_tags: list[str] | None = None,
         css_selector: str | None = None,
         with_links_summary: bool = False,
+        inner_img: bool = False,
     ) -> CrawlResult:
-        """Scrape a URL via Jina Reader API — returns Markdown directly."""
+        """Scrape a URL via Jina Reader API — returns Markdown directly.
+
+        Uses the Chromium ``browser`` engine (best fidelity on JS-heavy
+        municipality portals). ``X-Retain-Images: none`` keeps inline image
+        markdown out of the returned content. Links summary and images summary
+        are requested only when the caller actually needs them
+        (``links_summary`` / ``inner_img``), since Jina is no-HTML and those
+        headers drive the side lists used by the router.
+        """
         headers = {
             "Authorization": f"Bearer {self._jina_key}",
             "Accept": "application/json",
+            "X-Engine": "browser",
             "X-Return-Format": "markdown",
+            "X-Retain-Images": "none",
         }
-        # "fit" → use readerlm-v2 engine for LLM-based main-content extraction
-        # (closest Jina analogue to Crawl4AI's PruningContentFilter).
-        # "raw" / "citations" → default engine (Jina has no citations mode).
-        if markdown_type == "fit":
-            headers["X-Engine"] = "readerlm-v2"
+        if with_links_summary:
+            headers["X-With-Links-Summary"] = "true"
+        if inner_img:
+            headers["X-With-Images-Summary"] = "true"
         if css_selector:
             headers["X-Target-Selector"] = css_selector
         if exclude_tags:
             headers["X-Remove-Selector"] = ",".join(exclude_tags)
-        if with_links_summary:
-            headers["X-With-Links-Summary"] = "true"
 
         try:
             resp = await self._client.get(  # type: ignore[union-attr]
@@ -280,14 +300,25 @@ class Crawl4AIClient:
             return CrawlResult(success=False, error=f"Jina error: {exc}")
 
         data = resp.json()
-        content = data.get("data", {}).get("content", "")
+        data_section = data.get("data", {}) if isinstance(data.get("data"), dict) else {}
+        content = data_section.get("content", "")
+        title_value = data_section.get("title")
+        title = title_value.strip() if isinstance(title_value, str) and title_value.strip() else None
         links = _extract_jina_links(data, url)
+        images = _extract_jina_images(data, url)
 
         if not content.strip():
             return CrawlResult(success=False, error="Jina returned empty content")
 
         markdown = clean_markdown(content)
-        return CrawlResult(markdown=markdown, html="", links=links, success=True)
+        return CrawlResult(
+            markdown=markdown,
+            html="",
+            title=title,
+            links=links,
+            images=images,
+            success=True,
+        )
 
     async def _scrape_with_httpx(
         self,
@@ -466,5 +497,50 @@ def _extract_jina_links(data: dict, base_url: str) -> list[str]:
 
     for candidate in candidates:
         _walk(candidate)
+
+    return urls
+
+
+def _extract_jina_images(data: dict, base_url: str) -> list[str]:
+    """Extract image URLs from Jina's ``data.images`` block.
+
+    Jina returns images as a dict (``{"Image 1": "url", ...}`` or
+    ``{"<alt>": "url"}``). Older / different responses may use a list of
+    dicts or strings — handle both. Returns deduped, absolute http(s) URLs.
+    """
+    data_section = data.get("data", {})
+    raw = data_section.get("images")
+    if raw is None:
+        raw = data.get("images")
+    if raw is None:
+        return []
+
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def _add(value: str) -> None:
+        normalized = urljoin(base_url, value.strip())
+        parsed = urlparse(normalized)
+        if parsed.scheme not in {"http", "https"}:
+            return
+        if normalized in seen:
+            return
+        seen.add(normalized)
+        urls.append(normalized)
+
+    if isinstance(raw, dict):
+        for value in raw.values():
+            if isinstance(value, str) and value.strip():
+                _add(value)
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str) and item.strip():
+                _add(item)
+            elif isinstance(item, dict):
+                for key in ("url", "src", "href"):
+                    nested = item.get(key)
+                    if isinstance(nested, str) and nested.strip():
+                        _add(nested)
+                        break
 
     return urls
