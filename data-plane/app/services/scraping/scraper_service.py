@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
 
+from app.config import ext
 from app.services.audit import AuditLogger
 from app.services.cache import ContentCache
 from app.services.metrics import mark_cache_hit, mark_cache_miss, set_active_jobs
@@ -25,6 +26,7 @@ class ScrapeOptions(BaseModel):
     wait_for: str | None = None
     extract_links: bool = True
     with_links_summary: bool = False
+    inner_img: bool = False
     css_selector: str | None = None
     timeout: int = Field(30, ge=1, le=120)
     markdown_type: str = "fit"
@@ -61,6 +63,10 @@ class ScrapeResult(BaseModel):
     metadata: PageMetadata = Field(default_factory=PageMetadata)
     discovered_documents: list[DiscoveredDocument] = Field(default_factory=list)
     discovered_links: list[str] = Field(default_factory=list)
+    # Image URLs reported by the backend (only populated when Jina is the
+    # active scraper — Crawl4AI / httpx leave this empty because the rendered
+    # HTML is available downstream and ``discover_images`` works there).
+    discovered_images: list[str] = Field(default_factory=list)
     error: str | None = None
     duration_ms: int | None = None
 
@@ -77,6 +83,34 @@ class ScraperService:
         self.audit = AuditLogger()
         self._active_jobs = 0
         self._jobs_lock = threading.Lock()
+        self._jina_domains: set[str] = {
+            d.strip().lower().lstrip(".")
+            for d in ext.jina_default_domains.split(",")
+            if d.strip()
+        }
+
+    def _route_scraper(self, url: str, requested: str) -> str:
+        """Pick the actual scraper backend for a URL.
+
+        - Caller explicitly chose ``"jina"`` → respected.
+        - Caller left the default ``"crawl4ai"`` and the URL's domain (or any
+          parent domain) is in ``JINA_DEFAULT_DOMAINS`` → Jina.
+        - Otherwise → caller's value (``"crawl4ai"``).
+        """
+        if requested != "crawl4ai":
+            return requested
+        if not self._jina_domains:
+            return requested
+        domain = urlparse(url).netloc.lower()
+        if domain.startswith("www."):
+            domain = domain[4:]
+        if not domain:
+            return requested
+        if domain in self._jina_domains:
+            return "jina"
+        if any(domain.endswith("." + d) for d in self._jina_domains):
+            return "jina"
+        return requested
 
     async def startup(self) -> None:
         log.info("scraper_starting")
@@ -130,16 +164,29 @@ class ScraperService:
                 if cached:
                     mark_cache_hit()
                     log.info("scrape_cache_hit", url=url)
+                    cached_markdown = cached.get("markdown") or ""
                     return ScrapeResult(
                         url=url,
                         status=ScrapeStatus.SUCCESS,
-                        markdown=cached,
-                        metadata=PageMetadata(word_count=count_words(cached)),
+                        markdown=cached_markdown,
+                        metadata=PageMetadata(
+                            title=cached.get("title"),
+                            word_count=count_words(cached_markdown),
+                        ),
                         duration_ms=int((time.monotonic() - start) * 1000),
                     )
                 mark_cache_miss()
 
             await self.rate_limiter.acquire(url)
+
+            scraper_choice = self._route_scraper(url, options.scraper)
+            if scraper_choice != options.scraper:
+                log.info(
+                    "scraper_routed",
+                    url=url,
+                    requested=options.scraper,
+                    routed_to=scraper_choice,
+                )
 
             crawl_result = await self.crawl4ai.crawl(
                 url,
@@ -150,7 +197,8 @@ class ScraperService:
                 markdown_type=options.markdown_type,
                 exclude_tags=options.exclude_tags,
                 with_links_summary=options.with_links_summary,
-                scraper=options.scraper,
+                inner_img=options.inner_img,
+                scraper=scraper_choice,
             )
 
             if not crawl_result.success:
@@ -207,15 +255,20 @@ class ScraperService:
             elif options.extract_links and crawl_result.links:
                 _, discovered_links = split_documents_and_links(crawl_result.links, found_on=url)
 
+            # Backend-reported images (Jina path). Empty for crawl4ai/httpx —
+            # the router runs ``discover_images`` against the rendered HTML
+            # for those backends, so we don't need to populate it here.
+            discovered_images: list[str] = list(crawl_result.images)
+
             metadata = PageMetadata(
-                title=meta.get("title"),
+                title=meta.get("title") or crawl_result.title,
                 description=meta.get("description"),
                 language=meta.get("language"),
                 word_count=count_words(markdown),
             )
 
             if markdown is not None:
-                await self.cache.set(url, markdown)
+                await self.cache.set(url, markdown, title=metadata.title)
 
             duration_ms = int((time.monotonic() - start) * 1000)
 
@@ -239,6 +292,7 @@ class ScraperService:
                 metadata=metadata,
                 discovered_documents=discovered_docs,
                 discovered_links=discovered_links,
+                discovered_images=discovered_images,
                 duration_ms=duration_ms,
             )
 

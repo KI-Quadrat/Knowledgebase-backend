@@ -1,4 +1,5 @@
 import hashlib
+import json
 
 import redis.asyncio as aioredis
 
@@ -43,25 +44,49 @@ class ContentCache:
     def _make_key(url: str) -> str:
         return f"{KEY_PREFIX}{hashlib.sha256(url.encode()).hexdigest()}"
 
-    async def get(self, url: str) -> str | None:
+    async def get(self, url: str) -> dict | None:
+        """Return cached entry as ``{"markdown": str, "title": str | None}``.
+
+        New entries are stored as a JSON envelope. Legacy entries (plain
+        markdown strings written before the title field was added) are wrapped
+        with ``title=None`` so callers can treat the shape uniformly.
+        """
         if not self._redis:
             return None
         try:
             key = self._make_key(url)
             value = await self._redis.get(key)
-            if value is not None:
-                log.debug("cache_hit", url=url)
-            return value
+            if value is None:
+                return None
+            log.debug("cache_hit", url=url)
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, dict) and "markdown" in parsed:
+                    return {
+                        "markdown": parsed.get("markdown") or "",
+                        "title": parsed.get("title"),
+                    }
+            except (json.JSONDecodeError, TypeError):
+                pass
+            return {"markdown": value, "title": None}
         except Exception as exc:
             log.warning("cache_get_failed", url=url, error=str(exc))
             return None
 
-    async def set(self, url: str, content: str, ttl: int | None = None) -> None:
+    async def set(
+        self,
+        url: str,
+        content: str,
+        *,
+        title: str | None = None,
+        ttl: int | None = None,
+    ) -> None:
         if not self._redis:
             return
         try:
             key = self._make_key(url)
-            await self._redis.set(key, content, ex=ttl or self._default_ttl)
+            payload = json.dumps({"markdown": content, "title": title})
+            await self._redis.set(key, payload, ex=ttl or self._default_ttl)
             log.debug("cache_set", url=url)
         except Exception as exc:
             log.warning("cache_set_failed", url=url, error=str(exc))

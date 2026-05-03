@@ -35,6 +35,7 @@ from app.services.intelligence.chunker import Chunker
 from app.services.intelligence.classifier import Classifier
 from app.services.intelligence.contextual import ContextualEnricher
 from app.services.intelligence.funding_extractor import FundingExtractor
+from app.services.intelligence import llm_fallback
 from app.services.parsing.parser_service import ParserService
 from app.services.scraping.scraper_service import ScraperService
 from app.services.scraping.sitemap import SitemapParser
@@ -78,6 +79,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         app.state.parser = parser_svc
 
         # ── Intelligence ─────────────────────────────────
+        # LiteLLM fallback (shared by classifier, contextual, funding extractor).
+        # Started before the consumers so they can use it from their first call.
+        await llm_fallback.startup()
+        stack.push_async_callback(llm_fallback.shutdown)
+
         classifier = Classifier()
         app.state.classifier = classifier
 

@@ -16,7 +16,7 @@ class ScrapeRequest(BaseModel):
         description=(
             "Which Markdown variant to return. "
             "`fit` = main content only (boilerplate pruned via PruningContentFilter on Crawl4AI, "
-            "or readerlm-v2 engine on Jina fallback). "
+            "or Chromium browser-engine markdown on Jina fallback). "
             "`raw` = full page including headers/nav/footer. "
             "`citations` = full content with citation links preserved (Crawl4AI only; falls back to `raw` on Jina/httpx)."
         ),

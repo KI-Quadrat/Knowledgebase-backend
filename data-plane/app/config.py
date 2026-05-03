@@ -56,9 +56,15 @@ class ExternalSettings(BaseSettings):
     crawl4ai_url: str = "http://crawl4ai:11235"
     crawl4ai_api_token: str = ""
 
-    # Jina Reader (fallback scraper)
+    # Jina Reader (used as fallback by default; primary for listed domains).
     jina_api_url: str = "https://eu-r-beta.jina.ai"
     jina_api_key: str = ""
+    # Comma-separated list of domains routed to Jina by default (instead of
+    # Crawl4AI). Subdomains match by suffix — listing "stadt-wien.at" routes
+    # both "stadt-wien.at" and "www.stadt-wien.at". Empty disables routing
+    # (Crawl4AI stays primary for every URL). Caller-supplied scraper="jina"
+    # or scraper="crawl4ai" still overrides the routing decision.
+    jina_default_domains: str = ""
 
     # LlamaParse (cloud document parsing)
     llama_cloud_api_key: str = ""  # empty = use local unstructured parser
@@ -121,6 +127,14 @@ class ExternalSettings(BaseSettings):
     classify_max_input_chars: int = 120_000
     funding_max_input_chars: int = 120_000
     contextual_doc_max_chars: int = 60_000
+
+    # LiteLLM fallback (self-hosted, OpenAI-compatible). Used by the
+    # classifier, contextual enricher, and funding extractor when the OpenAI
+    # call fails with a rate-limit/connection/5xx error. Empty url or api key
+    # disables the fallback (callers then bubble up the OpenAI error as before).
+    litellm_url: str = ""
+    litellm_api_key: str = ""
+    litellm_fallback_model: str = "nebius/Qwen/Qwen2.5-VL-72B-Instruct"
 
     # TEI — AT-specific embedding endpoint used by POST /api/v1/online/ingest/at.
     # OpenAI-compatible server exposing POST {TEI_EMBED_URL_AT}/v1/embeddings.
