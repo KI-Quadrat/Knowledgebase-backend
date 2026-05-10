@@ -45,6 +45,7 @@ from app.models.online.ingest import EmbeddingModel
 from app.models.online.ingest_at import OnlineIngestATData, OnlineIngestATRequest
 from app.services.embedding.bge_m3_client import EmbeddingError
 from app.services.embedding.qdrant_service import QdrantError
+from app.services.intelligence.funding_extractor import normalize_provinces
 from app.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -96,49 +97,12 @@ _KNOWN_METADATA_KEYS = {
 }
 
 
-# German / English → canonical English-lowercase form. The canonical forms
-# match funding_extractor.PROVINCES_BY_COUNTRY["AT"] exactly so overrides and
-# extractor output produce the same stored metadata.state_or_province value
-# regardless of caller input casing or language.
-_AT_PROVINCE_ALIASES: dict[str, str] = {
-    # English (canonical)
-    "burgenland": "burgenland",
-    "carinthia": "carinthia",
-    "lower austria": "lower austria",
-    "upper austria": "upper austria",
-    "salzburg": "salzburg",
-    "styria": "styria",
-    "tyrol": "tyrol",
-    "vorarlberg": "vorarlberg",
-    "vienna": "vienna",
-    # German
-    "kärnten": "carinthia",
-    "niederösterreich": "lower austria",
-    "oberösterreich": "upper austria",
-    "steiermark": "styria",
-    "tirol": "tyrol",
-    "wien": "vienna",
-}
-
-
+# Province normalization is delegated to ``funding_extractor.normalize_provinces``
+# so AT, DE, CH, and any other supported country share the same alias map +
+# validation logic. The wrapper below pins the country to AT — that is the
+# only country this endpoint serves.
 def _normalize_provinces(names: list[str] | None) -> list[str]:
-    """Canonicalize AT province names to the same English-lowercase form the
-    funding extractor emits.
-
-    Accepts German or English input, any casing. Unknown values are dropped so
-    the stored ``metadata.state_or_province`` is always a subset of the nine
-    official AT provinces — search-time filters stay consistent across ingests.
-    """
-    if not names:
-        return []
-    seen: set[str] = set()
-    out: list[str] = []
-    for raw in names:
-        canonical = _AT_PROVINCE_ALIASES.get((raw or "").strip().lower())
-        if canonical and canonical not in seen:
-            seen.add(canonical)
-            out.append(canonical)
-    return out
+    return normalize_provinces(_AT_COUNTRY, names)
 
 
 def _build_point(
@@ -227,8 +191,11 @@ async def _delete_existing_by_source_id(qdrant, collection: str, source_id: str)
         "fast with `QDRANT_COLLECTION_NOT_FOUND`.\n\n"
         "**Metadata:** the funding extractor runs unconditionally and its "
         "output (title, program_name, processing_office, contract_email, "
-        "contract_phone, state_or_province, funding_type, status, …) is "
-        "merged into `metadata.*` on every point. `state_or_province` in the "
+        "contract_phone, application_form, state_or_province, funding_type, "
+        "status, …) is merged into `metadata.*` on every point. `application_form` "
+        "is a list of URLs to the program's application forms (PDF or online "
+        "form pages); when no URL is available the LLM may include a form name "
+        "verbatim instead. `state_or_province` in the "
         "request body overrides the extractor's choice for the stored "
         "metadata only — there is no per-province collection routing.\n\n"
         "**Idempotency:** prior points for the same `source_id` are deleted via "
