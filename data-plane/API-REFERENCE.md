@@ -1092,6 +1092,7 @@ When `country` is provided in the request body (e.g. `"AT"`), the extractor cons
 | `eligibility_criteria` | string | Eligibility criteria and requirements |
 | `legal_basis` | string | Legal basis or regulation |
 | `funding_provider` | array of strings | Funding provider organizations |
+| `application_form` | array of strings | URLs to the program's application forms (PDF or online form pages). Falls back to verbatim form names when no URL is available. Empty list if none. |
 | `reference_number` | string/null | Reference number or ID |
 | `start_date` | string | Start date (DD.MM.YYYY) or empty |
 | `end_date` | string | End date (DD.MM.YYYY), `unlimited`, or empty |
@@ -1126,6 +1127,7 @@ The OpenAI-based funding extractor runs unconditionally on every request and its
 - `title`, `program_name` (falls back to `title` when the extractor doesn't find a distinct program name)
 - `processing_office` (list) — a funding doc may route through more than one office
 - `contract_email` (list), `contract_phone` (list) — a funding doc may list multiple contacts
+- `application_form` (list) — URLs to application forms (PDF or online); form names verbatim when no URL is available
 - `state_or_province` (list, english lowercase), `city` (list)
 - `target_group`, `funding_type`, `status`, `funding_amount`
 - `thematic_focus`, `eligibility_criteria`, `legal_basis`, `funding_provider`

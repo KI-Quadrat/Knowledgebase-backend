@@ -36,9 +36,11 @@ class OnlineIngestATRequest(BaseModel):
         None,
         description=(
             "Optional explicit province override stored on every point as "
-            "`metadata.state_or_province`. English lowercase (e.g. "
-            "'lower austria', 'vienna'). When omitted, the funding extractor's "
-            "output is used."
+            "`metadata.state_or_province`. Accepts German or English input in "
+            "any casing — the values pass through the shared AT alias map and "
+            "are stored in canonical English lowercase (e.g. 'wien' → "
+            "'vienna', 'kärnten' → 'carinthia'). Unknown values are dropped. "
+            "When omitted, the funding extractor's output is used."
         ),
     )
     embedding_model: EmbeddingModel = Field(

@@ -10,6 +10,7 @@ from app.models.common import ErrorCode, ResponseEnvelope
 from app.models.online.ingest import EmbeddingModel, OnlineIngestData, OnlineIngestRequest
 from app.routers._ingest_utils import INGEST_ERROR_CODE_MAP
 from app.services.ingest.ingest_service import IngestError
+from app.services.intelligence.funding_extractor import normalize_provinces
 from app.utils.logger import get_logger
 
 # Per-model defaults for vector dim + stored vector field name.
@@ -66,7 +67,9 @@ router = APIRouter(prefix="/api/v1/online", tags=["Online - Ingestion Pipeline"]
         "**Funding metadata extraction:** When `assistant_type` is `\"funding\"`, "
         "an additional OpenAI call extracts structured funding metadata (`country_code`, `state_or_province`, `city`, "
         "`target_group`, `funding_type`, `status`, `funding_amount`, `thematic_focus`, `eligibility_criteria`, "
-        "`legal_basis`, `funding_provider`, `reference_number`, `start_date`, `end_date`, `scraped_at`). "
+        "`legal_basis`, `funding_provider`, `application_form`, `reference_number`, `start_date`, `end_date`, `scraped_at`). "
+        "`application_form` is a list of URLs to the program's application forms (PDF or online form pages); "
+        "the extractor falls back to a verbatim form name when no URL is available. "
         "These fields are merged flat into each Qdrant point's metadata for filtering.\n\n"
         "**Country constraint:** The `country` field (ISO 3166-1 alpha-2) is **required** when `assistant_type` is `\"funding\"`. "
         "It constrains `state_or_province` to the official administrative divisions for that country "
@@ -121,9 +124,16 @@ async def ingest_online(body: OnlineIngestRequest, request: Request) -> Response
     metadata_dict["source_url"] = body.url
     metadata_dict["assistant_type"] = body.assistant_type
 
-    # Explicit state_or_province override from request body: stored verbatim, bypassing extractor normalization.
+    # Explicit state_or_province override from request body — passed through
+    # the same normalize_provinces helper the extractor uses, so a caller
+    # passing local-language names (e.g. "Bayern") lands in the same canonical
+    # English-lowercase form ("bavaria") the extractor would have produced.
+    # This guarantees search-time filters stay consistent across ingests
+    # regardless of how the field was supplied.
     if body.state_or_province:
-        metadata_dict["state_or_province"] = body.state_or_province
+        metadata_dict["state_or_province"] = normalize_provinces(
+            body.country, body.state_or_province
+        )
 
     try:
         result = await ingest_svc.ingest(

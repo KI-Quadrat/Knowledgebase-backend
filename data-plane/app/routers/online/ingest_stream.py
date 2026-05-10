@@ -26,6 +26,7 @@ from app.models.online.ingest import OnlineIngestRequest
 from app.routers._ingest_utils import INGEST_ERROR_CODE_MAP
 from app.routers.online.ingest import _resolve_primary_embedder
 from app.services.ingest.ingest_service import IngestError
+from app.services.intelligence.funding_extractor import normalize_provinces
 from app.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -263,7 +264,12 @@ async def ingest_online_stream(body: OnlineIngestRequest, request: Request) -> S
         metadata_dict["source_url"] = body.url
         metadata_dict["assistant_type"] = body.assistant_type
         if body.state_or_province:
-            metadata_dict["state_or_province"] = body.state_or_province
+            # Same normalization as /ingest — caller-supplied local-language
+            # names land in the canonical English-lowercase form regardless
+            # of country. Keeps stream and non-stream paths in lockstep.
+            metadata_dict["state_or_province"] = normalize_provinces(
+                body.country, body.state_or_province
+            )
 
         queue: asyncio.Queue = asyncio.Queue()
         ingest_task = asyncio.create_task(
