@@ -56,14 +56,14 @@ class ExternalSettings(BaseSettings):
     crawl4ai_url: str = "http://crawl4ai:11235"
     crawl4ai_api_token: str = ""
 
-    # Jina Reader (used as fallback by default; primary for listed domains).
+    # Jina Reader (now the default backend; Crawl4AI /md is the fallback).
     jina_api_url: str = "https://eu-r-beta.jina.ai"
     jina_api_key: str = ""
-    # Comma-separated list of domains routed to Jina by default (instead of
-    # Crawl4AI). Subdomains match by suffix — listing "stadt-wien.at" routes
-    # both "stadt-wien.at" and "www.stadt-wien.at". Empty disables routing
-    # (Crawl4AI stays primary for every URL). Caller-supplied scraper="jina"
-    # or scraper="crawl4ai" still overrides the routing decision.
+    # Comma-separated list of domains where requests with scraper="crawl4ai"
+    # are forced back to Jina (overrides the caller's explicit choice for
+    # known-bad domains). Subdomains match by suffix — listing "stadt-wien.at"
+    # routes both "stadt-wien.at" and "www.stadt-wien.at". Empty disables the
+    # override; the default backend (Jina) is unaffected by this list.
     jina_default_domains: str = ""
 
     # LlamaParse (cloud document parsing)

@@ -15,10 +15,12 @@ class ScrapeRequest(BaseModel):
         "fit",
         description=(
             "Which Markdown variant to return. "
-            "`fit` = main content only (boilerplate pruned via PruningContentFilter on Crawl4AI, "
-            "or Chromium browser-engine markdown on Jina fallback). "
+            "`fit` = main content only (Jina Chromium browser-engine markdown by default; "
+            "Crawl4AI `/md` `f=fit` filter on the fallback path). "
             "`raw` = full page including headers/nav/footer. "
-            "`citations` = full content with citation links preserved (Crawl4AI only; falls back to `raw` on Jina/httpx)."
+            "`citations` = full content with citation links preserved (best-effort; "
+            "the current Crawl4AI `/md` endpoint does not expose a citations filter, "
+            "so this degrades to `raw` on every backend)."
         ),
     )
     exclude_tags: list[str] | None = Field(
@@ -36,10 +38,10 @@ class ScrapeRequest(BaseModel):
         ),
     )
     scraper: Literal["crawl4ai", "jina"] = Field(
-        "crawl4ai",
+        "jina",
         description=(
-            "Preferred scraping backend. `crawl4ai` (default) uses the Crawl4AI service "
-            "with full JavaScript rendering. `jina` uses the Jina Reader API. "
+            "Preferred scraping backend. `jina` (default) uses the Jina Reader API "
+            "(Chromium engine). `crawl4ai` uses the Crawl4AI `POST /md` endpoint. "
             "The other backend (and raw httpx) remain as automatic fallbacks if the "
             "selected one fails, so results are always best-effort."
         ),
@@ -55,6 +57,16 @@ class ScrapeRequest(BaseModel):
             "Triggers one extra raw-HTML fetch (~small)."
         ),
     )
+    bypass_cache: bool = Field(
+        False,
+        description=(
+            "If true, skip the Redis cache and force a fresh fetch from the origin "
+            "(then update the cache with the new content). Use when stale cached "
+            "content must be refreshed — e.g. policy/funding pages that change "
+            "between scheduled re-ingests. `links_summary`, `inner_img`, and "
+            "`inner_docs` already imply a fresh fetch."
+        ),
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -67,7 +79,7 @@ class ScrapeRequest(BaseModel):
                     "css_selector": "main",
                 },
                 {"url": "https://www.wiener-neudorf.gv.at/foerderungen", "inner_img": True, "inner_docs": True},
-                {"url": "https://www.wiener-neudorf.gv.at/foerderungen", "scraper": "jina"},
+                {"url": "https://www.wiener-neudorf.gv.at/foerderungen", "scraper": "crawl4ai"},
                 {"url": "https://www.wiener-neudorf.gv.at/foerderungen", "links_summary": True},
             ]
         }
@@ -125,6 +137,7 @@ class ScrapeData(BaseModel):
     inner_images: list[InnerImageData] | None = Field(None, description="Parsed images found on the page (only when inner_img=true)")
     inner_documents: list[InnerDocData] | None = Field(None, description="Parsed documents linked on the page (only when inner_docs=true)")
     links_summary: LinksSummary | None = Field(None, description="Deduped URL lists grouped by kind (only when links_summary=true)")
+    scraper_used: str | None = Field(None, description="Backend that produced the content: 'crawl4ai', 'jina', or 'httpx' (final fallback). Null on failure or cache hits with no recorded backend.")
 
 
 class CrawlRequest(BaseModel):
@@ -134,11 +147,19 @@ class CrawlRequest(BaseModel):
     method: str = Field(..., description="Discovery method: 'sitemap' (parse XML sitemap) or 'crawl' (BFS link following)", pattern=r"^(sitemap|crawl)$")
     max_depth: int = Field(3, ge=1, le=5, description="Maximum link-following depth for crawl method")
     max_urls: int = Field(500, ge=1, le=5000, description="Maximum number of URLs to return")
-    scraper: Literal["crawl4ai", "jina"] = Field(
-        "crawl4ai",
+    scraper: Literal["httpx", "crawl4ai", "jina"] = Field(
+        "httpx",
         description=(
-            "Preferred scraping backend used during BFS `crawl` discovery "
-            "(ignored when `method='sitemap'`). Same semantics as in `/online/scrape`."
+            "Backend used during BFS `crawl` discovery (ignored when `method='sitemap'`).\n"
+            "- `httpx` (**default**) — raw HTTP fetches, no JS rendering. Fast and free; "
+            "sufficient for sites with server-rendered nav menus (most muni/gov portals).\n"
+            "- `crawl4ai` — server-side BFS via Crawl4AI's `POST /crawl` endpoint with "
+            "`BFSDeepCrawlStrategy`. One round-trip; the server runs the loop. Use for "
+            "deep/large crawls where you want filter chains or relevance pruning. Falls "
+            "back to the Python BFS over httpx if the deep-crawl call fails.\n"
+            "- `jina` — per-URL Python BFS through Jina's hosted Chromium engine. "
+            "Expensive (one Jina call per discovered URL) — only pick this when the link "
+            "graph is genuinely JS-injected and httpx misses links."
         ),
     )
 
@@ -147,6 +168,7 @@ class CrawlRequest(BaseModel):
             "examples": [
                 {"url": "https://www.wiener-neudorf.gv.at/sitemap.xml", "method": "sitemap", "max_urls": 500},
                 {"url": "https://www.wiener-neudorf.gv.at", "method": "crawl", "max_depth": 3, "max_urls": 100},
+                {"url": "https://www.wiener-neudorf.gv.at", "method": "crawl", "scraper": "crawl4ai"},
                 {"url": "https://www.wiener-neudorf.gv.at", "method": "crawl", "scraper": "jina"},
             ]
         }
@@ -168,3 +190,17 @@ class CrawlData(BaseModel):
     method_used: str = Field(..., description="Method that was used: sitemap or crawl")
     urls: list[CrawlUrl] = Field(..., description="List of discovered URLs")
     total_urls: int = Field(..., description="Total number of URLs discovered")
+    scraper_used: str | None = Field(
+        None,
+        description=(
+            "Backend that produced the BFS discovery: 'crawl4ai' (server-side "
+            "BFS via Crawl4AI's `/crawl` endpoint), 'jina' (per-URL Chromium), "
+            "or 'httpx' (raw HTTP — the new default for /crawl). When the "
+            "requested 'crawl4ai' deep-crawl call fails, the service falls "
+            "back to a Python BFS over httpx and reports 'httpx' here. Falls "
+            "back to the requested `scraper` value when every BFS hit was a "
+            "legacy cache entry without a recorded backend. Null for "
+            "`method='sitemap'` (no scraping involved) or when no pages were "
+            "discovered at all."
+        ),
+    )

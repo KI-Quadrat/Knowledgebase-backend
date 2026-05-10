@@ -45,7 +45,7 @@ class ContentCache:
         return f"{KEY_PREFIX}{hashlib.sha256(url.encode()).hexdigest()}"
 
     async def get(self, url: str) -> dict | None:
-        """Return cached entry as ``{"markdown": str, "title": str | None}``.
+        """Return cached entry as ``{"markdown": str, "title": str | None, "scraper_used": str | None}``.
 
         New entries are stored as a JSON envelope. Legacy entries (plain
         markdown strings written before the title field was added) are wrapped
@@ -65,10 +65,11 @@ class ContentCache:
                     return {
                         "markdown": parsed.get("markdown") or "",
                         "title": parsed.get("title"),
+                        "scraper_used": parsed.get("scraper_used"),
                     }
             except (json.JSONDecodeError, TypeError):
                 pass
-            return {"markdown": value, "title": None}
+            return {"markdown": value, "title": None, "scraper_used": None}
         except Exception as exc:
             log.warning("cache_get_failed", url=url, error=str(exc))
             return None
@@ -79,13 +80,16 @@ class ContentCache:
         content: str,
         *,
         title: str | None = None,
+        scraper_used: str | None = None,
         ttl: int | None = None,
     ) -> None:
         if not self._redis:
             return
         try:
             key = self._make_key(url)
-            payload = json.dumps({"markdown": content, "title": title})
+            payload = json.dumps(
+                {"markdown": content, "title": title, "scraper_used": scraper_used}
+            )
             await self._redis.set(key, payload, ex=ttl or self._default_ttl)
             log.debug("cache_set", url=url)
         except Exception as exc:

@@ -40,21 +40,29 @@ class CrawlResult:
         success: bool = True,
         error: str | None = None,
         duration_ms: int = 0,
+        scraper_used: str | None = None,
     ):
         self.markdown = markdown
         self.html = html
-        # Title reported directly by the backend (Jina ``data.title``). For
-        # Crawl4AI / httpx the rendered HTML is available so the title is
-        # extracted via ``extract_metadata`` downstream — this stays None.
+        # Title reported directly by the backend (Jina ``data.title``). The
+        # Crawl4AI ``/md`` endpoint does not return a title — the router falls
+        # back to whatever ``extract_metadata`` can pull from cached HTML or
+        # leaves it None. The httpx fallback returns rendered HTML, so the
+        # router extracts the title from there.
         self.title = title
         self.links = links or []
         # Image URLs harvested by the backend (Jina X-With-Images-Summary).
-        # Crawl4AI / httpx leave this empty — the router still has the rendered
-        # HTML and uses ``discover_images`` for those backends.
+        # Crawl4AI ``/md`` and httpx leave this empty — the router runs
+        # ``discover_images`` against rendered HTML for the httpx backend, and
+        # the Crawl4AI branch produces no HTML, so per-page image discovery is
+        # only available via the Jina/httpx paths.
         self.images = images or []
         self.success = success
         self.error = error
         self.duration_ms = duration_ms
+        # Which backend actually produced the markdown — set per-branch in
+        # ``crawl()`` after a backend succeeds. ``None`` on failed results.
+        self.scraper_used = scraper_used
 
 
 class Crawl4AIClient:
@@ -112,15 +120,24 @@ class Crawl4AIClient:
         # Build prioritized backend list based on client preference. The
         # non-preferred backend (and raw httpx) remain as automatic fallbacks
         # so requests stay best-effort even when the chosen backend fails.
-        if scraper == "jina":
+        # ``scraper="httpx"`` short-circuits both browser backends and goes
+        # straight to the raw httpx fallback below — used by /crawl BFS where
+        # Chromium-rendered fetches are wasted on per-URL link harvesting.
+        if scraper == "httpx":
+            backend_order: tuple[str, ...] = ()
+        elif scraper == "jina":
             backend_order = ("jina", "crawl4ai")
         else:
             backend_order = ("crawl4ai", "jina")
 
         for backend in backend_order:
+            # ``js_render=False`` opts out of every browser-rendered backend.
+            # Both Crawl4AI's ``/md`` and Jina's Chromium engine fetch via a
+            # headless browser, so the flag must skip both — otherwise Jina
+            # silently re-introduces the Chromium cost we asked to avoid.
+            if not js_render:
+                continue
             if backend == "crawl4ai":
-                if not js_render:
-                    continue
                 try:
                     result = await self._crawl_via_api(
                         url,
@@ -132,6 +149,7 @@ class Crawl4AIClient:
                     )
                     result.duration_ms = int((time.monotonic() - start) * 1000)
                     if result.success:
+                        result.scraper_used = "crawl4ai"
                         mark_crawl4ai("success", time.monotonic() - start)
                         return result
                     log.warning("crawl4ai_failed_falling_back", url=url, error=result.error)
@@ -154,6 +172,7 @@ class Crawl4AIClient:
                     )
                     result.duration_ms = int((time.monotonic() - start) * 1000)
                     if result.success:
+                        result.scraper_used = "jina"
                         log.info("jina_scrape_success", url=url, primary=(scraper == "jina"))
                         return result
                     log.warning("jina_scrape_failed", url=url, error=result.error)
@@ -168,6 +187,8 @@ class Crawl4AIClient:
             exclude_tags=exclude_tags,
         )
         result.duration_ms = int((time.monotonic() - start) * 1000)
+        if result.success:
+            result.scraper_used = "httpx"
         return result
 
     async def _crawl_via_api(
@@ -180,55 +201,28 @@ class Crawl4AIClient:
         markdown_type: str = "fit",
         exclude_tags: list[str] | None = None,
     ) -> CrawlResult:
-        headers: dict[str, str] = {}
+        # Crawl4AI's /md endpoint takes a tiny payload — just url + filter.
+        # The legacy /crawl endpoint with browser_config / crawler_config /
+        # markdown_generator / magic was tripping the new server with
+        # "Invalid expression" on some pages, so we no longer construct that
+        # config envelope. Caller-supplied wait_for / css_selector /
+        # exclude_tags can't be forwarded here (the server applies its own
+        # defaults); they're still honored on the Jina branch where they map
+        # to request headers.
+        headers: dict[str, str] = {"Content-Type": "application/json"}
         if self._api_token:
             headers["Authorization"] = f"Bearer {self._api_token}"
 
-        crawler_params: dict = {
-            "scan_full_page": False,
-            "wait_until": "domcontentloaded",
-            "page_timeout": timeout * 1000,
-            "delay_before_return_html": 0.5,
-            "magic": True,
-            "remove_overlay_elements": True,
-            "cache_mode": "bypass",
-        }
-        if wait_for:
-            crawler_params["wait_for"] = f"css:{wait_for}"
-        if css_selector:
-            crawler_params["css_selector"] = css_selector
-        if exclude_tags:
-            crawler_params["excluded_tags"] = exclude_tags
-        if markdown_type == "fit":
-            crawler_params["markdown_generator"] = {
-                "type": "DefaultMarkdownGenerator",
-                "params": {
-                    "content_filter": {
-                        "type": "PruningContentFilter",
-                        "params": {
-                            "threshold": 0.48,
-                            "threshold_type": "fixed",
-                            "min_word_threshold": 0,
-                        },
-                    },
-                    "options": {"ignore_links": False, "escape_html": True},
-                },
-            }
+        # /md FilterType: raw | fit | bm25 | llm. We only ever use fit/raw;
+        # citations is a Crawl4AI-only feature on /crawl that /md doesn't
+        # offer, so it degrades to raw (full content) — same fallback that
+        # Jina/httpx already use.
+        filter_value = "fit" if markdown_type == "fit" else "raw"
 
-        payload: dict = {
-            "urls": [url],
-            "browser_config": {
-                "type": "BrowserConfig",
-                "params": {"headless": True},
-            },
-            "crawler_config": {
-                "type": "CrawlerRunConfig",
-                "params": crawler_params,
-            },
-        }
+        payload: dict = {"url": url, "f": filter_value}
 
         resp = await self._client.post(  # type: ignore[union-attr]
-            f"{self._base_url}/crawl",
+            f"{self._base_url}/md",
             json=payload,
             headers=headers,
             timeout=timeout + 10,
@@ -236,18 +230,116 @@ class Crawl4AIClient:
         resp.raise_for_status()
         data = resp.json()
 
-        results = data.get("results") or []
-        if isinstance(results, list) and results:
-            result_data = results[0]
+        markdown_value = data.get("markdown")
+        if isinstance(markdown_value, dict):
+            markdown = _extract_markdown(markdown_value, preferred=markdown_type)
+        elif isinstance(markdown_value, str):
+            markdown = markdown_value
         else:
-            result_data = data.get("result", data)
+            markdown = ""
 
-        success = bool(result_data.get("success", data.get("success", False)))
-        markdown = _extract_markdown(result_data.get("markdown"), preferred=markdown_type)
-        html = _extract_html(result_data)
-        error = _extract_error(result_data)
+        success = bool(data.get("success", bool(markdown.strip())))
+        error = _extract_error(data)
 
-        return CrawlResult(markdown=clean_markdown(markdown), html=html, success=success, error=error)
+        # New server still occasionally returns success=true with the literal
+        # "Crawl4AI Error" preamble baked into the markdown body. Treat that
+        # as a failure so the Jina/httpx fallback chain engages.
+        if success and markdown.lstrip().startswith("Crawl4AI Error"):
+            success = False
+            error = markdown.split("\n", 1)[0].strip()
+            markdown = ""
+
+        return CrawlResult(markdown=clean_markdown(markdown), html="", success=success, error=error)
+
+    async def deep_crawl(
+        self,
+        root_url: str,
+        *,
+        max_depth: int = 2,
+        max_pages: int = 50,
+        same_domain_only: bool = True,
+        timeout: int = 120,
+    ) -> tuple[bool, list[str], list[dict], str | None]:
+        """Server-side BFS via Crawl4AI ``POST /crawl`` + ``BFSDeepCrawlStrategy``.
+
+        Returns ``(success, visited_urls, discovered_links, error)``.
+
+        - ``visited_urls`` — pages the server actually crawled (one per result).
+        - ``discovered_links`` — the union of internal ``links`` reported across
+          all crawled pages, as ``[{"href": ..., "text": ...}, ...]``. Used by
+          the caller to classify pages vs documents.
+        - On failure ``success=False`` with ``error`` set; the caller is
+          expected to fall back to its own BFS.
+
+        The endpoint runs synchronously when ``stream=false`` (default) and
+        returns ``{"results": [...]}``. Older builds returned ``{"task_id": ...}``
+        for async polling — we treat that as unsupported here and surface a
+        failure so the caller falls back rather than hanging on a poll loop.
+        """
+        if not self._client:
+            raise RuntimeError("Client not started — call start() first")
+
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self._api_token:
+            headers["Authorization"] = f"Bearer {self._api_token}"
+
+        payload: dict = {
+            "urls": [root_url],
+            "crawler_config": {
+                "deep_crawl_strategy": {
+                    "type": "BFSDeepCrawlStrategy",
+                    "max_depth": max_depth,
+                    "max_pages": max_pages,
+                    "include_external": not same_domain_only,
+                },
+                "stream": False,
+            },
+        }
+
+        try:
+            resp = await self._client.post(
+                f"{self._base_url}/crawl",
+                json=payload,
+                headers=headers,
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.TimeoutException:
+            return False, [], [], f"Crawl4AI deep_crawl timeout after {timeout}s"
+        except httpx.HTTPStatusError as exc:
+            return False, [], [], f"Crawl4AI deep_crawl HTTP {exc.response.status_code}"
+        except Exception as exc:
+            return False, [], [], f"Crawl4AI deep_crawl error: {exc}"
+
+        if "results" not in data:
+            # Async-task variant — poll-based. Treat as unsupported.
+            return False, [], [], "Crawl4AI returned task_id (async mode unsupported)"
+
+        results = data.get("results") or []
+        visited: list[str] = []
+        seen_visited: set[str] = set()
+        discovered: list[dict] = []
+        seen_links: set[str] = set()
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            url_value = item.get("url")
+            if isinstance(url_value, str) and url_value not in seen_visited:
+                visited.append(url_value)
+                seen_visited.add(url_value)
+            links_obj = item.get("links") or {}
+            internal = links_obj.get("internal") or [] if isinstance(links_obj, dict) else []
+            for link in internal:
+                if not isinstance(link, dict):
+                    continue
+                href = link.get("href")
+                if not isinstance(href, str) or href in seen_links:
+                    continue
+                seen_links.add(href)
+                discovered.append({"href": href, "text": link.get("text") or ""})
+
+        return True, visited, discovered, None
 
     async def _scrape_with_jina(
         self,
@@ -407,16 +499,6 @@ def _extract_markdown(markdown_value: object, *, preferred: str = "fit") -> str:
             if isinstance(value, str) and value.strip():
                 return value
         return ""
-    return ""
-
-
-def _extract_html(result_data: dict) -> str:
-    # Preserve the full rendered DOM when available so downstream link discovery
-    # can see links that may be dropped from cleaned/fit variants.
-    for key in ("html", "cleaned_html", "fit_html"):
-        value = result_data.get(key)
-        if isinstance(value, str) and value.strip():
-            return value
     return ""
 
 

@@ -2,7 +2,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from pydantic import BaseModel, Field
 
@@ -19,6 +19,74 @@ from app.utils.logger import get_logger
 log = get_logger(__name__)
 
 
+# CSS selectors for the most common cookie/CMP banners. Always merged into
+# ``exclude_tags`` so the scraped markdown is not polluted by consent text.
+# Conservative on purpose — only specific CMP hooks plus a small set of
+# canonical class/id names. Broad attribute regex (``[class*="cookie"]``) is
+# avoided since it would also strip legitimate footer cookie-policy blocks.
+DEFAULT_COOKIE_BANNER_SELECTORS: tuple[str, ...] = (
+    # OneTrust
+    "#onetrust-banner-sdk",
+    "#onetrust-consent-sdk",
+    "#onetrust-pc-sdk",
+    # Cookiebot
+    "#CybotCookiebotDialog",
+    "#CybotCookiebotDialogBodyUnderlay",
+    # Osano
+    ".osano-cm-window",
+    ".osano-cm-dialog",
+    # Quantcast Choice
+    "#qc-cmp2-container",
+    "#qc-cmp2-ui",
+    # TrustArc
+    "#truste-consent-track",
+    "#consent_blackbar",
+    ".trustarc-banner-container",
+    # Termly
+    ".termly-styles-banner",
+    "#termly-code-snippet-support",
+    # Cookie Law Info (WP plugin)
+    "#cookie-law-info-bar",
+    ".cookie-law-info-bar",
+    # Insites Cookie Consent
+    ".cc-window",
+    ".cc-banner",
+    # Usercentrics
+    "#usercentrics-root",
+    "#uc-banner",
+    # Klaro
+    "#klaro",
+    ".klaro",
+    # Didomi
+    "#didomi-host",
+    ".didomi-popup-container",
+    # Axeptio
+    "#axeptio_overlay",
+    "#axeptio_main_button",
+    # Sourcepoint
+    '[id^="sp_message_container_"]',
+    # Generic, canonical names
+    "#cookie-banner",
+    ".cookie-banner",
+    "#cookie-notice",
+    ".cookie-notice",
+    "#cookie-consent",
+    ".cookie-consent",
+    "#cookieConsent",
+)
+
+
+def _merge_cookie_selectors(exclude_tags: list[str] | None) -> list[str]:
+    """Return ``exclude_tags`` extended with the default cookie selectors, deduped."""
+    seen: set[str] = set()
+    merged: list[str] = []
+    for sel in (*(exclude_tags or ()), *DEFAULT_COOKIE_BANNER_SELECTORS):
+        if sel and sel not in seen:
+            seen.add(sel)
+            merged.append(sel)
+    return merged
+
+
 # ── Internal models used by the scraper service ──────
 
 class ScrapeOptions(BaseModel):
@@ -31,7 +99,7 @@ class ScrapeOptions(BaseModel):
     timeout: int = Field(30, ge=1, le=120)
     markdown_type: str = "fit"
     exclude_tags: list[str] | None = None
-    scraper: str = "crawl4ai"
+    scraper: str = "jina"
 
 
 class PageMetadata(BaseModel):
@@ -69,6 +137,9 @@ class ScrapeResult(BaseModel):
     discovered_images: list[str] = Field(default_factory=list)
     error: str | None = None
     duration_ms: int | None = None
+    # Backend that actually produced the result: ``crawl4ai``, ``jina``, or
+    # ``httpx`` (final fallback). ``None`` on failed scrapes.
+    scraper_used: str | None = None
 
 
 # ── Service ──────────────────────────────────────────
@@ -92,9 +163,11 @@ class ScraperService:
     def _route_scraper(self, url: str, requested: str) -> str:
         """Pick the actual scraper backend for a URL.
 
-        - Caller explicitly chose ``"jina"`` → respected.
-        - Caller left the default ``"crawl4ai"`` and the URL's domain (or any
-          parent domain) is in ``JINA_DEFAULT_DOMAINS`` → Jina.
+        - Caller chose ``"jina"`` (now the default) → respected.
+        - Caller explicitly opted into ``"crawl4ai"`` AND the URL's domain
+          (or any parent domain) is in ``JINA_DEFAULT_DOMAINS`` → routed back
+          to Jina (the override list flags domains where Crawl4AI is known
+          to misbehave).
         - Otherwise → caller's value (``"crawl4ai"``).
         """
         if requested != "crawl4ai":
@@ -174,6 +247,7 @@ class ScraperService:
                             word_count=count_words(cached_markdown),
                         ),
                         duration_ms=int((time.monotonic() - start) * 1000),
+                        scraper_used=cached.get("scraper_used"),
                     )
                 mark_cache_miss()
 
@@ -188,6 +262,8 @@ class ScraperService:
                     routed_to=scraper_choice,
                 )
 
+            exclude_tags = _merge_cookie_selectors(options.exclude_tags)
+
             crawl_result = await self.crawl4ai.crawl(
                 url,
                 js_render=options.js_render,
@@ -195,7 +271,7 @@ class ScraperService:
                 css_selector=options.css_selector,
                 timeout=options.timeout,
                 markdown_type=options.markdown_type,
-                exclude_tags=options.exclude_tags,
+                exclude_tags=exclude_tags,
                 with_links_summary=options.with_links_summary,
                 inner_img=options.inner_img,
                 scraper=scraper_choice,
@@ -268,7 +344,12 @@ class ScraperService:
             )
 
             if markdown is not None:
-                await self.cache.set(url, markdown, title=metadata.title)
+                await self.cache.set(
+                    url,
+                    markdown,
+                    title=metadata.title,
+                    scraper_used=crawl_result.scraper_used,
+                )
 
             duration_ms = int((time.monotonic() - start) * 1000)
 
@@ -294,6 +375,7 @@ class ScraperService:
                 discovered_links=discovered_links,
                 discovered_images=discovered_images,
                 duration_ms=duration_ms,
+                scraper_used=crawl_result.scraper_used,
             )
 
         except TimeoutError:
@@ -325,17 +407,123 @@ class ScraperService:
         max_pages: int = 50,
         same_domain_only: bool = True,
         on_progress: Callable[[int, int, str], None] | None = None,
-        scraper: str = "crawl4ai",
-    ) -> tuple[list[str], list[DiscoveredDocument]]:
-        """Breadth-first URL discovery using lightweight scraping."""
+        scraper: str = "httpx",
+    ) -> tuple[list[str], list[DiscoveredDocument], str | None]:
+        """Breadth-first URL discovery.
+
+        Backend behavior by ``scraper`` value:
+        - ``crawl4ai`` — one server-side ``POST /crawl`` with
+          ``BFSDeepCrawlStrategy``. The Crawl4AI server runs the BFS itself
+          and returns the visited URL set + per-page link map in one round
+          trip. Falls back to the Python BFS over httpx if the deep-crawl
+          call fails (server unsupported, timeout, etc).
+        - ``jina`` — Python BFS, each URL fetched via Jina's Chromium
+          engine. Use only when the link graph is JS-injected.
+        - ``httpx`` (**default**) — Python BFS with cheap raw HTTP fetches.
+          Sufficient for sites with server-rendered nav.
+
+        Returns ``(pages, documents, scraper_used)``. ``scraper_used``
+        prefers the first non-None backend actually reported across the
+        BFS, and falls back to the caller's requested ``scraper`` when
+        every result was a legacy cache entry without a recorded backend.
+        """
+        if scraper == "crawl4ai":
+            ok, pages, docs = await self._deep_crawl_via_crawl4ai(
+                root_url,
+                max_depth=max_depth,
+                max_pages=max_pages,
+                same_domain_only=same_domain_only,
+                on_progress=on_progress,
+            )
+            if ok:
+                return pages, docs, "crawl4ai"
+            log.info("deep_crawl_falling_back_to_python_bfs", url=root_url)
+
+        return await self._discover_urls_python_bfs(
+            root_url,
+            max_depth=max_depth,
+            max_pages=max_pages,
+            same_domain_only=same_domain_only,
+            on_progress=on_progress,
+            scraper="httpx" if scraper == "crawl4ai" else scraper,
+        )
+
+    async def _deep_crawl_via_crawl4ai(
+        self,
+        root_url: str,
+        *,
+        max_depth: int,
+        max_pages: int,
+        same_domain_only: bool,
+        on_progress: Callable[[int, int, str], None] | None,
+    ) -> tuple[bool, list[str], list[DiscoveredDocument]]:
+        """Server-side BFS via ``Crawl4AIClient.deep_crawl``."""
+        ok, visited, links, error = await self.crawl4ai.deep_crawl(
+            root_url,
+            max_depth=max_depth,
+            max_pages=max_pages,
+            same_domain_only=same_domain_only,
+        )
+        if not ok:
+            log.warning("deep_crawl_failed", url=root_url, error=error)
+            return False, [], []
+
+        # Resolve relative hrefs against the root, then split into docs vs
+        # pages. Client-side same-domain filter as a safety net — the server
+        # honors ``include_external`` but builds vary; this guarantees the
+        # caller's contract regardless.
+        root_domain = urlparse(root_url).netloc.lower()
+        absolute_links: list[str] = []
+        for link in links:
+            href = link.get("href")
+            if not href:
+                continue
+            absolute = urljoin(root_url, href)
+            if same_domain_only and urlparse(absolute).netloc.lower() != root_domain:
+                continue
+            absolute_links.append(absolute)
+        raw_docs, _page_links = split_documents_and_links(absolute_links, found_on=root_url)
+        discovered_docs = [
+            DiscoveredDocument(
+                url=d.url,
+                type=d.type,
+                link_text=d.link_text,
+                found_on=d.found_on,
+            )
+            for d in raw_docs
+        ]
+        if on_progress:
+            on_progress(len(visited), max_pages, root_url)
+        return True, visited, discovered_docs
+
+    async def _discover_urls_python_bfs(
+        self,
+        root_url: str,
+        *,
+        max_depth: int,
+        max_pages: int,
+        same_domain_only: bool,
+        on_progress: Callable[[int, int, str], None] | None,
+        scraper: str,
+    ) -> tuple[list[str], list[DiscoveredDocument], str | None]:
+        """In-process BFS — fan out per URL through ``scrape_url``.
+
+        ``js_render`` is set based on the scraper choice: ``httpx`` skips
+        rendering entirely (cheap fetches), while ``jina`` enables it so
+        the Chromium engine actually runs.
+        """
         visited: set[str] = set()
         discovered_pages: list[str] = []
         doc_map: dict[str, DiscoveredDocument] = {}
         queue: deque[tuple[str, int]] = deque([(root_url, 0)])
+        observed_scraper: str | None = None
 
         root_domain = urlparse(root_url).netloc.lower()
         discover_options = ScrapeOptions(
-            js_render=False, extract_links=True, timeout=15, scraper=scraper
+            js_render=(scraper != "httpx"),
+            extract_links=True,
+            timeout=15,
+            scraper=scraper,
         )
 
         while queue and len(discovered_pages) < max_pages:
@@ -346,6 +534,8 @@ class ScraperService:
 
             result = await self.scrape_url(current_url, discover_options)
             discovered_pages.append(current_url)
+            if observed_scraper is None and result.scraper_used:
+                observed_scraper = result.scraper_used
             if on_progress:
                 on_progress(len(discovered_pages), max_pages, current_url)
 
@@ -363,4 +553,5 @@ class ScraperService:
                     continue
                 queue.append((link, depth + 1))
 
-        return discovered_pages, list(doc_map.values())
+        scraper_used = observed_scraper or (scraper if discovered_pages else None)
+        return discovered_pages, list(doc_map.values()), scraper_used
