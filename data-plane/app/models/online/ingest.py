@@ -88,12 +88,12 @@ class OnlineIngestRequest(BaseModel):
     country: str | None = Field(None, description="ISO 3166-1 alpha-2 country code (e.g. 'AT', 'DE', 'RO'). Required when assistant_type is 'funding'. Used by the funding extractor to constrain state_or_province to the official list for that country, preventing hallucinated region names.")
     state_or_province: list[str] | None = Field(None, description="Optional override for the funding `state_or_province` metadata field. When provided, values pass through the same per-country alias map the extractor uses — local-language names (e.g. 'Bayern', 'Praha', 'Wien') are canonicalized to English lowercase ('bavaria', 'prague', 'vienna'), and values not in the official list for the supplied `country` are dropped. Supported alias maps: AT, DE, CH, RO, IT, FR, HU, CZ, SK, SI, HR. For countries outside that list, values are lowercased and stripped but not validated. When omitted, the funding extractor detects and normalizes the value automatically.")
     embedding_model: EmbeddingModel = Field(
-        EmbeddingModel.openai,
+        EmbeddingModel.bge_m3,
         description=(
-            "Primary embedder for this ingest. `openai` (default) uses "
-            "`text-embedding-3-small` (1536-dim, stored as `dense_openai`). "
-            "`bge_m3` uses BGE-M3 via the TEI endpoint at `TEI_EMBED_URL_AT` "
-            "(1024-dim, stored as `dense_bge_m3`). A collection is tied to "
+            "Primary embedder for this ingest. `bge_m3` (default) uses "
+            "BGE-M3 via the TEI endpoint at `TEI_EMBED_URL_AT` (1024-dim, "
+            "stored as `dense_bge_m3`). `openai` uses `text-embedding-3-small` "
+            "(1536-dim, stored as `dense_openai`). A collection is tied to "
             "the model it was first ingested with — mixing models in one "
             "collection is not supported."
         ),
@@ -126,7 +126,6 @@ class OnlineIngestRequest(BaseModel):
                         "department": ["Bürgerservice", "Förderungen"],
                     },
                     "vector_config": {
-                        "vector_size": 1536,
                         "search_mode": "semantic",
                     },
                 }

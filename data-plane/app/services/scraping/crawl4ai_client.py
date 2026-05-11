@@ -213,12 +213,67 @@ class Crawl4AIClient:
         if self._api_token:
             headers["Authorization"] = f"Bearer {self._api_token}"
 
-        # /md FilterType: raw | fit | bm25 | llm. We only ever use fit/raw;
-        # citations is a Crawl4AI-only feature on /crawl that /md doesn't
-        # offer, so it degrades to raw (full content) — same fallback that
-        # Jina/httpx already use.
-        filter_value = "fit" if markdown_type == "fit" else "raw"
+        result = await self._fetch_md(
+            url,
+            markdown_type=markdown_type,
+            timeout=timeout,
+            headers=headers,
+        )
 
+        # Fit → raw fallback. Crawl4AI's PruningContentFilter (f=fit)
+        # occasionally strips pages whose payload is mostly tabular /
+        # label-value content (Austrian gov portals are the canonical case),
+        # leaving fit-mode markdown nearly empty. The /md branch has no HTML
+        # to compare against — only the markdown — so we use a word-count
+        # floor. Retry once with f=raw and keep that result if it's a real
+        # improvement (more words than the fit result); otherwise fall
+        # through to the original so the outer Jina/httpx chain can engage
+        # via the normal success=False path. Skipped for raw/citations —
+        # both already map to f=raw, so retrying would change nothing.
+        if (
+            markdown_type == "fit"
+            and result.success
+            and len(result.markdown.split()) < _FIT_FALLBACK_WORD_THRESHOLD
+        ):
+            log.info(
+                "crawl4ai_fit_thin_retry_raw",
+                url=url,
+                word_count=len(result.markdown.split()),
+            )
+            raw_result = await self._fetch_md(
+                url,
+                markdown_type="raw",
+                timeout=timeout,
+                headers=headers,
+            )
+            if (
+                raw_result.success
+                and raw_result.markdown.strip()
+                and len(raw_result.markdown.split()) > len(result.markdown.split())
+            ):
+                return raw_result
+
+        return result
+
+    async def _fetch_md(
+        self,
+        url: str,
+        *,
+        markdown_type: str,
+        timeout: int,
+        headers: dict[str, str],
+    ) -> CrawlResult:
+        """POST one /md request and parse the response into a CrawlResult.
+
+        Maps the public ``markdown_type`` (fit / raw / citations) to /md's
+        ``f`` filter via ``_FILTER_BY_MARKDOWN_TYPE``. The /md endpoint only
+        supports raw | fit | bm25 | llm — there is no citations filter, so
+        citations degrades to f=raw (same best-effort the Jina and httpx
+        branches already provide). Empty markdown and the literal
+        ``Crawl4AI Error`` preamble are surfaced as failures so the upstream
+        Jina/httpx fallback chain engages.
+        """
+        filter_value = _FILTER_BY_MARKDOWN_TYPE.get(markdown_type, "raw")
         payload: dict = {"url": url, "f": filter_value}
 
         resp = await self._client.post(  # type: ignore[union-attr]
@@ -232,6 +287,10 @@ class Crawl4AIClient:
 
         markdown_value = data.get("markdown")
         if isinstance(markdown_value, dict):
+            # /md returns a string today, but the older /crawl envelope used
+            # a dict keyed by fit_markdown / markdown_with_citations /
+            # raw_markdown. Defend against either shape: prefer the variant
+            # that matches the caller's markdown_type, fall through the rest.
             markdown = _extract_markdown(markdown_value, preferred=markdown_type)
         elif isinstance(markdown_value, str):
             markdown = markdown_value
@@ -480,6 +539,24 @@ def _html_to_markdown(soup: BeautifulSoup) -> str:
         else:
             lines.append(f"{text}\n")
     return "\n".join(lines)
+
+
+# Map the public markdown_type (fit / raw / citations) to Crawl4AI's /md
+# ``f`` filter. /md supports raw | fit | bm25 | llm only — citations is a
+# /crawl-only feature, so it degrades to f=raw here (same best-effort the
+# Jina and httpx branches already provide).
+_FILTER_BY_MARKDOWN_TYPE: dict[str, str] = {
+    "fit": "fit",
+    "raw": "raw",
+    "citations": "raw",
+}
+
+# Word-count floor for the Crawl4AI /md fit→raw fallback. The /md endpoint
+# returns markdown only (no HTML), so the router's ratio-based thin check
+# (which needs both) is bypassed; this is the in-client backstop. Tuned to
+# match the router's _THIN_WORD_THRESHOLD so both heuristics agree on what
+# counts as "suspiciously short."
+_FIT_FALLBACK_WORD_THRESHOLD = 20
 
 
 _MARKDOWN_PRIORITY: dict[str, tuple[str, ...]] = {
