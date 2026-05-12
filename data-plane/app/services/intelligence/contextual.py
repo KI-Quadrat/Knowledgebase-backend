@@ -56,13 +56,8 @@ BATCH_CONTEXT_SYSTEM_PROMPT = """\
 You produce short situating contexts for chunks of a document, used to improve
 retrieval. For each chunk, write 2-3 concise sentences explaining how that
 chunk fits within the overall document. Write each context in the same language
-as the source content.
-
-Respond ONLY with valid JSON of the exact shape:
-{"contexts": ["<context for chunk 1>", "<context for chunk 2>", ...]}
-
-The array length MUST equal the number of chunks, and contexts MUST be in the
-same order as the chunks."""
+as the source content. Return one context per chunk, in the same order as the
+chunks. The response is structured JSON enforced by schema."""
 
 
 class ContextualEnricher:
@@ -178,6 +173,11 @@ class ContextualEnricher:
         # don't blow through the response limit.
         max_tokens = min(16000, 200 + 160 * len(chunks))
 
+        # ``json_schema`` strict mode forces OpenAI's constrained sampler to
+        # produce an array of exactly ``len(chunks)`` strings — schema-level
+        # enforcement, not a prompt instruction. Eliminates the prior
+        # ``contextual_batch_length_mismatch`` failure mode where the model
+        # returned ±N too many/few entries under ``json_object`` mode.
         body = {
             "model": self._model,
             "messages": [
@@ -186,7 +186,26 @@ class ContextualEnricher:
             ],
             "max_tokens": max_tokens,
             "temperature": 0.0,
-            "response_format": {"type": "json_object"},
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "contexts",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "contexts": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": len(chunks),
+                                "maxItems": len(chunks),
+                            },
+                        },
+                        "required": ["contexts"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
         }
 
         raw = await self._chat_with_fallback(body, label="contextual_batch")
@@ -200,6 +219,12 @@ class ContextualEnricher:
             return None
 
         contexts = data.get("contexts")
+        # Length mismatch is structurally impossible under strict json_schema
+        # mode (the schema pins ``minItems``/``maxItems`` to ``len(chunks)``),
+        # but kept as a defensive guard in case the call landed on the LiteLLM
+        # fallback with a provider that doesn't honor the schema, or strict
+        # mode is degraded in some future OpenAI revision. Either way we fall
+        # back to per-chunk enrichment rather than mis-aligning contexts.
         if not isinstance(contexts, list) or len(contexts) != len(chunks):
             log.warning(
                 "contextual_batch_length_mismatch",
@@ -245,7 +270,15 @@ class ContextualEnricher:
         """
         try:
             resp = await self._post_with_rate_limit_retry(body)
-            return resp.json()["choices"][0]["message"]["content"]
+            message = resp.json()["choices"][0]["message"]
+            # Strict structured-outputs surface a non-null ``refusal`` field
+            # when the model declines instead of returning ``content``. Treat
+            # it as a soft failure so the caller falls back per-chunk.
+            refusal = message.get("refusal")
+            if refusal:
+                log.warning(f"{label}_refused", reason=str(refusal)[:200])
+                return None
+            return message.get("content")
         except Exception as e:
             if not _is_outage_error(e):
                 log.warning(f"{label}_call_failed", error=str(e))
@@ -269,8 +302,13 @@ class ContextualEnricher:
         if fb is None:
             log.warning(f"{label}_fallback_disabled")
             return None
+        fb_message = fb.choices[0].message
+        fb_refusal = getattr(fb_message, "refusal", None)
+        if fb_refusal:
+            log.warning(f"{label}_fallback_refused", reason=str(fb_refusal)[:200])
+            return None
         log.info(f"{label}_via_fallback", model=llm_fallback.model())
-        return fb.choices[0].message.content or ""
+        return fb_message.content or ""
 
     async def _post_with_rate_limit_retry(self, body: dict) -> httpx.Response:
         """POST to OPENAI_CHAT_URL, retrying up to 3x on 429 with exponential backoff.
