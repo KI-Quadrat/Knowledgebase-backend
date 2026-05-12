@@ -19,6 +19,14 @@ class Settings(BaseSettings):
     max_batch_urls: int = 50
     max_sitemap_pages: int = 500
 
+    # Batch ingest limits — caps on POST /api/v1/online/batch/ingest.
+    # ``max_batch_ingest_items`` rejects requests larger than this with
+    # ``BATCH_TOO_LARGE``. ``batch_ingest_concurrency`` caps how many items
+    # run simultaneously inside one batch (asyncio.Semaphore size). Keep
+    # the concurrency at or below your OpenAI tier's concurrent quota.
+    max_batch_ingest_items: int = 50
+    batch_ingest_concurrency: int = 10
+
     # Cache
     cache_ttl: int = 3600
 
@@ -56,6 +64,17 @@ class ExternalSettings(BaseSettings):
     crawl4ai_url: str = "http://crawl4ai:11235"
     crawl4ai_api_token: str = ""
 
+    # Default scraping backend used when the request body omits ``scraper``.
+    # Must be one of ``"jina"`` or ``"crawl4ai"`` — invalid values fall back to
+    # ``"jina"`` at the request-model layer.
+    default_scraper: str = "jina"
+
+    # Default crawler backend used when ``/crawl`` requests with
+    # ``method="crawl"`` omit ``scraper``. Valid values: ``"httpx"``,
+    # ``"crawl4ai"``, ``"jina"``, ``"firecrawl"``. Invalid values fall back
+    # to ``"httpx"`` at the request-model layer.
+    default_crawler: str = "httpx"
+
     # Jina Reader (now the default backend; Crawl4AI /md is the fallback).
     jina_api_url: str = "https://eu-r-beta.jina.ai"
     jina_api_key: str = ""
@@ -65,6 +84,12 @@ class ExternalSettings(BaseSettings):
     # routes both "stadt-wien.at" and "www.stadt-wien.at". Empty disables the
     # override; the default backend (Jina) is unaffected by this list.
     jina_default_domains: str = ""
+
+    # Firecrawl (optional third backend — opt-in via ``scraper="firecrawl"``).
+    # Point ``firecrawl_api_url`` at a self-hosted EU instance for data
+    # residency; the managed cloud has no EU region.
+    firecrawl_api_url: str = "https://api.firecrawl.dev"
+    firecrawl_api_key: str = ""
 
     # LlamaParse (cloud document parsing)
     llama_cloud_api_key: str = ""  # empty = use local unstructured parser

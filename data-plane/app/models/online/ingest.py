@@ -144,3 +144,38 @@ class OnlineIngestData(BaseModel):
     content_type: list[str] = Field(..., description="Content categories stored with the vectors (passed through from the request body)")
     embedding_time_ms: int = Field(..., description="Time spent on embedding (ms)")
     total_time_ms: int = Field(..., description="Total pipeline duration (ms)")
+
+
+class BatchIngestRequest(BaseModel):
+    """Batch wrapper around `OnlineIngestRequest` — same per-item shape as
+    `POST /api/v1/online/ingest`, just N at a time."""
+
+    items: list[OnlineIngestRequest] = Field(
+        ...,
+        description=(
+            "List of ingest requests. Each item is identical in shape to the "
+            "body of `POST /api/v1/online/ingest`. Capped by the "
+            "`DP_MAX_BATCH_INGEST_ITEMS` env var (default 50). Empty list "
+            "returns `VALIDATION_BATCH_EMPTY`."
+        ),
+    )
+
+
+class BatchIngestItemResult(BaseModel):
+    """Per-item outcome inside a batch ingest response."""
+
+    source_id: str = Field(..., description="`source_id` of the item this result corresponds to")
+    success: bool = Field(..., description="Whether this item ingested successfully")
+    data: OnlineIngestData | None = Field(None, description="Ingest result; null when `success=false`")
+    error: str | None = Field(None, description="Error code when `success=false`; null otherwise")
+    detail: str | None = Field(None, description="Human-readable error detail when `success=false`")
+
+
+class BatchIngestData(BaseModel):
+    """Aggregate result of a batch ingest call."""
+
+    total: int = Field(..., description="Total items submitted")
+    succeeded: int = Field(..., description="Items that completed without error")
+    failed: int = Field(..., description="Items that returned an error (still present in `results`)")
+    results: list[BatchIngestItemResult] = Field(..., description="Per-item outcomes, same order as the request")
+    total_time_ms: int = Field(..., description="Wall-clock duration of the entire batch")
