@@ -32,6 +32,7 @@ DEFAULT_COOKIE_BANNER_SELECTORS: tuple[str, ...] = (
     # Cookiebot
     "#CybotCookiebotDialog",
     "#CybotCookiebotDialogBodyUnderlay",
+    "#CookieDeclaration",
     # Osano
     ".osano-cm-window",
     ".osano-cm-dialog",
@@ -439,13 +440,24 @@ class ScraperService:
                 return pages, docs, "crawl4ai"
             log.info("deep_crawl_falling_back_to_python_bfs", url=root_url)
 
+        if scraper == "firecrawl":
+            ok, pages, docs = await self._deep_crawl_via_firecrawl(
+                root_url,
+                max_pages=max_pages,
+                same_domain_only=same_domain_only,
+                on_progress=on_progress,
+            )
+            if ok:
+                return pages, docs, "firecrawl"
+            log.info("firecrawl_map_falling_back_to_python_bfs", url=root_url)
+
         return await self._discover_urls_python_bfs(
             root_url,
             max_depth=max_depth,
             max_pages=max_pages,
             same_domain_only=same_domain_only,
             on_progress=on_progress,
-            scraper="httpx" if scraper == "crawl4ai" else scraper,
+            scraper="httpx" if scraper in {"crawl4ai", "firecrawl"} else scraper,
         )
 
     async def _deep_crawl_via_crawl4ai(
@@ -495,6 +507,60 @@ class ScraperService:
         if on_progress:
             on_progress(len(visited), max_pages, root_url)
         return True, visited, discovered_docs
+
+    async def _deep_crawl_via_firecrawl(
+        self,
+        root_url: str,
+        *,
+        max_pages: int,
+        same_domain_only: bool,
+        on_progress: Callable[[int, int, str], None] | None,
+    ) -> tuple[bool, list[str], list[DiscoveredDocument]]:
+        """URL discovery via ``Crawl4AIClient._map_with_firecrawl``.
+
+        Firecrawl's ``/v2/map`` endpoint is single-shot — no depth control,
+        so ``max_depth`` is ignored. The flat URL list is then partitioned
+        into pages and documents via ``split_documents_and_links``, matching
+        the contract of ``_deep_crawl_via_crawl4ai``.
+        """
+        ok, visited, links, error = await self.crawl4ai._map_with_firecrawl(
+            root_url,
+            max_pages=max_pages,
+            same_domain_only=same_domain_only,
+            timeout=120,
+        )
+        if not ok:
+            log.warning("firecrawl_map_failed", url=root_url, error=error)
+            return False, [], []
+
+        root_domain = urlparse(root_url).netloc.lower()
+        absolute_links: list[str] = []
+        for link in links:
+            href = link.get("href")
+            if not href:
+                continue
+            absolute = urljoin(root_url, href)
+            if same_domain_only and urlparse(absolute).netloc.lower() != root_domain:
+                continue
+            absolute_links.append(absolute)
+        raw_docs, page_links = split_documents_and_links(absolute_links, found_on=root_url)
+        discovered_docs = [
+            DiscoveredDocument(
+                url=d.url,
+                type=d.type,
+                link_text=d.link_text,
+                found_on=d.found_on,
+            )
+            for d in raw_docs
+        ]
+        # ``visited`` from the map endpoint is the combined URL set; strip
+        # the document URLs so the page list mirrors what crawl4ai's
+        # deep-crawl path returns.
+        doc_urls = {d.url for d in raw_docs}
+        page_only = [u for u in visited if u not in doc_urls] or page_links
+        if on_progress:
+            on_progress(len(page_only), max_pages, root_url)
+        return True, page_only, discovered_docs
 
     async def _discover_urls_python_bfs(
         self,

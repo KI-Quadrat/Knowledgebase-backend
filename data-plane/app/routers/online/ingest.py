@@ -1,13 +1,23 @@
 """
 POST /api/v1/online/ingest — Ingest web-scraped content into the RAG pipeline.
+POST /api/v1/online/batch/ingest — Batch wrapper around /ingest.
 """
 
 import asyncio
+import time
 
 from fastapi import APIRouter, Request
 
+from app.config import settings
 from app.models.common import ErrorCode, ResponseEnvelope
-from app.models.online.ingest import EmbeddingModel, OnlineIngestData, OnlineIngestRequest
+from app.models.online.ingest import (
+    BatchIngestData,
+    BatchIngestItemResult,
+    BatchIngestRequest,
+    EmbeddingModel,
+    OnlineIngestData,
+    OnlineIngestRequest,
+)
 from app.routers._ingest_utils import INGEST_ERROR_CODE_MAP
 from app.services.ingest.ingest_service import IngestError
 from app.services.intelligence.funding_extractor import normalize_provinces
@@ -47,9 +57,9 @@ router = APIRouter(prefix="/api/v1/online", tags=["Online - Ingestion Pipeline"]
         "Takes web-scraped or URL-parsed text content and processes it through the ingestion pipeline:\n\n"
         "1. **Chunk** — Split content using `contextual` (default), `late_chunking`, `sentence`, or `fixed` strategy\n"
         "2. **Contextual Enrichment** — (when using `contextual` strategy) Prepend AI-generated context to each chunk via OpenAI, improving retrieval accuracy\n"
-        "3. **Embed** — Generate a dense vector via the model chosen by `embedding_model`: "
-        "`openai` → `text-embedding-3-small` (1536-dim, stored as `dense_openai`); "
-        "`bge_m3` → BGE-M3 behind the TEI endpoint at `TEI_EMBED_URL_AT` (1024-dim, stored as `dense_bge_m3`).\n"
+        "3. **Embed** — Generate a dense vector via the model chosen by `embedding_model` (default `bge_m3`): "
+        "`bge_m3` → BGE-M3 behind the TEI endpoint at `TEI_EMBED_URL_AT` (1024-dim, stored as `dense_bge_m3`); "
+        "`openai` → `text-embedding-3-small` (1536-dim, stored as `dense_openai`).\n"
         "4. **Store** — Upsert vectors into the specified Qdrant `collection_name` with metadata\n\n"
         "**Content type is supplied by the caller.** The `content_type` field is **required** — "
         "obtain it upfront from `/online/scrape` or `/online/document-parse`, which now run the classifier "
@@ -84,15 +94,31 @@ router = APIRouter(prefix="/api/v1/online", tags=["Online - Ingestion Pipeline"]
 )
 async def ingest_online(body: OnlineIngestRequest, request: Request) -> ResponseEnvelope[OnlineIngestData]:
     request_id = request.state.request_id
-    ingest_svc = request.app.state.online_ingest
-
-    if not body.content.strip():
+    success, data, error_code, detail = await _ingest_one_item(body, request.app.state)
+    if not success:
         return ResponseEnvelope(
             success=False,
-            error=ErrorCode.VALIDATION_EMPTY_CONTENT,
-            detail="Content must not be empty",
+            error=error_code,
+            detail=detail,
             request_id=request_id,
         )
+    return ResponseEnvelope(success=True, data=data, request_id=request_id)
+
+
+async def _ingest_one_item(
+    body: OnlineIngestRequest, app_state
+) -> tuple[bool, OnlineIngestData | None, ErrorCode | None, str | None]:
+    """Run one document through the ingest pipeline.
+
+    Same behavior as `/ingest`: validates content, optionally launches the
+    funding extractor task in parallel, builds metadata, calls
+    `IngestService.ingest`, and maps `IngestError` to the public error code.
+    Returns ``(success, data, error_code, detail)``.
+    """
+    if not body.content.strip():
+        return False, None, ErrorCode.VALIDATION_EMPTY_CONTENT, "Content must not be empty"
+
+    ingest_svc = app_state.online_ingest
 
     # ── Funding metadata extraction (only for funding assistant) ──
     # Launched as a task so it runs concurrently with chunking / contextual
@@ -100,7 +126,7 @@ async def ingest_online(body: OnlineIngestRequest, request: Request) -> Response
     # awaits this task and merges its result just before building Qdrant points.
     funding_task: asyncio.Task | None = None
     if body.assistant_type == "funding":
-        extractor = request.app.state.funding_extractor
+        extractor = app_state.funding_extractor
         funding_task = asyncio.create_task(
             _safe_extract_funding(
                 extractor,
@@ -114,7 +140,7 @@ async def ingest_online(body: OnlineIngestRequest, request: Request) -> Response
     chunking = body.chunking
     vcfg = body.vector_config
     primary_embedder, default_dim, primary_vector_name = _resolve_primary_embedder(
-        request.app.state, body.embedding_model
+        app_state, body.embedding_model
     )
     vector_size = vcfg.vector_size if (vcfg and vcfg.vector_size is not None) else default_dim
     # Request-supplied metadata wins over anything the funding extractor produces,
@@ -160,16 +186,11 @@ async def ingest_online(body: OnlineIngestRequest, request: Request) -> Response
             funding_task.cancel()
         error_code = INGEST_ERROR_CODE_MAP.get(e.code, ErrorCode.EMBEDDING_FAILED)
         log.error("ingest_online_failed", source_id=body.source_id, error=str(e), code=e.code)
-        return ResponseEnvelope(
-            success=False,
-            error=error_code,
-            detail=str(e),
-            request_id=request_id,
-        )
+        return False, None, error_code, str(e)
 
-    return ResponseEnvelope(
-        success=True,
-        data=OnlineIngestData(
+    return (
+        True,
+        OnlineIngestData(
             source_id=result.source_id,
             chunks_created=result.chunks_created,
             vectors_stored=result.vectors_stored,
@@ -178,7 +199,8 @@ async def ingest_online(body: OnlineIngestRequest, request: Request) -> Response
             embedding_time_ms=result.embedding_time_ms,
             total_time_ms=result.total_time_ms,
         ),
-        request_id=request_id,
+        None,
+        None,
     )
 
 
@@ -191,3 +213,102 @@ async def _safe_extract_funding(
     except Exception as e:
         log.warning("ingest_online_funding_extract_failed", source_id=source_id, error=str(e))
         return {}
+
+
+@router.post(
+    "/batch/ingest",
+    summary="Batch-ingest N documents through the standard ingest pipeline",
+    description=(
+        "Same per-item behavior as `POST /api/v1/online/ingest` — each item runs "
+        "the full chunk → enrich → embed → Qdrant pipeline. Items execute in "
+        "parallel up to `DP_BATCH_INGEST_CONCURRENCY` (default 10), capped by the "
+        "configured upstream limits (OpenAI tier RPM, TEI server throughput).\n\n"
+        "**Per-item failures do not abort the batch.** Each item's outcome is "
+        "reported independently in `results`; the top-level envelope is `success=true` "
+        "as long as the request itself was valid.\n\n"
+        "**Limits:**\n"
+        "- Maximum items per request: `DP_MAX_BATCH_INGEST_ITEMS` (default 50). "
+        "Requests above this return `VALIDATION_BATCH_TOO_LARGE`.\n"
+        "- Empty `items` list returns `VALIDATION_BATCH_EMPTY`.\n\n"
+        "**Optional X-API-Key header** — required only when `DP_ONLINE_API_KEYS` is configured."
+    ),
+    response_description="Per-item ingest outcomes plus aggregate timing.",
+)
+async def batch_ingest_online(
+    body: BatchIngestRequest, request: Request
+) -> ResponseEnvelope[BatchIngestData]:
+    request_id = request.state.request_id
+
+    if not body.items:
+        return ResponseEnvelope(
+            success=False,
+            error=ErrorCode.VALIDATION_BATCH_EMPTY,
+            detail="`items` must contain at least one ingest request",
+            request_id=request_id,
+        )
+
+    if len(body.items) > settings.max_batch_ingest_items:
+        return ResponseEnvelope(
+            success=False,
+            error=ErrorCode.VALIDATION_BATCH_TOO_LARGE,
+            detail=(
+                f"`items` length {len(body.items)} exceeds the configured "
+                f"max of {settings.max_batch_ingest_items} per request"
+            ),
+            request_id=request_id,
+        )
+
+    sem = asyncio.Semaphore(settings.batch_ingest_concurrency)
+    app_state = request.app.state
+
+    async def _run(item: OnlineIngestRequest) -> BatchIngestItemResult:
+        async with sem:
+            try:
+                success, data, error_code, detail = await _ingest_one_item(item, app_state)
+            except Exception as exc:
+                # Unexpected exception — don't blow up the whole batch.
+                log.exception(
+                    "batch_ingest_item_unexpected_failure",
+                    source_id=item.source_id,
+                    error=str(exc),
+                )
+                return BatchIngestItemResult(
+                    source_id=item.source_id,
+                    success=False,
+                    data=None,
+                    error=ErrorCode.EMBEDDING_FAILED.value,
+                    detail=f"Unexpected error: {exc}",
+                )
+        return BatchIngestItemResult(
+            source_id=item.source_id,
+            success=success,
+            data=data,
+            error=error_code.value if error_code is not None else None,
+            detail=detail,
+        )
+
+    start = time.monotonic()
+    results = await asyncio.gather(*(_run(item) for item in body.items))
+    total_time_ms = int((time.monotonic() - start) * 1000)
+
+    succeeded = sum(1 for r in results if r.success)
+    failed = len(results) - succeeded
+    log.info(
+        "batch_ingest_completed",
+        total=len(results),
+        succeeded=succeeded,
+        failed=failed,
+        total_time_ms=total_time_ms,
+    )
+
+    return ResponseEnvelope(
+        success=True,
+        data=BatchIngestData(
+            total=len(results),
+            succeeded=succeeded,
+            failed=failed,
+            results=list(results),
+            total_time_ms=total_time_ms,
+        ),
+        request_id=request_id,
+    )

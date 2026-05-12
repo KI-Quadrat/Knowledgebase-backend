@@ -74,6 +74,8 @@ class Crawl4AIClient:
         self._api_token = ext.crawl4ai_api_token
         self._jina_url = ext.jina_api_url.rstrip("/")
         self._jina_key = ext.jina_api_key
+        self._firecrawl_url = ext.firecrawl_api_url.rstrip("/")
+        self._firecrawl_key = ext.firecrawl_api_key
 
     async def start(self) -> None:
         self._client = httpx.AsyncClient(
@@ -127,6 +129,8 @@ class Crawl4AIClient:
             backend_order: tuple[str, ...] = ()
         elif scraper == "jina":
             backend_order = ("jina", "crawl4ai")
+        elif scraper == "firecrawl":
+            backend_order = ("firecrawl", "jina", "crawl4ai")
         else:
             backend_order = ("crawl4ai", "jina")
 
@@ -179,6 +183,26 @@ class Crawl4AIClient:
                 except Exception as exc:
                     log.warning("jina_scrape_error", url=url, error=str(exc))
 
+            elif backend == "firecrawl":
+                if not self._firecrawl_key:
+                    continue
+                try:
+                    result = await self._scrape_with_firecrawl(
+                        url,
+                        timeout=req_timeout,
+                        markdown_type=markdown_type,
+                        exclude_tags=exclude_tags,
+                        css_selector=css_selector,
+                    )
+                    result.duration_ms = int((time.monotonic() - start) * 1000)
+                    if result.success:
+                        result.scraper_used = "firecrawl"
+                        log.info("firecrawl_scrape_success", url=url, primary=(scraper == "firecrawl"))
+                        return result
+                    log.warning("firecrawl_scrape_failed", url=url, error=result.error)
+                except Exception as exc:
+                    log.warning("firecrawl_scrape_error", url=url, error=str(exc))
+
         # Final fallback: Raw httpx
         result = await self._scrape_with_httpx(
             url,
@@ -213,12 +237,67 @@ class Crawl4AIClient:
         if self._api_token:
             headers["Authorization"] = f"Bearer {self._api_token}"
 
-        # /md FilterType: raw | fit | bm25 | llm. We only ever use fit/raw;
-        # citations is a Crawl4AI-only feature on /crawl that /md doesn't
-        # offer, so it degrades to raw (full content) — same fallback that
-        # Jina/httpx already use.
-        filter_value = "fit" if markdown_type == "fit" else "raw"
+        result = await self._fetch_md(
+            url,
+            markdown_type=markdown_type,
+            timeout=timeout,
+            headers=headers,
+        )
 
+        # Fit → raw fallback. Crawl4AI's PruningContentFilter (f=fit)
+        # occasionally strips pages whose payload is mostly tabular /
+        # label-value content (Austrian gov portals are the canonical case),
+        # leaving fit-mode markdown nearly empty. The /md branch has no HTML
+        # to compare against — only the markdown — so we use a word-count
+        # floor. Retry once with f=raw and keep that result if it's a real
+        # improvement (more words than the fit result); otherwise fall
+        # through to the original so the outer Jina/httpx chain can engage
+        # via the normal success=False path. Skipped for raw/citations —
+        # both already map to f=raw, so retrying would change nothing.
+        if (
+            markdown_type == "fit"
+            and result.success
+            and len(result.markdown.split()) < _FIT_FALLBACK_WORD_THRESHOLD
+        ):
+            log.info(
+                "crawl4ai_fit_thin_retry_raw",
+                url=url,
+                word_count=len(result.markdown.split()),
+            )
+            raw_result = await self._fetch_md(
+                url,
+                markdown_type="raw",
+                timeout=timeout,
+                headers=headers,
+            )
+            if (
+                raw_result.success
+                and raw_result.markdown.strip()
+                and len(raw_result.markdown.split()) > len(result.markdown.split())
+            ):
+                return raw_result
+
+        return result
+
+    async def _fetch_md(
+        self,
+        url: str,
+        *,
+        markdown_type: str,
+        timeout: int,
+        headers: dict[str, str],
+    ) -> CrawlResult:
+        """POST one /md request and parse the response into a CrawlResult.
+
+        Maps the public ``markdown_type`` (fit / raw / citations) to /md's
+        ``f`` filter via ``_FILTER_BY_MARKDOWN_TYPE``. The /md endpoint only
+        supports raw | fit | bm25 | llm — there is no citations filter, so
+        citations degrades to f=raw (same best-effort the Jina and httpx
+        branches already provide). Empty markdown and the literal
+        ``Crawl4AI Error`` preamble are surfaced as failures so the upstream
+        Jina/httpx fallback chain engages.
+        """
+        filter_value = _FILTER_BY_MARKDOWN_TYPE.get(markdown_type, "raw")
         payload: dict = {"url": url, "f": filter_value}
 
         resp = await self._client.post(  # type: ignore[union-attr]
@@ -232,6 +311,10 @@ class Crawl4AIClient:
 
         markdown_value = data.get("markdown")
         if isinstance(markdown_value, dict):
+            # /md returns a string today, but the older /crawl envelope used
+            # a dict keyed by fit_markdown / markdown_with_citations /
+            # raw_markdown. Defend against either shape: prefer the variant
+            # that matches the caller's markdown_type, fall through the rest.
             markdown = _extract_markdown(markdown_value, preferred=markdown_type)
         elif isinstance(markdown_value, str):
             markdown = markdown_value
@@ -255,7 +338,7 @@ class Crawl4AIClient:
         self,
         root_url: str,
         *,
-        max_depth: int = 2,
+        max_depth: int = 3,
         max_pages: int = 50,
         same_domain_only: bool = True,
         timeout: int = 120,
@@ -412,6 +495,175 @@ class Crawl4AIClient:
             success=True,
         )
 
+    async def _scrape_with_firecrawl(
+        self,
+        url: str,
+        *,
+        timeout: int = 30,
+        markdown_type: str = "fit",
+        exclude_tags: list[str] | None = None,
+        css_selector: str | None = None,
+    ) -> CrawlResult:
+        """Scrape a URL via Firecrawl's ``POST /v2/scrape``.
+
+        Requests both ``markdown`` and ``html`` formats so the router's
+        ``links_summary`` HTML path can parse the full link graph (Firecrawl
+        returns the rendered DOM, not a content-filtered subset). The
+        ``onlyMainContent`` flag maps from ``markdown_type``: ``fit`` keeps
+        article-only output, ``raw`` / ``citations`` keep the full page.
+        """
+        if not self._firecrawl_key:
+            return CrawlResult(success=False, error="Firecrawl API key not configured")
+
+        payload: dict = {
+            "url": url,
+            "formats": ["markdown", "html"],
+            "onlyMainContent": markdown_type == "fit",
+        }
+        if exclude_tags:
+            payload["excludeTags"] = list(exclude_tags)
+        if css_selector:
+            payload["includeTags"] = [css_selector]
+
+        headers = {
+            "Authorization": f"Bearer {self._firecrawl_key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            resp = await self._client.post(  # type: ignore[union-attr]
+                f"{self._firecrawl_url}/v2/scrape",
+                json=payload,
+                headers=headers,
+                timeout=timeout + 10,
+            )
+            resp.raise_for_status()
+        except httpx.TimeoutException:
+            return CrawlResult(success=False, error=f"Firecrawl timeout after {timeout}s")
+        except httpx.HTTPStatusError as exc:
+            return CrawlResult(success=False, error=f"Firecrawl HTTP {exc.response.status_code}")
+        except Exception as exc:
+            return CrawlResult(success=False, error=f"Firecrawl error: {exc}")
+
+        data = resp.json()
+        if not data.get("success", True):
+            return CrawlResult(success=False, error=str(data.get("error") or "Firecrawl returned success=false"))
+
+        result_data = data.get("data") if isinstance(data.get("data"), dict) else {}
+        markdown_value = result_data.get("markdown")
+        html_value = result_data.get("html") or result_data.get("rawHtml") or ""
+        metadata = result_data.get("metadata") if isinstance(result_data.get("metadata"), dict) else {}
+        title_value = metadata.get("title") or metadata.get("ogTitle")
+        title = title_value.strip() if isinstance(title_value, str) and title_value.strip() else None
+
+        markdown = markdown_value if isinstance(markdown_value, str) else ""
+        if not markdown.strip() and not html_value.strip():
+            return CrawlResult(success=False, error="Firecrawl returned empty content")
+
+        # ``links`` is a flat list of absolute URLs when Firecrawl populates it
+        # (the v2 API includes it whenever the rendered HTML is requested).
+        links_value = result_data.get("links")
+        links: list[str] = []
+        seen: set[str] = set()
+        if isinstance(links_value, list):
+            for entry in links_value:
+                if isinstance(entry, str):
+                    candidate = urljoin(url, entry.strip())
+                    parsed = urlparse(candidate)
+                    if parsed.scheme in {"http", "https"} and candidate not in seen:
+                        seen.add(candidate)
+                        links.append(candidate)
+
+        return CrawlResult(
+            markdown=clean_markdown(markdown),
+            html=html_value,
+            title=title,
+            links=links,
+            success=True,
+        )
+
+    async def _map_with_firecrawl(
+        self,
+        url: str,
+        *,
+        max_pages: int,
+        same_domain_only: bool,
+        timeout: int,
+    ) -> tuple[bool, list[str], list[dict], str | None]:
+        """Discover URLs via Firecrawl's ``POST /v2/map``.
+
+        Returns the same ``(success, visited, links, error)`` tuple shape as
+        ``deep_crawl``. Firecrawl's map endpoint returns a flat URL list in a
+        single round-trip — we treat that list as both the visited set and the
+        source of ``discovered_links``, so the caller's downstream
+        ``split_documents_and_links`` still partitions pages from documents.
+        """
+        if not self._firecrawl_key:
+            return False, [], [], "Firecrawl API key not configured"
+
+        payload: dict = {
+            "url": url,
+            "limit": max_pages,
+        }
+        headers = {
+            "Authorization": f"Bearer {self._firecrawl_key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            resp = await self._client.post(  # type: ignore[union-attr]
+                f"{self._firecrawl_url}/v2/map",
+                json=payload,
+                headers=headers,
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.TimeoutException:
+            return False, [], [], f"Firecrawl map timeout after {timeout}s"
+        except httpx.HTTPStatusError as exc:
+            return False, [], [], f"Firecrawl map HTTP {exc.response.status_code}"
+        except Exception as exc:
+            return False, [], [], f"Firecrawl map error: {exc}"
+
+        if not data.get("success", True):
+            return False, [], [], str(data.get("error") or "Firecrawl map success=false")
+
+        raw_links = data.get("links") or []
+        root_domain = urlparse(url).netloc.lower()
+        visited: list[str] = []
+        discovered: list[dict] = []
+        seen_visited: set[str] = set()
+        seen_links: set[str] = set()
+        for entry in raw_links:
+            # Firecrawl v2 returns either bare URL strings or
+            # ``{"url": ..., "title": ...}`` objects depending on the request
+            # mode. Handle both so the caller sees the same shape.
+            if isinstance(entry, str):
+                href = entry
+                text = ""
+            elif isinstance(entry, dict):
+                href = entry.get("url") or entry.get("link") or ""
+                text = entry.get("title") or entry.get("text") or ""
+            else:
+                continue
+            if not isinstance(href, str) or not href.strip():
+                continue
+            absolute = urljoin(url, href.strip())
+            parsed = urlparse(absolute)
+            if parsed.scheme not in {"http", "https"}:
+                continue
+            if same_domain_only and parsed.netloc.lower() != root_domain:
+                continue
+            if absolute not in seen_visited:
+                seen_visited.add(absolute)
+                visited.append(absolute)
+            if absolute not in seen_links:
+                seen_links.add(absolute)
+                discovered.append({"href": absolute, "text": text})
+
+        return True, visited, discovered, None
+
     async def _scrape_with_httpx(
         self,
         url: str,
@@ -480,6 +732,24 @@ def _html_to_markdown(soup: BeautifulSoup) -> str:
         else:
             lines.append(f"{text}\n")
     return "\n".join(lines)
+
+
+# Map the public markdown_type (fit / raw / citations) to Crawl4AI's /md
+# ``f`` filter. /md supports raw | fit | bm25 | llm only — citations is a
+# /crawl-only feature, so it degrades to f=raw here (same best-effort the
+# Jina and httpx branches already provide).
+_FILTER_BY_MARKDOWN_TYPE: dict[str, str] = {
+    "fit": "fit",
+    "raw": "raw",
+    "citations": "raw",
+}
+
+# Word-count floor for the Crawl4AI /md fit→raw fallback. The /md endpoint
+# returns markdown only (no HTML), so the router's ratio-based thin check
+# (which needs both) is bypassed; this is the in-client backstop. Tuned to
+# match the router's _THIN_WORD_THRESHOLD so both heuristics agree on what
+# counts as "suspiciously short."
+_FIT_FALLBACK_WORD_THRESHOLD = 20
 
 
 _MARKDOWN_PRIORITY: dict[str, tuple[str, ...]] = {
