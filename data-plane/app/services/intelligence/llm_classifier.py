@@ -10,7 +10,7 @@ import json
 from openai import AsyncOpenAI, BadRequestError, RateLimitError
 
 from app.config import ext
-from app.services.intelligence import llm_fallback
+from app.services.intelligence import llm_router
 from app.services.intelligence.models import (
     ClassifyResult,
     ContentCategory,
@@ -62,17 +62,26 @@ class LLMClassifier:
 
     def __init__(self) -> None:
         self._client: AsyncOpenAI | None = None
-        self._model = ext.openai_model
+        self._model: str = ext.openai_model
+        self._provider: str = "openai"
 
     def is_available(self) -> bool:
         return self._client is not None
 
     def startup(self) -> None:
-        if not ext.openai_api_key:
-            log.info("llm_classifier_disabled", reason="no OPENAI_API_KEY")
+        try:
+            resolved = llm_router.for_classifier()
+        except llm_router.LLMRouterError as exc:
+            log.info("llm_classifier_disabled", reason=str(exc))
             return
-        self._client = AsyncOpenAI(api_key=ext.openai_api_key)
-        log.info("llm_classifier_started", model=self._model)
+        self._client = llm_router.get_client(resolved)
+        self._model = resolved.model
+        self._provider = resolved.provider
+        log.info(
+            "llm_classifier_started",
+            provider=resolved.provider,
+            model=self._model,
+        )
 
     async def classify(self, content: str, language: str = "de") -> ClassifyResult:
         if not self._client:
@@ -94,12 +103,7 @@ class LLMClassifier:
                 chars_in=len(truncated),
                 chars_retry=len(half),
             )
-            try:
-                response = await self._chat_with_rate_limit_retry(half)
-            except llm_fallback.OUTAGE_ERRORS as outage_exc:
-                response = await self._chat_via_fallback(half, outage_exc)
-        except llm_fallback.OUTAGE_ERRORS as outage_exc:
-            response = await self._chat_via_fallback(truncated, outage_exc)
+            response = await self._chat_with_rate_limit_retry(half)
 
         raw = response.choices[0].message.content or "{}"
         data = json.loads(raw)
@@ -164,33 +168,3 @@ class LLMClassifier:
         assert last_exc is not None
         raise last_exc
 
-    async def _chat_via_fallback(self, user_content: str, outage_exc: Exception):
-        """Run the classify call against the LiteLLM fallback model.
-
-        Re-raises the original OpenAI outage error if the fallback is disabled
-        or if the fallback call itself fails — the upstream Classifier will
-        then catch it and degrade to the rule-based path.
-        """
-        log.warning(
-            "llm_classify_openai_unavailable_falling_back",
-            error=str(outage_exc),
-            error_type=type(outage_exc).__name__,
-        )
-        try:
-            response = await llm_fallback.chat_completion(
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_content},
-                ],
-                temperature=0.1,
-                max_tokens=500,
-                response_format={"type": "json_object"},
-            )
-        except Exception as fb_exc:
-            log.error("llm_classify_fallback_failed", error=str(fb_exc))
-            raise outage_exc from fb_exc
-        if response is None:
-            log.warning("llm_classify_fallback_disabled")
-            raise outage_exc
-        log.info("llm_classify_via_fallback", model=llm_fallback.model())
-        return response

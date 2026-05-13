@@ -375,7 +375,7 @@ async def model_health(request: Request) -> ModelHealthResponse:
         _item(
             component="content_classifier",
             task="content classification",
-            provider="openai",
+            provider=getattr(llm_classifier, "_provider", "openai"),
             model=getattr(llm_classifier, "_model", ext.openai_model),
             configured=chat_configured,
             healthy=chat_ok,
@@ -389,7 +389,7 @@ async def model_health(request: Request) -> ModelHealthResponse:
         _item(
             component="contextual_enricher",
             task="contextual chunk enrichment",
-            provider="openai",
+            provider=getattr(contextual, "_provider", "openai"),
             model=getattr(contextual, "_model", ext.openai_model),
             configured=contextual_configured,
             healthy=chat_ok if contextual_configured else False,
@@ -403,7 +403,7 @@ async def model_health(request: Request) -> ModelHealthResponse:
         _item(
             component="funding_extractor",
             task="funding metadata extraction",
-            provider="openai",
+            provider=getattr(funding, "_provider", "openai"),
             model=getattr(funding, "_model", ext.openai_model),
             configured=funding_configured,
             healthy=chat_ok if funding_configured else False,

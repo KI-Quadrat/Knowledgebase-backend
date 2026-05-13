@@ -108,7 +108,7 @@ async def test_batch_length_mismatch_guard_still_fires_defensively(enricher):
     length for any reason, we still fall back rather than mis-align contexts
     onto chunks."""
     # Force a mismatched response by hand (simulating a non-strict provider
-    # on the LiteLLM fallback path, or a future API quirk).
+    # configured via the router, or a future API quirk).
     resp = MagicMock()
     resp.status_code = 200
     resp.raise_for_status = MagicMock()

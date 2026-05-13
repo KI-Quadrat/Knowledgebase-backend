@@ -1,6 +1,6 @@
 from enum import Enum
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.models.classify import ExtractedEntities
 
@@ -29,8 +29,13 @@ class OnlineChunkingConfig(BaseModel):
     """Configuration for text chunking during ingestion."""
 
     strategy: str = Field("contextual", description="Chunking strategy: 'contextual' (recursive splitter + AI context prepended, default), 'recursive' (recursive character text splitter), 'late_chunking' (paragraph-aware), 'sentence' (sentence boundaries), or 'fixed' (character count)")
-    max_chunk_size: int = Field(1200, ge=64, le=4096, description="Maximum chunk size in characters")
+    max_chunk_size: int = Field(1200, le=4096, description="Maximum chunk size in characters. Values below 1000 are silently clamped to 1000 (the per-chunk minimum produces too many tiny chunks otherwise and inflates the contextual-enrichment bill); the upper bound is whatever the caller provides up to 4096.")
     overlap: int = Field(50, ge=0, le=512, description="Overlap between consecutive chunks in characters")
+
+    @field_validator("max_chunk_size", mode="after")
+    @classmethod
+    def _enforce_min_chunk_size(cls, v: int) -> int:
+        return max(v, 1000)
 
 
 class OnlineVectorConfig(BaseModel):

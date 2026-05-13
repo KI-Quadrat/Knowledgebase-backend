@@ -138,9 +138,14 @@ your plan. No per-RPM limit in our code.
 
 ### 3.3 OpenAI calls (classifier, funding extractor, contextual enricher, OpenAI embedder)
 
-Three pipeline stages call OpenAI Chat (`gpt-4o-mini` by default); one stage
-calls OpenAI Embeddings (`text-embedding-3-small`). All four go through the
-same `OPENAI_API_KEY` quota.
+Three pipeline stages call OpenAI Chat — by default **classifier on
+`gpt-4o-mini`** and **contextual enricher + funding extractor on
+`gpt-4.1-nano`** (per `DP_CLASSIFIER_MODEL` / `DP_CONTEXTUAL_MODEL` /
+`DP_FUNDING_MODEL`). One stage calls OpenAI Embeddings
+(`text-embedding-3-small`). All go through the same `OPENAI_API_KEY` quota
+but **per-model RPM/TPM buckets are independent** — splitting tasks across
+gpt-4o-mini and gpt-4.1-nano effectively gives you two separate quotas at
+the same tier.
 
 | Stage | Triggered when | Calls per ingest | Concurrency | File:line |
 |---|---|---|---|---|
@@ -152,15 +157,32 @@ same `OPENAI_API_KEY` quota.
 Char caps on inputs (`config.py:127-129`): 120K for classify, 120K for funding
 extract, 60K for contextual. Above these the input is truncated.
 
-**LiteLLM fallback** (`config.py:131-137`): if the OpenAI call fails with a
-rate-limit / connection / 5xx, the classifier, contextual enricher, and
-funding extractor retry against `LITELLM_URL`. Empty URL or key disables it.
+**Per-task model routing** (`app/services/intelligence/llm_router.py`): the
+classifier, contextual enricher, and funding extractor each select their
+own model via `DP_CLASSIFIER_MODEL` / `DP_CONTEXTUAL_MODEL` /
+`DP_FUNDING_MODEL` in `"<provider>/<model_id>"` form (e.g.
+`openai/gpt-4o-mini`, `nebius/Qwen/Qwen2.5-72B-Instruct`). Any
+OpenAI-compatible provider works — point a heavy task at a cheaper or
+higher-quota endpoint to dodge the OpenAI tier ceiling below.
 
-**Practical RPM ceiling: governed by your OpenAI tier.** At Tier 1 (gpt-4o-mini
-500 RPM / 200K TPM), classifier + enricher + funding together consume 2–3
-calls per ingest, so plan **~150 ingests/min** before hitting OpenAI 429s.
+**Practical RPM ceiling: governed by your OpenAI tier — and now split across
+two model buckets.** Each model has its own RPM/TPM quota at every tier:
+
+- **Classifier (gpt-4o-mini)** — 1 call/ingest. Tier 1: 500 RPM / 200K TPM →
+  **~500 ingests/min** before this bucket throttles.
+- **Contextual + funding (gpt-4.1-nano)** — 1 batched contextual call/ingest,
+  plus 1 funding call when `assistant_type="funding"`. Tier 1: 500 RPM /
+  200K TPM (separate bucket from gpt-4o-mini) → **~250 ingests/min** with
+  funding on, **~500/min** without.
+
+The effective ceiling is the **lower** of the two: **~250 ingests/min on
+Tier 1 with funding**, **~500 without funding**. Compared to the prior
+"everything on gpt-4o-mini" config (~150/min), splitting tasks across two
+models is a ~2–3× headroom win at the same tier — even before any auto-
+cache savings on contextual.
+
 With BGE-M3 instead of OpenAI for embeddings, the embedding step drops off
-the OpenAI quota.
+the OpenAI quota entirely.
 
 ### 3.4 TEI dense (BGE-M3) embedding
 
@@ -273,8 +295,9 @@ This is the answer you actually want. "Scrape → ingest" means the caller does:
   across origins or warm the scrape cache.
 - The classifier runs on every `/scrape` and `/document-parse` response —
   there is no "skip classify" toggle. If you need higher throughput, either
-  upgrade your OpenAI tier or self-host the classifier behind LiteLLM
-  (`LITELLM_URL`).
+  upgrade your OpenAI tier or point `DP_CLASSIFIER_MODEL` at a
+  higher-quota OpenAI-compatible provider (Nebius, Groq, etc. — see
+  `llm_router.py`).
 - Contextual enrichment is the most expensive step. Switch
   `chunking.strategy` to `"recursive"` for a ~5× speedup at the cost of
   retrieval quality.
@@ -323,8 +346,10 @@ upsert, ~1–2 s wall-clock. 10 parallel items finish in ~2 s.
 
 **Average case — defaults (`contextual` + BGE-M3, no funding)**
 
-One OpenAI chat call per item for context enrichment; embeddings stay on
-TEI. Tier 1 (gpt-4o-mini 500 RPM / 200K TPM) has ~5–10× headroom.
+One OpenAI chat call per item for context enrichment (gpt-4.1-nano);
+embeddings stay on TEI. Tier 1 contextual bucket (gpt-4.1-nano 500 RPM /
+200K TPM) has ~5–10× headroom — and the classifier's gpt-4o-mini RPM is on
+a separate bucket, so neither bottlenecks the other.
 
 | Metric | Value |
 |---|---|
@@ -355,8 +380,7 @@ concurrency 10 you flood Tier 1's chat RPM/TPM and start seeing per-item
 |---|---|
 | Single item with `content` > 120K chars (classify cap) / 60K (contextual cap) | Truncated inside the helper; item still succeeds, but enrichment quality drops on the trimmed tail. |
 | Mixed batch (some 1-chunk docs, some 200-chunk docs) | Concurrency is per-item, not per-chunk — small items finish fast and pick up new ones from the queue while large ones run. Effective parallelism stays at the semaphore size. |
-| OpenAI 429 mid-batch (no LiteLLM) | Failing items return `EMBEDDING_FAILED` (or the closest mapped code) in `results[]`. Batch keeps running. Top-level envelope still `success=true`. |
-| OpenAI 429 mid-batch (LiteLLM configured) | Classifier/contextual/funding retry against `LITELLM_URL` transparently — most 429s are absorbed; batch sees few failures. |
+| OpenAI 429 mid-batch | Failing items return `EMBEDDING_FAILED` (or the closest mapped code) in `results[]`. Batch keeps running. Top-level envelope still `success=true`. Route the affected task to a higher-quota provider via the router (`DP_<TASK>_MODEL=<provider>/<model>`) to absorb the 429s upstream. |
 | TEI BGE-M3 server unreachable | Every item fails with `EMBEDDING_FAILED`. Detect via `succeeded=0` in the response and back off. |
 | Qdrant unreachable | Every item fails with `QDRANT_CONNECTION_FAILED`. Same signal — `succeeded=0`. |
 | Two items share the same `source_id` | `IngestService` deletes prior vectors for that `source_id` before upsert (idempotent). Within one batch this means the **second** item wins; the first item's vectors are deleted by the second. Avoid duplicate source_ids in one batch. |
@@ -370,10 +394,10 @@ concurrency 10 you flood Tier 1's chat RPM/TPM and start seeing per-item
 | You're running… | Set `DP_BATCH_INGEST_CONCURRENCY` to | Why |
 |---|---|---|
 | Recursive + BGE-M3 (no OpenAI in ingest) | **20–30** | TEI is the only bottleneck; push it. |
-| Contextual + BGE-M3, no funding (default) | **10** | Default — comfortable headroom on OpenAI Tier 1. |
-| Contextual + OpenAI embeddings | **5** on Tier 1; **10–15** on Tier 2+ | Each item burns embed RPM too. |
-| Contextual + funding + OpenAI embeddings | **3** on Tier 1; **8–10** on Tier 2+; **15+** if LiteLLM configured | 3 chat calls + 1 embed per item; needs the most headroom. |
-| Any of the above with LiteLLM fallback wired | **2× the above** | 429s get absorbed by the fallback chain. |
+| Contextual + BGE-M3, no funding (default) | **10–15** | Default split (classifier on gpt-4o-mini, contextual on gpt-4.1-nano) gives 2× the headroom of a same-model config — both Tier 1 buckets stay well under 500 RPM. |
+| Contextual + OpenAI embeddings | **5–8** on Tier 1; **10–15** on Tier 2+ | Embed (text-embedding-3-small) has its own RPM bucket, but TPM matters at this concurrency. |
+| Contextual + funding + OpenAI embeddings | **5** on Tier 1; **10–12** on Tier 2+; **15+** when contextual is routed off OpenAI | contextual + funding share the gpt-4.1-nano bucket; classifier is on a separate gpt-4o-mini bucket so it's not the constraint. |
+| Any of the above with the heavy task routed to a higher-quota provider | **2× the above** | Move `DP_CONTEXTUAL_MODEL` to e.g. `nebius/...` or `groq/...` to absorb 429s upstream. |
 
 Keep `DP_MAX_BATCH_INGEST_ITEMS` at 50 unless you have a specific reason to
 go bigger — single-batch wall-clock above ~2 min hurts client-side timeout
@@ -486,10 +510,13 @@ Workload: scrape transparenzportal.gv.at + 10 provincial portals (~11 origins),
 
 **Total:** **~50–70 minutes for 1000 AT funding pages.**
 
-**Watch out for:** OpenAI Tier 1 caps at 500 RPM combined; three calls per
-doc means you hit the OpenAI ceiling at ~165 docs/min, well above the
-contextual enricher's ~25 RPM cap. So contextual is still the bottleneck on
-Tier 1; on Tier 5 the bottleneck shifts to your TEI deployment.
+**Watch out for:** OpenAI Tier 1 caps are **per-model**. Classifier
+(gpt-4o-mini) and contextual + funding (gpt-4.1-nano) each get their own
+500 RPM bucket. Classifier eats 1/bucket, funding + contextual eat 2/bucket
+— so the contextual bucket is hit first at ~250 docs/min, still well above
+the contextual enricher's wall-clock ~25 RPM cap (per-call latency, not
+quota, is the binding constraint). On Tier 5 the bottleneck shifts to your
+TEI deployment.
 
 ---
 
@@ -619,7 +646,8 @@ All overridable via env vars (`DP_` prefix for `Settings`, no prefix for
 | OpenAI embed batch | `OPENAI_EMBED_MAX_BATCH` | 256 | Larger = fewer requests, more tokens per call |
 | Contextual batch | `OPENAI_CONTEXTUAL_MAX_BATCH` | 32 | Larger = fewer calls, but risks `max_tokens` truncation |
 | Contextual concurrency (fallback path) | constructor arg `max_concurrent` | 10 | In-process Semaphore size |
+| Per-request `max_chunk_size` | request body `chunking.max_chunk_size` | 1200 (default), **silently clamped to a 1000 floor**, capped at 4096 | Smaller chunks → more chunks → more contextual batches per doc. Floor exists because tinier chunks inflate the contextual bill without improving retrieval quality (see `models/online/ingest.py:32-37`). |
 | TEI dense batch | `TEI_EMBED_MAX_BATCH_AT` | 32 | Must match TEI server's `--max-client-batch-size` |
 | TEI sparse batch | `SPARSE_EMBED_MAX_BATCH_AT` | 32 | Same |
 | Uvicorn workers | (add `--workers N` in `Dockerfile`) | 1 | Multi-process for CPU-bound work (rarely needed here — pipeline is I/O-bound) |
-| LiteLLM fallback | `LITELLM_URL` + `LITELLM_API_KEY` | empty | Self-host classifier/enricher/funding when OpenAI throttles |
+| Per-task model routing | `DP_CLASSIFIER_MODEL` / `DP_CONTEXTUAL_MODEL` / `DP_FUNDING_MODEL` + `DP_<PROVIDER>_API_KEY` | empty (falls back to `OPENAI_MODEL`) | Point any task at a different OpenAI-compatible provider — see `llm_router.py` |
