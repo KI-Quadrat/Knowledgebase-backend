@@ -36,16 +36,18 @@ class OnlineIngestATRequest(BaseModel):
         None,
         description=(
             "Optional explicit province override stored on every point as "
-            "`metadata.state_or_province`. English lowercase (e.g. "
-            "'lower austria', 'vienna'). When omitted, the funding extractor's "
-            "output is used."
+            "`metadata.state_or_province`. Accepts German or English input in "
+            "any casing — the values pass through the shared AT alias map and "
+            "are stored in canonical English lowercase (e.g. 'wien' → "
+            "'vienna', 'kärnten' → 'carinthia'). Unknown values are dropped. "
+            "When omitted, the funding extractor's output is used."
         ),
     )
     embedding_model: EmbeddingModel = Field(
         EmbeddingModel.bge_m3,
         description=(
-            "Embedder for this AT ingest. `bge_m3` (default) uses the TEI "
-            "endpoint at `TEI_EMBED_URL_AT` (1024-dim). `openai` uses "
+            "Embedder for this AT ingest. `bge_m3` (default) uses the "
+            "configured TEI endpoint (1024-dim). `openai` uses "
             "`text-embedding-3-small` (1536-dim). The AT collection is "
             "auto-created with the matching dim on first use; switching "
             "models requires a new collection name."

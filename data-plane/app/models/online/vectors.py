@@ -22,9 +22,9 @@ class OnlineDeleteByFilterRequest(BaseModel):
         "json_schema_extra": {
             "examples": [
                 {
-                    "collection_name": "wiener-neudorf",
+                    "collection_name": "example-municipality",
                     "filters": [
-                        {"key": "assistant_id", "value": "asst_wiener_neudorf_01"},
+                        {"key": "assistant_id", "value": "asst_01"},
                         {"key": "content_type", "value": "funding"},
                     ],
                 },

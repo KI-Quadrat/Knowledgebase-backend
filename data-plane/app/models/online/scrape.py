@@ -2,7 +2,22 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app.config import ext
 from app.models.classify import ExtractedEntities
+
+
+_VALID_SCRAPERS: set[str] = {"crawl4ai", "jina", "firecrawl"}
+_VALID_CRAWLERS: set[str] = {"httpx", "crawl4ai", "jina", "firecrawl"}
+
+
+def _default_scraper() -> Literal["crawl4ai", "jina", "firecrawl"]:
+    value = ext.default_scraper
+    return value if value in _VALID_SCRAPERS else "jina"  # type: ignore[return-value]
+
+
+def _default_crawler() -> Literal["httpx", "crawl4ai", "jina", "firecrawl"]:
+    value = ext.default_crawler
+    return value if value in _VALID_CRAWLERS else "httpx"  # type: ignore[return-value]
 
 
 class ScrapeRequest(BaseModel):
@@ -15,10 +30,12 @@ class ScrapeRequest(BaseModel):
         "fit",
         description=(
             "Which Markdown variant to return. "
-            "`fit` = main content only (boilerplate pruned via PruningContentFilter on Crawl4AI, "
-            "or readerlm-v2 engine on Jina fallback). "
+            "`fit` = main content only (Jina Chromium browser-engine markdown by default; "
+            "Crawl4AI `/md` `f=fit` filter on the fallback path). "
             "`raw` = full page including headers/nav/footer. "
-            "`citations` = full content with citation links preserved (Crawl4AI only; falls back to `raw` on Jina/httpx)."
+            "`citations` = full content with citation links preserved (best-effort; "
+            "the current Crawl4AI `/md` endpoint does not expose a citations filter, "
+            "so this degrades to `raw` on every backend)."
         ),
     )
     exclude_tags: list[str] | None = Field(
@@ -35,13 +52,14 @@ class ScrapeRequest(BaseModel):
             "(e.g. `'main'` or `'article.content'`). Applied on all backends."
         ),
     )
-    scraper: Literal["crawl4ai", "jina"] = Field(
-        "crawl4ai",
+    scraper: Literal["crawl4ai", "jina", "firecrawl"] = Field(
+        default_factory=_default_scraper,
         description=(
-            "Preferred scraping backend. `crawl4ai` (default) uses the Crawl4AI service "
-            "with full JavaScript rendering. `jina` uses the Jina Reader API. "
-            "The other backend (and raw httpx) remain as automatic fallbacks if the "
-            "selected one fails, so results are always best-effort."
+            "Preferred scraping backend (default `jina`, configurable server-side). "
+            "`jina` uses the Jina Reader API (Chromium engine). `crawl4ai` "
+            "uses the Crawl4AI `POST /md` endpoint. `firecrawl` uses "
+            "Firecrawl's `POST /v2/scrape` (when configured). The other backends "
+            "(and raw httpx) remain as automatic fallbacks if the selected one fails."
         ),
     )
     links_summary: bool = Field(
@@ -55,20 +73,31 @@ class ScrapeRequest(BaseModel):
             "Triggers one extra raw-HTML fetch (~small)."
         ),
     )
+    bypass_cache: bool = Field(
+        False,
+        description=(
+            "If true, skip the Redis cache and force a fresh fetch from the origin "
+            "(then update the cache with the new content). Use when stale cached "
+            "content must be refreshed — e.g. policy/funding pages that change "
+            "between scheduled re-ingests. `links_summary`, `inner_img`, and "
+            "`inner_docs` already imply a fresh fetch."
+        ),
+    )
 
     model_config = {
         "json_schema_extra": {
             "examples": [
-                {"url": "https://www.wiener-neudorf.gv.at/foerderungen"},
+                {"url": "https://www.example.gv.at/foerderungen"},
                 {
-                    "url": "https://transparenzportal.gv.at/tdb/tp/leistung/1051580.html",
+                    "url": "https://www.example.gv.at/article",
                     "markdown_type": "fit",
                     "exclude_tags": ["nav", "footer", "aside"],
                     "css_selector": "main",
                 },
-                {"url": "https://www.wiener-neudorf.gv.at/foerderungen", "inner_img": True, "inner_docs": True},
-                {"url": "https://www.wiener-neudorf.gv.at/foerderungen", "scraper": "jina"},
-                {"url": "https://www.wiener-neudorf.gv.at/foerderungen", "links_summary": True},
+                {"url": "https://www.example.gv.at/foerderungen", "inner_img": True, "inner_docs": True},
+                {"url": "https://www.example.gv.at/foerderungen", "scraper": "crawl4ai"},
+                {"url": "https://www.example.gv.at/foerderungen", "scraper": "firecrawl"},
+                {"url": "https://www.example.gv.at/foerderungen", "links_summary": True},
             ]
         }
     }
@@ -125,6 +154,7 @@ class ScrapeData(BaseModel):
     inner_images: list[InnerImageData] | None = Field(None, description="Parsed images found on the page (only when inner_img=true)")
     inner_documents: list[InnerDocData] | None = Field(None, description="Parsed documents linked on the page (only when inner_docs=true)")
     links_summary: LinksSummary | None = Field(None, description="Deduped URL lists grouped by kind (only when links_summary=true)")
+    scraper_used: str | None = Field(None, description="Backend that produced the content: 'crawl4ai', 'jina', 'firecrawl', or 'httpx' (final fallback). Null on failure or cache hits with no recorded backend.")
 
 
 class CrawlRequest(BaseModel):
@@ -134,20 +164,31 @@ class CrawlRequest(BaseModel):
     method: str = Field(..., description="Discovery method: 'sitemap' (parse XML sitemap) or 'crawl' (BFS link following)", pattern=r"^(sitemap|crawl)$")
     max_depth: int = Field(3, ge=1, le=5, description="Maximum link-following depth for crawl method")
     max_urls: int = Field(500, ge=1, le=5000, description="Maximum number of URLs to return")
-    scraper: Literal["crawl4ai", "jina"] = Field(
-        "crawl4ai",
+    scraper: Literal["httpx", "crawl4ai", "jina", "firecrawl"] = Field(
+        default_factory=_default_crawler,
         description=(
-            "Preferred scraping backend used during BFS `crawl` discovery "
-            "(ignored when `method='sitemap'`). Same semantics as in `/online/scrape`."
+            "Backend used during BFS `crawl` discovery (ignored when `method='sitemap'`). "
+            "Default `httpx`, configurable server-side.\n"
+            "- `httpx` — raw HTTP fetches, no JS rendering. Fast and free; "
+            "sufficient for sites with server-rendered nav menus (most muni/gov portals).\n"
+            "- `crawl4ai` — server-side BFS via Crawl4AI. Use for deep/large crawls. "
+            "Falls back to the Python BFS over httpx if the deep-crawl call fails.\n"
+            "- `jina` — per-URL Python BFS through Jina's hosted Chromium engine. "
+            "Expensive — only pick this when the link graph is genuinely JS-injected and "
+            "httpx misses links.\n"
+            "- `firecrawl` — single-shot URL map via Firecrawl (when configured). Falls "
+            "back to the Python BFS over httpx if the map call fails."
         ),
     )
 
     model_config = {
         "json_schema_extra": {
             "examples": [
-                {"url": "https://www.wiener-neudorf.gv.at/sitemap.xml", "method": "sitemap", "max_urls": 500},
-                {"url": "https://www.wiener-neudorf.gv.at", "method": "crawl", "max_depth": 3, "max_urls": 100},
-                {"url": "https://www.wiener-neudorf.gv.at", "method": "crawl", "scraper": "jina"},
+                {"url": "https://www.example.gv.at/sitemap.xml", "method": "sitemap", "max_urls": 500},
+                {"url": "https://www.example.gv.at", "method": "crawl", "max_depth": 3, "max_urls": 100},
+                {"url": "https://www.example.gv.at", "method": "crawl", "scraper": "crawl4ai"},
+                {"url": "https://www.example.gv.at", "method": "crawl", "scraper": "jina"},
+                {"url": "https://www.example.gv.at", "method": "crawl", "scraper": "firecrawl"},
             ]
         }
     }
@@ -168,3 +209,17 @@ class CrawlData(BaseModel):
     method_used: str = Field(..., description="Method that was used: sitemap or crawl")
     urls: list[CrawlUrl] = Field(..., description="List of discovered URLs")
     total_urls: int = Field(..., description="Total number of URLs discovered")
+    scraper_used: str | None = Field(
+        None,
+        description=(
+            "Backend that produced the BFS discovery: 'crawl4ai' (server-side "
+            "BFS via Crawl4AI's `/crawl` endpoint), 'jina' (per-URL Chromium), "
+            "'firecrawl' (single-shot `/v2/map`), or 'httpx' (raw HTTP — the "
+            "new default for /crawl). When the requested 'crawl4ai' or "
+            "'firecrawl' call fails, the service falls back to a Python BFS "
+            "over httpx and reports 'httpx' here. Falls back to the requested "
+            "`scraper` value when every BFS hit was a legacy cache entry "
+            "without a recorded backend. Null for `method='sitemap'` (no "
+            "scraping involved) or when no pages were discovered at all."
+        ),
+    )

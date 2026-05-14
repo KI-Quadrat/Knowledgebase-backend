@@ -24,7 +24,7 @@ router = APIRouter(prefix="/api/v1/online", tags=["Online - Document Parsing"])
     summary="Parse a document from URL",
     description="Download and extract text, tables, and metadata from a document at a public URL.\n\n"
     "**Supported formats:** PDF, DOCX, DOC, PPTX, ODT, XLSX, XLS, TXT, CSV, HTML, RTF.\n\n"
-    "**Optional X-API-Key header** — required only when `DP_ONLINE_API_KEYS` is configured.\n\n"
+    "**Optional X-API-Key header** when API-key auth is configured.\n\n"
     "**Error codes:** `PARSE_FAILED`, `PARSE_ENCRYPTED`, `PARSE_CORRUPTED`, `PARSE_EMPTY`, "
     "`PARSE_TIMEOUT`, `PARSE_UNSUPPORTED_FORMAT`",
     response_description="Extracted text content with page count, language, and table count",
@@ -52,7 +52,7 @@ async def parse_online(body: OnlineParseRequest, request: Request) -> ResponseEn
     "```\n"
     "curl -X POST /api/v1/online/document-parse/upload -H \"X-API-Key: your-key\" -F \"file=@report.pdf\"\n"
     "```\n\n"
-    "**Optional X-API-Key header** — required only when `DP_ONLINE_API_KEYS` is configured.\n\n"
+    "**Optional X-API-Key header** when API-key auth is configured.\n\n"
     "**Error codes:** `PARSE_FAILED`, `PARSE_ENCRYPTED`, `PARSE_CORRUPTED`, `PARSE_EMPTY`, "
     "`PARSE_TIMEOUT`, `PARSE_UNSUPPORTED_FORMAT`",
     response_description="Extracted text content with page count, language, and table count",

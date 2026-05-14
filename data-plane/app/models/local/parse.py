@@ -18,7 +18,7 @@ class LocalParseRequest(BaseModel):
                     "mime_type": "application/pdf",
                 },
                 {
-                    "file_path": "tenant/wiener-neudorf/uploads/report.docx",
+                    "file_path": "tenant/example-municipality/uploads/report.docx",
                     "source": "r2",
                     "r2_presigned_url": "https://r2.example.com/presigned/report.docx?token=abc123",
                     "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",

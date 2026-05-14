@@ -1,9 +1,11 @@
 """
-GET /api/v1/health — Liveness check (no auth)
-GET /api/v1/ready  — Readiness check (minimal without auth, full with HMAC)
+GET /api/v1/health        — Liveness check (no auth)
+GET /api/v1/ready         — Readiness check (minimal without auth, full with HMAC)
+GET /api/v1/model-health  — Detailed per-dependency health (X-API-Key auth, 60s cache, ?force=true)
 """
 
 import time
+from datetime import datetime, timezone
 
 import httpx
 from fastapi import APIRouter, Depends, Request
@@ -12,8 +14,10 @@ from app.config import ext, settings
 from app.dependencies.api_key import require_api_key
 from app.models.health import (
     HealthResponse,
+    HealthStatus,
     ModelHealthItem,
     ModelHealthResponse,
+    QuotaInfo,
     ReadyResponse,
     ServiceStatus,
 )
@@ -23,6 +27,15 @@ log = get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["Health"])
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
+
+# ── /model-health cache + thresholds ─────────────────────────
+# Probes burn small amounts of LLM tokens (OpenAI / Nebius / etc. chat completions)
+# and external rate-limit budget (Jina, LlamaParse). Cache the assembled response
+# for `_MODEL_HEALTH_CACHE_TTL_S` seconds. Callers bypass with ?force=true.
+_MODEL_HEALTH_CACHE_TTL_S = 60
+_NEAR_QUOTA_THRESHOLD_PCT = 5.0
+_model_health_cache: dict[str, tuple[float, ModelHealthResponse]] = {}
+_MODEL_HEALTH_CACHE_KEY = "default"
 
 
 def _uptime(request: Request) -> float:
@@ -45,7 +58,7 @@ async def _probe_component(component: object, method_name: str) -> tuple[bool, s
 
 async def _probe_openai_chat_model() -> tuple[bool, str | None]:
     if not ext.openai_api_key:
-        return False, "OPENAI_API_KEY not configured"
+        return False, "openai key not configured"
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(20)) as client:
@@ -79,7 +92,7 @@ async def _probe_jina_reader(scraping_svc: object) -> tuple[bool, str | None]:
     if not crawl_client or not http_client:
         return False, "service not initialized"
     if not jina_key:
-        return False, "JINA_API_KEY not configured"
+        return False, "jina key not configured"
 
     try:
         resp = await http_client.get(
@@ -99,28 +112,6 @@ async def _probe_jina_reader(scraping_svc: object) -> tuple[bool, str | None]:
         return False, str(exc)
 
 
-def _item(
-    *,
-    component: str,
-    task: str,
-    provider: str,
-    model: str,
-    configured: bool,
-    healthy: bool,
-    detail: str | None = None,
-) -> ModelHealthItem:
-    return ModelHealthItem(
-        component=component,
-        task=task,
-        provider=provider,
-        model=model,
-        configured=configured,
-        healthy=healthy,
-        required=configured,
-        detail=detail,
-    )
-
-
 @router.get(
     "/health",
     response_model=HealthResponse,
@@ -138,11 +129,11 @@ async def health(request: Request) -> HealthResponse:
     summary="Readiness check",
     description="""Check if the Data Plane and all its dependencies are ready to serve requests.
 
-**Without HMAC auth headers:** Returns minimal `{ready: true/false}` — suitable for load balancer health checks.
+**Without auth headers:** Returns minimal `{ready: true/false}` — suitable for load balancer health checks.
 
-**With HMAC auth headers (X-Signature + X-Timestamp):** Returns full dependency status including Qdrant, BGE-M3, OpenAI embedder, TEI BGE-M3 (embed.ki2.at), TEI sparse (sparse.ki2.at), Parser (LlamaParse/Unstructured), Crawl4AI, LDAP, and Redis.
+**With internal auth headers:** Returns per-service dependency status (vector DB, embedders, parser, scraper, directory, cache).
 
-Core services that must be healthy for `ready: true`: Qdrant, BGE-M3, Parser, Crawl4AI.""",
+Core services that must be healthy for `ready: true`: vector DB, primary embedder, parser, scraper.""",
     response_description="Readiness status with optional service details",
 )
 async def ready(request: Request) -> ReadyResponse:
@@ -241,209 +232,740 @@ async def ready(request: Request) -> ReadyResponse:
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# /model-health — granular per-dependency probes
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _classify_http_status(status_code: int) -> HealthStatus:
+    """Map an HTTP status code from a third-party probe onto our HealthStatus."""
+    if 200 <= status_code < 300:
+        return HealthStatus.ok
+    if status_code in (401, 403):
+        return HealthStatus.auth_failed
+    if status_code == 402:
+        return HealthStatus.quota_exhausted
+    if status_code == 429:
+        return HealthStatus.rate_limited
+    if status_code == 404:
+        # 404 with valid creds means "endpoint reached, resource missing"
+        # — useful as an "auth probe" pattern (e.g. LlamaParse job lookup).
+        return HealthStatus.ok
+    if 400 <= status_code < 500:
+        return HealthStatus.degraded
+    return HealthStatus.unreachable  # 5xx
+
+
+def _extract_openai_quota(headers: httpx.Headers | dict) -> QuotaInfo | None:
+    """Read OpenAI-compatible x-ratelimit-* headers (also works for Nebius,
+    Together, Groq, Fireworks, DeepInfra)."""
+
+    def _int(name: str) -> int | None:
+        raw = headers.get(name)
+        try:
+            return int(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    rem_tok = _int("x-ratelimit-remaining-tokens")
+    rem_req = _int("x-ratelimit-remaining-requests")
+    lim_tok = _int("x-ratelimit-limit-tokens")
+    lim_req = _int("x-ratelimit-limit-requests")
+    reset = headers.get("x-ratelimit-reset-tokens") or headers.get("x-ratelimit-reset-requests")
+
+    if rem_tok is None and rem_req is None:
+        return None
+
+    near = False
+    limit_kind: str | None = None
+    threshold = _NEAR_QUOTA_THRESHOLD_PCT / 100.0
+    if rem_tok is not None and lim_tok and lim_tok > 0 and rem_tok / lim_tok < threshold:
+        near, limit_kind = True, "openai_tpm"
+    if rem_req is not None and lim_req and lim_req > 0 and rem_req / lim_req < threshold:
+        near, limit_kind = True, limit_kind or "openai_rpm"
+
+    return QuotaInfo(
+        remaining_tokens=rem_tok,
+        remaining_requests=rem_req,
+        reset_at=reset,
+        near_limit=near,
+        limit_kind=limit_kind,
+    )
+
+
+def _extract_jina_quota(headers: httpx.Headers | dict) -> QuotaInfo | None:
+    rem = headers.get("x-ratelimit-remaining")
+    lim = headers.get("x-ratelimit-limit")
+    reset = headers.get("x-ratelimit-reset")
+    try:
+        rem_i = int(rem) if rem is not None else None
+        lim_i = int(lim) if lim is not None else None
+    except (TypeError, ValueError):
+        rem_i = lim_i = None
+    if rem_i is None:
+        return None
+    near = (
+        lim_i is not None
+        and lim_i > 0
+        and (rem_i / lim_i) < (_NEAR_QUOTA_THRESHOLD_PCT / 100.0)
+    )
+    return QuotaInfo(
+        remaining_requests=rem_i,
+        reset_at=reset,
+        near_limit=near,
+        limit_kind="jina_requests" if near else None,
+    )
+
+
+def _item(
+    *,
+    component: str,
+    task: str,
+    provider: str,
+    model: str,
+    configured: bool,
+    status: HealthStatus,
+    detail: str | None = None,
+    category: str = "llm",
+    latency_ms: int | None = None,
+    quota: QuotaInfo | None = None,
+) -> ModelHealthItem:
+    required = configured and status not in (HealthStatus.disabled, HealthStatus.not_configured)
+    return ModelHealthItem(
+        component=component,
+        task=task,
+        provider=provider,
+        model=model,
+        configured=configured,
+        required=required,
+        healthy=(status == HealthStatus.ok),
+        status=status,
+        detail=detail,
+        category=category,
+        latency_ms=latency_ms,
+        quota=quota,
+        last_checked_at=_utc_now_iso(),
+    )
+
+
+async def _probe_chat(
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    provider_label: str,
+) -> tuple[HealthStatus, str | None, QuotaInfo | None, int]:
+    """Generic OpenAI-compatible chat probe — reused for openai_chat and the
+    per-task extra providers (nebius, together, groq, fireworks, deepinfra)."""
+    if not api_key:
+        return HealthStatus.not_configured, f"{provider_label}: API key not configured", None, 0
+    url = base_url.rstrip("/") + "/chat/completions"
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20)) as client:
+            resp = await client.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": "ok"}],
+                    "temperature": 0.0,
+                    "max_tokens": 1,
+                },
+            )
+        latency = int((time.monotonic() - started) * 1000)
+        status = _classify_http_status(resp.status_code)
+        quota = _extract_openai_quota(resp.headers) if resp.status_code < 500 else None
+        if status == HealthStatus.ok and quota and quota.near_limit:
+            status = HealthStatus.near_quota_limit
+        detail = None if status == HealthStatus.ok else f"{provider_label} HTTP {resp.status_code}"
+        return status, detail, quota, latency
+    except httpx.TimeoutException:
+        return HealthStatus.unreachable, f"{provider_label}: timeout", None, int((time.monotonic() - started) * 1000)
+    except Exception as exc:
+        return HealthStatus.unreachable, f"{provider_label}: {exc}", None, int((time.monotonic() - started) * 1000)
+
+
+def _openai_chat_base_url() -> str:
+    return (ext.openai_base_url or "https://api.openai.com/v1").rstrip("/")
+
+
+async def _probe_openai_chat_item() -> ModelHealthItem:
+    status, detail, quota, latency = await _probe_chat(
+        base_url=_openai_chat_base_url(),
+        api_key=ext.openai_api_key,
+        model=ext.openai_model,
+        provider_label="OpenAI chat",
+    )
+    return _item(
+        component="openai_chat",
+        task="content classification + contextual enrichment + funding extraction",
+        provider="openai",
+        model=ext.openai_model,
+        configured=bool(ext.openai_api_key),
+        status=status,
+        detail=detail,
+        category="llm",
+        latency_ms=latency,
+        quota=quota,
+    )
+
+
+async def _probe_openai_embeddings_item() -> ModelHealthItem:
+    model = "text-embedding-3-small"
+    if not ext.openai_api_key:
+        return _item(
+            component="openai_embeddings",
+            task="OpenAI online embedding (dense_openai)",
+            provider="openai",
+            model=model,
+            configured=False,
+            status=HealthStatus.not_configured,
+            detail="openai key not configured",
+            category="embedding",
+        )
+    url = _openai_chat_base_url() + "/embeddings"
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15)) as client:
+            resp = await client.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {ext.openai_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"model": model, "input": "ok"},
+            )
+        latency = int((time.monotonic() - started) * 1000)
+        status = _classify_http_status(resp.status_code)
+        quota = _extract_openai_quota(resp.headers) if resp.status_code < 500 else None
+        if status == HealthStatus.ok and quota and quota.near_limit:
+            status = HealthStatus.near_quota_limit
+        detail = None if status == HealthStatus.ok else f"OpenAI embeddings HTTP {resp.status_code}"
+    except Exception as exc:
+        latency = int((time.monotonic() - started) * 1000)
+        status = HealthStatus.unreachable
+        detail = f"OpenAI embeddings: {exc}"
+        quota = None
+    return _item(
+        component="openai_embeddings",
+        task="OpenAI online embedding (dense_openai)",
+        provider="openai",
+        model=model,
+        configured=True,
+        status=status,
+        detail=detail,
+        category="embedding",
+        latency_ms=latency,
+        quota=quota,
+    )
+
+
+async def _probe_jina_item(request: Request) -> ModelHealthItem:
+    scraping_svc = getattr(request.app.state, "scraping", None)
+    crawl_client = getattr(scraping_svc, "crawl4ai", None)
+    http_client = getattr(crawl_client, "_client", None)
+    jina_key = getattr(crawl_client, "_jina_key", "")
+    jina_url = getattr(crawl_client, "_jina_url", "")
+
+    if not crawl_client or not http_client:
+        return _item(
+            component="jina_reader",
+            task="reader-based web scraping",
+            provider="jina",
+            model="jina-reader",
+            configured=False,
+            status=HealthStatus.not_configured,
+            detail="scraping service not initialized",
+            category="scraper",
+        )
+    if not jina_key:
+        return _item(
+            component="jina_reader",
+            task="reader-based web scraping",
+            provider="jina",
+            model="jina-reader",
+            configured=False,
+            status=HealthStatus.not_configured,
+            detail="jina key not configured",
+            category="scraper",
+        )
+    started = time.monotonic()
+    try:
+        resp = await http_client.get(
+            f"{jina_url}/https://example.com",
+            headers={
+                "Authorization": f"Bearer {jina_key}",
+                "Accept": "application/json",
+                "X-Return-Format": "markdown",
+            },
+            timeout=10.0,
+        )
+        latency = int((time.monotonic() - started) * 1000)
+        status = _classify_http_status(resp.status_code)
+        quota = _extract_jina_quota(resp.headers) if resp.status_code < 500 else None
+        if status == HealthStatus.ok and quota and quota.near_limit:
+            status = HealthStatus.near_quota_limit
+        detail = None if status == HealthStatus.ok else f"Jina HTTP {resp.status_code}"
+    except Exception as exc:
+        latency = int((time.monotonic() - started) * 1000)
+        status = HealthStatus.unreachable
+        detail = f"Jina: {exc}"
+        quota = None
+    return _item(
+        component="jina_reader",
+        task="reader-based web scraping",
+        provider="jina",
+        model="jina-reader",
+        configured=True,
+        status=status,
+        detail=detail,
+        category="scraper",
+        latency_ms=latency,
+        quota=quota,
+    )
+
+
+async def _probe_firecrawl_item() -> ModelHealthItem:
+    if not ext.firecrawl_api_key:
+        return _item(
+            component="firecrawl",
+            task="scrape backend (firecrawl)",
+            provider="firecrawl",
+            model="firecrawl",
+            configured=False,
+            status=HealthStatus.not_configured,
+            detail="firecrawl key not configured",
+            category="scraper",
+        )
+    url = ext.firecrawl_api_url.rstrip("/") + "/v1/scrape"
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20)) as client:
+            resp = await client.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {ext.firecrawl_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"url": "https://example.com", "formats": ["markdown"]},
+            )
+        latency = int((time.monotonic() - started) * 1000)
+        status = _classify_http_status(resp.status_code)
+        quota = _extract_jina_quota(resp.headers) if resp.status_code < 500 else None
+        if status == HealthStatus.ok and quota and quota.near_limit:
+            status = HealthStatus.near_quota_limit
+        detail = None if status == HealthStatus.ok else f"Firecrawl HTTP {resp.status_code}"
+    except Exception as exc:
+        latency = int((time.monotonic() - started) * 1000)
+        status = HealthStatus.unreachable
+        detail = f"Firecrawl: {exc}"
+        quota = None
+    return _item(
+        component="firecrawl",
+        task="scrape backend (firecrawl)",
+        provider="firecrawl",
+        model="firecrawl",
+        configured=True,
+        status=status,
+        detail=detail,
+        category="scraper",
+        latency_ms=latency,
+        quota=quota,
+    )
+
+
+async def _probe_llamaparse_item() -> ModelHealthItem:
+    if not ext.llama_cloud_api_key:
+        return _item(
+            component="llamaparse",
+            task="cloud document parsing",
+            provider="llamacloud",
+            model="llamaparse",
+            configured=False,
+            status=HealthStatus.disabled,
+            detail="local parser backend active",
+            category="parser",
+        )
+    # GET /job/<uuid> returns 404 with a valid key, 401 with a bad key —
+    # cheapest way to probe authentication without uploading a document.
+    probe_uuid = "00000000-0000-0000-0000-000000000000"
+    url = ext.llama_cloud_base_url.rstrip("/") + f"/job/{probe_uuid}"
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15)) as client:
+            resp = await client.get(
+                url,
+                headers={"Authorization": f"Bearer {ext.llama_cloud_api_key}"},
+            )
+        latency = int((time.monotonic() - started) * 1000)
+        # 404 here means "auth OK, resource missing" — that's a healthy signal.
+        if resp.status_code == 404:
+            status = HealthStatus.ok
+            detail = None
+        else:
+            status = _classify_http_status(resp.status_code)
+            detail = None if status == HealthStatus.ok else f"LlamaParse HTTP {resp.status_code}"
+    except Exception as exc:
+        latency = int((time.monotonic() - started) * 1000)
+        status = HealthStatus.unreachable
+        detail = f"LlamaParse: {exc}"
+    return _item(
+        component="llamaparse",
+        task="cloud document parsing",
+        provider="llamacloud",
+        model="llamaparse",
+        configured=True,
+        status=status,
+        detail=detail,
+        category="parser",
+        latency_ms=latency,
+    )
+
+
+def _extra_providers_in_use() -> dict[str, str]:
+    """Return {provider: model} for non-openai providers referenced by a task model.
+
+    Only includes providers that are actually wired up via DP_CLASSIFIER_MODEL,
+    DP_CONTEXTUAL_MODEL, or DP_FUNDING_MODEL. We probe each provider once with
+    the first model seen for it.
+    """
+    from app.services.intelligence.llm_router import parse_spec
+    specs = [ext.classifier_model, ext.contextual_model, ext.funding_model]
+    seen: dict[str, str] = {}
+    for spec in specs:
+        if not spec:
+            continue
+        try:
+            provider, model = parse_spec(spec)
+        except Exception:
+            continue
+        if provider != "openai" and provider not in seen:
+            seen[provider] = model
+    return seen
+
+
+async def _probe_extra_provider_item(provider: str, model: str) -> ModelHealthItem:
+    from app.services.intelligence.llm_router import KNOWN_PROVIDERS
+    api_key = getattr(ext, f"{provider}_api_key", "") or ""
+    base_url = (
+        (getattr(ext, f"{provider}_base_url", "") or "").rstrip("/")
+        or KNOWN_PROVIDERS.get(provider, "")
+    )
+    if not api_key:
+        return _item(
+            component=f"llm_provider_{provider}",
+            task="per-task LLM (classify / contextual / funding)",
+            provider=provider,
+            model=model,
+            configured=False,
+            status=HealthStatus.not_configured,
+            detail=f"{provider} key not configured (referenced by a task model)",
+            category="llm",
+        )
+    if not base_url:
+        return _item(
+            component=f"llm_provider_{provider}",
+            task="per-task LLM (classify / contextual / funding)",
+            provider=provider,
+            model=model,
+            configured=True,
+            status=HealthStatus.unreachable,
+            detail=f"no base_url configured for provider {provider!r}",
+            category="llm",
+        )
+    status, detail, quota, latency = await _probe_chat(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        provider_label=provider,
+    )
+    return _item(
+        component=f"llm_provider_{provider}",
+        task="per-task LLM (classify / contextual / funding)",
+        provider=provider,
+        model=model,
+        configured=True,
+        status=status,
+        detail=detail,
+        category="llm",
+        latency_ms=latency,
+        quota=quota,
+    )
+
+
+async def _probe_state_service(
+    *,
+    component: str,
+    task: str,
+    provider: str,
+    model: str,
+    category: str,
+    svc: object | None,
+    method_name: str = "check_health",
+    args: tuple = (),
+    not_configured_detail: str = "service not initialized",
+) -> ModelHealthItem:
+    """Probe a service attached to app.state via its no-arg (or fixed-arg)
+    check method (e.g. check_health, ping, is_ready)."""
+    if svc is None:
+        return _item(
+            component=component,
+            task=task,
+            provider=provider,
+            model=model,
+            configured=False,
+            status=HealthStatus.not_configured,
+            detail=not_configured_detail,
+            category=category,
+        )
+    started = time.monotonic()
+    detail: str | None = None
+    status: HealthStatus
+    try:
+        method = getattr(svc, method_name, None)
+        if method is None:
+            status = HealthStatus.not_configured
+            detail = f"missing {method_name}()"
+        else:
+            result = await method(*args)
+            status = HealthStatus.ok if bool(result) else HealthStatus.unreachable
+            if not bool(result):
+                detail = f"{method_name}() returned false"
+    except Exception as exc:
+        status = HealthStatus.unreachable
+        detail = str(exc)
+    latency = int((time.monotonic() - started) * 1000)
+    return _item(
+        component=component,
+        task=task,
+        provider=provider,
+        model=model,
+        configured=True,
+        status=status,
+        detail=detail,
+        category=category,
+        latency_ms=latency,
+    )
+
+
+async def _probe_crawl4ai_item(request: Request) -> ModelHealthItem:
+    scraping_svc = getattr(request.app.state, "scraping", None)
+    crawl4ai_client = getattr(scraping_svc, "crawl4ai", None)
+    return await _probe_state_service(
+        component="crawl4ai",
+        task="javascript-rendered web scraping",
+        provider="crawl4ai",
+        model="crawl4ai",
+        category="scraper",
+        svc=crawl4ai_client,
+    )
+
+
+async def _probe_tei_embed_at_item(request: Request) -> ModelHealthItem:
+    tei = getattr(request.app.state, "tei_embedder_at", None)
+    return await _probe_state_service(
+        component="tei_embed_at",
+        task="BGE-M3 online embedding (dense_bge_m3) via TEI",
+        provider="tei",
+        model=getattr(tei, "_model", ext.tei_embed_model_at) if tei else ext.tei_embed_model_at,
+        category="embedding",
+        svc=tei,
+    )
+
+
+async def _probe_tei_sparse_at_item(request: Request) -> ModelHealthItem:
+    sparse = getattr(request.app.state, "sparse_embedder", None)
+    return await _probe_state_service(
+        component="tei_sparse_at",
+        task="TEI sparse embedding for hybrid search",
+        provider="tei",
+        model=getattr(sparse, "_model", ext.sparse_embed_model_at) if sparse else ext.sparse_embed_model_at,
+        category="embedding",
+        svc=sparse,
+    )
+
+
+async def _probe_qdrant_item(request: Request, *, at: bool) -> ModelHealthItem:
+    if at:
+        qdrant = getattr(request.app.state, "qdrant_at", None)
+        component, task, model = "qdrant_at", "Qdrant (AT funding instance)", "qdrant"
+    else:
+        qdrant = getattr(request.app.state, "qdrant", None)
+        component, task, model = "qdrant", "Qdrant (default instance)", "qdrant"
+    return await _probe_state_service(
+        component=component,
+        task=task,
+        provider="qdrant",
+        model=model,
+        category="vector_db",
+        svc=qdrant,
+    )
+
+
+async def _probe_redis_item(request: Request) -> ModelHealthItem:
+    cache = getattr(request.app.state, "cache", None)
+    return await _probe_state_service(
+        component="redis",
+        task="cache",
+        provider="redis",
+        model="redis",
+        category="cache",
+        svc=cache,
+        method_name="ping",
+    )
+
+
+async def _probe_clickhouse_item(request: Request) -> ModelHealthItem:
+    audit = getattr(request.app.state, "audit", None)
+    return await _probe_state_service(
+        component="clickhouse",
+        task="audit log",
+        provider="clickhouse",
+        model="clickhouse",
+        category="audit",
+        svc=audit,
+        not_configured_detail="audit logger not initialized",
+    )
+
+
+async def _probe_ldap_item(request: Request) -> ModelHealthItem:
+    ldap = getattr(request.app.state, "ldap", None)
+    if ldap is None and not ext.ldap_url:
+        return _item(
+            component="ldap",
+            task="directory auth",
+            provider="ldap",
+            model="ldap",
+            configured=False,
+            status=HealthStatus.not_configured,
+            detail="ldap not configured",
+            category="directory",
+        )
+    return await _probe_state_service(
+        component="ldap",
+        task="directory auth",
+        provider="ldap",
+        model="ldap",
+        category="directory",
+        svc=ldap,
+    )
+
+
+def _aggregate(items: list[ModelHealthItem]) -> tuple[HealthStatus, bool, bool]:
+    """Compute (overall, any_quota_alerts, any_auth_failures) from the per-item statuses."""
+    required = [i for i in items if i.required]
+
+    # 'down'-class — surface the single worst one as `overall` for quick scanning.
+    for st in (HealthStatus.unreachable, HealthStatus.auth_failed, HealthStatus.quota_exhausted):
+        if any(i.status == st for i in required):
+            overall = st
+            break
+    else:
+        if any(
+            i.status in (HealthStatus.near_quota_limit, HealthStatus.rate_limited, HealthStatus.degraded)
+            for i in items
+        ):
+            overall = HealthStatus.degraded
+        else:
+            overall = HealthStatus.ok
+
+    any_quota_alerts = any(
+        i.status
+        in (HealthStatus.near_quota_limit, HealthStatus.rate_limited, HealthStatus.quota_exhausted)
+        for i in items
+    )
+    any_auth_failures = any(i.status == HealthStatus.auth_failed for i in items)
+    return overall, any_quota_alerts, any_auth_failures
+
+
 @router.get(
     "/model-health",
     response_model=ModelHealthResponse,
     dependencies=[Depends(require_api_key)],
-    summary="Model health check",
+    tags=["Diagnostics"],
+    summary="Detailed health check for every third-party dependency",
     description=(
-        "Checks every configured model-bearing component used by this project. "
-        "Embedding services receive a tiny probe input, the shared OpenAI chat "
-        "model is tested with a minimal completion, and LlamaParse is checked "
-        "when enabled."
+        "**Use this when you want a one-glance picture of every third-party dependency** — "
+        "API keys, quota state, reachability. Returns a structured per-component report "
+        "and a top-level `overall` status.\n\n"
+        "## When to call\n"
+        "- Operator dashboard / on-call refresh — \"is anything broken right now?\"\n"
+        "- Pre-flight before a big batch ingest — confirm dependencies are healthy.\n"
+        "- Alerting cron — page when `any_auth_failures: true` or `overall != \"ok\"`.\n"
+        "- **Do not** put this on a tight polling loop (every 5s, etc.) — each call burns a "
+        "tiny amount of provider budget.\n\n"
+        "## Reading the response\n"
+        "- `overall` — worst-required status (`ok` / `degraded` / `auth_failed` / `quota_exhausted` / `unreachable`).\n"
+        "- `any_quota_alerts` — `true` if any component is `near_quota_limit`, `rate_limited`, or `quota_exhausted`.\n"
+        "- `any_auth_failures` — `true` if any component is `auth_failed` (likely a rotated/expired key or lapsed subscription).\n"
+        "- `models[i].status` — granular per-component status.\n"
+        "- `models[i].quota` — `remaining_tokens` / `remaining_requests` / `reset_at` (only providers that expose them).\n"
+        "- `models[i].detail` — short error string.\n\n"
+        "## Caching\n"
+        "Results are cached in-memory for 60s (see `cache_ttl_seconds`). Pass `?force=true` to "
+        "skip the cache and re-probe everything. `served_from_cache: true` in the response "
+        "tells you when you got a cached copy.\n\n"
+        "**Auth:** requires `X-API-Key` when API-key auth is configured."
     ),
-    response_description="Detailed status for each configured model component",
+    response_description="Per-dependency health classification with optional quota snapshots",
 )
-async def model_health(request: Request) -> ModelHealthResponse:
+async def model_health(request: Request, force: bool = False) -> ModelHealthResponse:
     uptime = _uptime(request)
-    models: list[ModelHealthItem] = []
 
-    scraping_svc = getattr(request.app.state, "scraping", None)
-    crawl4ai_client = getattr(scraping_svc, "crawl4ai", None)
-    crawl4ai_ok, crawl4ai_detail = (
-        (await crawl4ai_client.check_health(), None)
-        if crawl4ai_client
-        else (False, "service not initialized")
-    )
-    models.append(
-        _item(
-            component="scraper_crawl4ai",
-            task="javascript-rendered web scraping",
-            provider="crawl4ai",
-            model="crawl4ai",
-            configured=crawl4ai_client is not None,
-            healthy=crawl4ai_ok,
-            detail=crawl4ai_detail,
-        )
-    )
+    if not force:
+        cached = _model_health_cache.get(_MODEL_HEALTH_CACHE_KEY)
+        if cached and (time.monotonic() - cached[0]) < _MODEL_HEALTH_CACHE_TTL_S:
+            return cached[1].model_copy(update={"uptime_seconds": uptime, "served_from_cache": True})
 
-    jina_configured = bool(crawl4ai_client and getattr(crawl4ai_client, "_jina_key", ""))
-    jina_ok, jina_detail = (
-        await _probe_jina_reader(scraping_svc)
-        if jina_configured
-        else (False, "JINA_API_KEY not configured" if crawl4ai_client else "service not initialized")
-    )
-    models.append(
-        _item(
-            component="scraper_jina_reader",
-            task="reader-based web scraping fallback",
-            provider="jina",
-            model="jina-reader",
-            configured=jina_configured,
-            healthy=jina_ok,
-            detail=jina_detail,
-        )
-    )
+    items: list[ModelHealthItem] = []
 
-    embedder = getattr(request.app.state, "embedder", None)
-    local_ok, local_detail = await _probe_component(embedder, "embed") if embedder else (False, "service not initialized")
-    models.append(
-        _item(
-            component="local_embedding",
-            task="local document embeddings",
-            provider="bge-m3 service",
-            model="bge-m3",
-            configured=embedder is not None,
-            healthy=local_ok,
-            detail=local_detail,
-        )
-    )
+    # ── LLM providers (chat) ─────────────────────────────────────────
+    items.append(await _probe_openai_chat_item())
+    for provider, model in sorted(_extra_providers_in_use().items()):
+        items.append(await _probe_extra_provider_item(provider, model))
 
-    openai_embedder = getattr(request.app.state, "openai_embedder", None)
-    openai_configured = bool(openai_embedder and getattr(openai_embedder, "_api_key", ""))
-    openai_embed_ok, openai_embed_detail = (
-        await _probe_component(openai_embedder, "embed")
-        if openai_configured
-        else (False, "OPENAI_API_KEY not configured" if openai_embedder else "service not initialized")
-    )
-    models.append(
-        _item(
-            component="online_embedding_openai",
-            task="OpenAI online embedding (dense_openai)",
-            provider="openai",
-            model=getattr(openai_embedder, "_model", "text-embedding-3-small"),
-            configured=openai_configured,
-            healthy=openai_embed_ok,
-            detail=openai_embed_detail,
-        )
-    )
+    # ── Embedders ────────────────────────────────────────────────────
+    items.append(await _probe_openai_embeddings_item())
+    items.append(await _probe_tei_embed_at_item(request))
+    items.append(await _probe_tei_sparse_at_item(request))
 
-    tei_embedder_at = getattr(request.app.state, "tei_embedder_at", None)
-    tei_configured = bool(tei_embedder_at and getattr(tei_embedder_at, "_api_key", ""))
-    tei_ok, tei_detail = (
-        await _probe_component(tei_embedder_at, "embed")
-        if tei_configured
-        else (False, "TEI_EMBED_API_KEY_AT not configured" if tei_embedder_at else "service not initialized")
-    )
-    models.append(
-        _item(
-            component="online_embedding_bge_m3",
-            task="BGE-M3 online embedding (dense_bge_m3)",
-            provider="tei",
-            model=getattr(tei_embedder_at, "_model", ext.tei_embed_model_at),
-            configured=tei_configured,
-            healthy=tei_ok,
-            detail=tei_detail,
-        )
-    )
+    # ── Scrapers / parser ────────────────────────────────────────────
+    items.append(await _probe_crawl4ai_item(request))
+    items.append(await _probe_jina_item(request))
+    if ext.firecrawl_api_key:
+        items.append(await _probe_firecrawl_item())
+    items.append(await _probe_llamaparse_item())
 
-    sparse_embedder = getattr(request.app.state, "sparse_embedder", None)
-    sparse_configured = bool(sparse_embedder and getattr(sparse_embedder, "_api_key", ""))
-    sparse_ok, sparse_detail = (
-        await _probe_component(sparse_embedder, "encode")
-        if sparse_configured
-        else (False, "SPARSE_EMBED_API_KEY_AT not configured" if sparse_embedder else "service not initialized")
-    )
-    models.append(
-        _item(
-            component="online_embedding_sparse",
-            task="TEI sparse embedding for hybrid search",
-            provider="tei",
-            model=getattr(sparse_embedder, "_model", ext.sparse_embed_model_at),
-            configured=sparse_configured,
-            healthy=sparse_ok,
-            detail=sparse_detail,
-        )
-    )
+    # ── Infrastructure ───────────────────────────────────────────────
+    items.append(await _probe_qdrant_item(request, at=False))
+    items.append(await _probe_qdrant_item(request, at=True))
+    items.append(await _probe_redis_item(request))
+    items.append(await _probe_clickhouse_item(request))
+    items.append(await _probe_ldap_item(request))
 
-    classifier = getattr(request.app.state, "classifier", None)
-    llm_classifier = getattr(classifier, "_llm", None)
-    chat_configured = bool(llm_classifier and getattr(llm_classifier, "_client", None))
-    chat_ok, chat_detail = await _probe_openai_chat_model() if chat_configured else (False, "OPENAI_API_KEY not configured")
+    overall, any_quota_alerts, any_auth_failures = _aggregate(items)
 
-    models.append(
-        _item(
-            component="content_classifier",
-            task="content classification",
-            provider="openai",
-            model=getattr(llm_classifier, "_model", ext.openai_model),
-            configured=chat_configured,
-            healthy=chat_ok,
-            detail=chat_detail,
-        )
-    )
-
-    contextual = getattr(request.app.state, "contextual_enricher", None)
-    contextual_configured = bool(contextual and getattr(contextual, "_api_key", ""))
-    models.append(
-        _item(
-            component="contextual_enricher",
-            task="contextual chunk enrichment",
-            provider="openai",
-            model=getattr(contextual, "_model", ext.openai_model),
-            configured=contextual_configured,
-            healthy=chat_ok if contextual_configured else False,
-            detail=chat_detail if contextual_configured else "OPENAI_API_KEY not configured",
-        )
-    )
-
-    funding = getattr(request.app.state, "funding_extractor", None)
-    funding_configured = bool(funding and getattr(funding, "_client", None))
-    models.append(
-        _item(
-            component="funding_extractor",
-            task="funding metadata extraction",
-            provider="openai",
-            model=getattr(funding, "_model", ext.openai_model),
-            configured=funding_configured,
-            healthy=chat_ok if funding_configured else False,
-            detail=chat_detail if funding_configured else "OPENAI_API_KEY not configured",
-        )
-    )
-
-    parser = getattr(request.app.state, "parser", None)
-    parser_backend = getattr(parser, "parser_backend", "local") if parser else "local"
-    llama_enabled = parser is not None and parser_backend == "llamaparse"
-    if llama_enabled:
-        try:
-            llama_ok = await parser.check_health()
-            llama_detail = None
-        except Exception as exc:
-            llama_ok = False
-            llama_detail = str(exc)
-    else:
-        llama_ok = False
-        llama_detail = "local parser backend active"
-    models.append(
-        _item(
-            component="document_parser",
-            task="cloud document parsing",
-            provider="llamacloud" if llama_enabled else "local",
-            model="llamaparse" if llama_enabled else "local-parser",
-            configured=llama_enabled,
-            healthy=llama_ok if llama_enabled else False,
-            detail=llama_detail,
-        )
-    )
-
-    all_healthy = all(item.healthy for item in models if item.required)
-
-    return ModelHealthResponse(
-        healthy=all_healthy,
-        models=models,
+    response = ModelHealthResponse(
+        overall=overall,
+        any_quota_alerts=any_quota_alerts,
+        any_auth_failures=any_auth_failures,
+        healthy=(overall == HealthStatus.ok),
+        models=items,
         mode=settings.mode,
         tenant_id=settings.tenant_id,
         worker_id=settings.worker_id,
         version=settings.version,
         uptime_seconds=uptime,
+        cache_ttl_seconds=_MODEL_HEALTH_CACHE_TTL_S,
+        served_from_cache=False,
     )
+    _model_health_cache[_MODEL_HEALTH_CACHE_KEY] = (time.monotonic(), response)
+    return response

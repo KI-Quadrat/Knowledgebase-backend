@@ -19,6 +19,14 @@ class Settings(BaseSettings):
     max_batch_urls: int = 50
     max_sitemap_pages: int = 500
 
+    # Batch ingest limits — caps on POST /api/v1/online/batch/ingest.
+    # ``max_batch_ingest_items`` rejects requests larger than this with
+    # ``BATCH_TOO_LARGE``. ``batch_ingest_concurrency`` caps how many items
+    # run simultaneously inside one batch (asyncio.Semaphore size). Keep
+    # the concurrency at or below your OpenAI tier's concurrent quota.
+    max_batch_ingest_items: int = 50
+    batch_ingest_concurrency: int = 10
+
     # Cache
     cache_ttl: int = 3600
 
@@ -56,9 +64,32 @@ class ExternalSettings(BaseSettings):
     crawl4ai_url: str = "http://crawl4ai:11235"
     crawl4ai_api_token: str = ""
 
-    # Jina Reader (fallback scraper)
+    # Default scraping backend used when the request body omits ``scraper``.
+    # Must be one of ``"jina"`` or ``"crawl4ai"`` — invalid values fall back to
+    # ``"jina"`` at the request-model layer.
+    default_scraper: str = "jina"
+
+    # Default crawler backend used when ``/crawl`` requests with
+    # ``method="crawl"`` omit ``scraper``. Valid values: ``"httpx"``,
+    # ``"crawl4ai"``, ``"jina"``, ``"firecrawl"``. Invalid values fall back
+    # to ``"httpx"`` at the request-model layer.
+    default_crawler: str = "httpx"
+
+    # Jina Reader (now the default backend; Crawl4AI /md is the fallback).
     jina_api_url: str = "https://eu-r-beta.jina.ai"
     jina_api_key: str = ""
+    # Comma-separated list of domains where requests with scraper="crawl4ai"
+    # are forced back to Jina (overrides the caller's explicit choice for
+    # known-bad domains). Subdomains match by suffix — listing "stadt-wien.at"
+    # routes both "stadt-wien.at" and "www.stadt-wien.at". Empty disables the
+    # override; the default backend (Jina) is unaffected by this list.
+    jina_default_domains: str = ""
+
+    # Firecrawl (optional third backend — opt-in via ``scraper="firecrawl"``).
+    # Point ``firecrawl_api_url`` at a self-hosted EU instance for data
+    # residency; the managed cloud has no EU region.
+    firecrawl_api_url: str = "https://api.firecrawl.dev"
+    firecrawl_api_key: str = ""
 
     # LlamaParse (cloud document parsing)
     llama_cloud_api_key: str = ""  # empty = use local unstructured parser
@@ -104,8 +135,16 @@ class ExternalSettings(BaseSettings):
     clickhouse_password: str = ""
 
     # OpenAI
+    # ``openai_model`` is also the *global default* model for any intelligence
+    # task whose per-task override (classifier_model / contextual_model /
+    # funding_model) is empty. Bare model names (no slash) are interpreted
+    # as the ``openai`` provider by the router.
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+    # Set this only when pointing the ``openai`` provider at a custom
+    # endpoint (Azure OpenAI, a self-hosted vLLM, a corporate proxy). Empty
+    # uses the OpenAI SDK's built-in https://api.openai.com/v1.
+    openai_base_url: str = ""
     # Per-request batch cap for OpenAI /v1/embeddings. The API allows up to
     # 2048 inputs (and ~300K tokens) per request; smaller windows keep
     # individual requests bounded. 0 disables splitting.
@@ -121,6 +160,33 @@ class ExternalSettings(BaseSettings):
     classify_max_input_chars: int = 120_000
     funding_max_input_chars: int = 120_000
     contextual_doc_max_chars: int = 60_000
+
+    # ── Per-task model routing ──────────────────────────────────────────
+    # Each intelligence task picks its own model via "<provider>/<model_id>"
+    # (e.g. "openai/gpt-4o-mini", "nebius/Qwen/Qwen2.5-72B-Instruct"). When
+    # empty, falls back to ``openai_model`` above. A bare model name is
+    # interpreted as the ``openai`` provider. See ``llm_router.py`` for the
+    # resolution rules.
+    classifier_model: str = ""
+    contextual_model: str = ""
+    funding_model: str = ""
+
+    # ── Additional OpenAI-compatible providers ──────────────────────────
+    # Built-in providers are pre-wired with public endpoints — set the
+    # corresponding api_key for each one you intend to use. ``base_url`` is
+    # only needed when overriding the default (self-hosted, vLLM, etc.).
+    # Add a new provider by declaring its pair of fields here and the router
+    # will pick them up via getattr.
+    nebius_base_url: str = ""       # default: https://api.studio.nebius.ai/v1
+    nebius_api_key: str = ""
+    together_base_url: str = ""     # default: https://api.together.xyz/v1
+    together_api_key: str = ""
+    groq_base_url: str = ""         # default: https://api.groq.com/openai/v1
+    groq_api_key: str = ""
+    fireworks_base_url: str = ""    # default: https://api.fireworks.ai/inference/v1
+    fireworks_api_key: str = ""
+    deepinfra_base_url: str = ""    # default: https://api.deepinfra.com/v1/openai
+    deepinfra_api_key: str = ""
 
     # TEI — AT-specific embedding endpoint used by POST /api/v1/online/ingest/at.
     # OpenAI-compatible server exposing POST {TEI_EMBED_URL_AT}/v1/embeddings.

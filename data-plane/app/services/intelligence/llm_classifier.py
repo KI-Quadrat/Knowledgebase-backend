@@ -10,6 +10,7 @@ import json
 from openai import AsyncOpenAI, BadRequestError, RateLimitError
 
 from app.config import ext
+from app.services.intelligence import llm_router
 from app.services.intelligence.models import (
     ClassifyResult,
     ContentCategory,
@@ -61,17 +62,26 @@ class LLMClassifier:
 
     def __init__(self) -> None:
         self._client: AsyncOpenAI | None = None
-        self._model = ext.openai_model
+        self._model: str = ext.openai_model
+        self._provider: str = "openai"
 
     def is_available(self) -> bool:
         return self._client is not None
 
     def startup(self) -> None:
-        if not ext.openai_api_key:
-            log.info("llm_classifier_disabled", reason="no OPENAI_API_KEY")
+        try:
+            resolved = llm_router.for_classifier()
+        except llm_router.LLMRouterError as exc:
+            log.info("llm_classifier_disabled", reason=str(exc))
             return
-        self._client = AsyncOpenAI(api_key=ext.openai_api_key)
-        log.info("llm_classifier_started", model=self._model)
+        self._client = llm_router.get_client(resolved)
+        self._model = resolved.model
+        self._provider = resolved.provider
+        log.info(
+            "llm_classifier_started",
+            provider=resolved.provider,
+            model=self._model,
+        )
 
     async def classify(self, content: str, language: str = "de") -> ClassifyResult:
         if not self._client:
@@ -157,3 +167,4 @@ class LLMClassifier:
                     await asyncio.sleep(wait)
         assert last_exc is not None
         raise last_exc
+

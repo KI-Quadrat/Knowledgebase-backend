@@ -17,7 +17,7 @@ class UpdateACLRequest(BaseModel):
         "json_schema_extra": {
             "examples": [
                 {
-                    "collection_name": "wiener-neudorf",
+                    "collection_name": "example-municipality",
                     "source_id": "doc_abc123",
                     "acl": {
                         "allow_groups": ["DOMAIN\\Bauamt-Mitarbeiter", "DOMAIN\\Neue-Gruppe"],
@@ -67,14 +67,14 @@ class DeleteByFilterRequest(BaseModel):
         "json_schema_extra": {
             "examples": [
                 {
-                    "collection_name": "wiener-neudorf",
+                    "collection_name": "example-municipality",
                     "filters": [
                         {"key": "source_type", "value": "smb"},
                         {"key": "acl_department", "value": "bauamt"},
                     ],
                 },
                 {
-                    "collection_name": "wiener-neudorf",
+                    "collection_name": "example-municipality",
                     "filters": [
                         {"key": "classification", "value": "funding"},
                     ],
