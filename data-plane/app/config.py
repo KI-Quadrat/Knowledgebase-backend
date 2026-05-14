@@ -135,8 +135,16 @@ class ExternalSettings(BaseSettings):
     clickhouse_password: str = ""
 
     # OpenAI
+    # ``openai_model`` is also the *global default* model for any intelligence
+    # task whose per-task override (classifier_model / contextual_model /
+    # funding_model) is empty. Bare model names (no slash) are interpreted
+    # as the ``openai`` provider by the router.
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+    # Set this only when pointing the ``openai`` provider at a custom
+    # endpoint (Azure OpenAI, a self-hosted vLLM, a corporate proxy). Empty
+    # uses the OpenAI SDK's built-in https://api.openai.com/v1.
+    openai_base_url: str = ""
     # Per-request batch cap for OpenAI /v1/embeddings. The API allows up to
     # 2048 inputs (and ~300K tokens) per request; smaller windows keep
     # individual requests bounded. 0 disables splitting.
@@ -153,13 +161,32 @@ class ExternalSettings(BaseSettings):
     funding_max_input_chars: int = 120_000
     contextual_doc_max_chars: int = 60_000
 
-    # LiteLLM fallback (self-hosted, OpenAI-compatible). Used by the
-    # classifier, contextual enricher, and funding extractor when the OpenAI
-    # call fails with a rate-limit/connection/5xx error. Empty url or api key
-    # disables the fallback (callers then bubble up the OpenAI error as before).
-    litellm_url: str = ""
-    litellm_api_key: str = ""
-    litellm_fallback_model: str = "nebius/Qwen/Qwen2.5-VL-72B-Instruct"
+    # ── Per-task model routing ──────────────────────────────────────────
+    # Each intelligence task picks its own model via "<provider>/<model_id>"
+    # (e.g. "openai/gpt-4o-mini", "nebius/Qwen/Qwen2.5-72B-Instruct"). When
+    # empty, falls back to ``openai_model`` above. A bare model name is
+    # interpreted as the ``openai`` provider. See ``llm_router.py`` for the
+    # resolution rules.
+    classifier_model: str = ""
+    contextual_model: str = ""
+    funding_model: str = ""
+
+    # ── Additional OpenAI-compatible providers ──────────────────────────
+    # Built-in providers are pre-wired with public endpoints — set the
+    # corresponding api_key for each one you intend to use. ``base_url`` is
+    # only needed when overriding the default (self-hosted, vLLM, etc.).
+    # Add a new provider by declaring its pair of fields here and the router
+    # will pick them up via getattr.
+    nebius_base_url: str = ""       # default: https://api.studio.nebius.ai/v1
+    nebius_api_key: str = ""
+    together_base_url: str = ""     # default: https://api.together.xyz/v1
+    together_api_key: str = ""
+    groq_base_url: str = ""         # default: https://api.groq.com/openai/v1
+    groq_api_key: str = ""
+    fireworks_base_url: str = ""    # default: https://api.fireworks.ai/inference/v1
+    fireworks_api_key: str = ""
+    deepinfra_base_url: str = ""    # default: https://api.deepinfra.com/v1/openai
+    deepinfra_api_key: str = ""
 
     # TEI — AT-specific embedding endpoint used by POST /api/v1/online/ingest/at.
     # OpenAI-compatible server exposing POST {TEI_EMBED_URL_AT}/v1/embeddings.

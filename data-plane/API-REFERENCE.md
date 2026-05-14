@@ -229,8 +229,8 @@ Classify content into 9 categories and extract structured entities. Designed for
 Permission-aware semantic or hybrid search. **No search is ever unfiltered** — every request requires a user context.
 
 **Search modes:**
-- `semantic` (default) — dense-only cosine search via OpenAI `text-embedding-3-small` (1536-dim). Automatically falls back to BGE-Gemma2 via LiteLLM (`dense_bge_gemma2` vector) when OpenAI is unavailable.
-- `hybrid` — dense (OpenAI or BGE-Gemma2 fallback) + sparse (BM25) combined with **Reciprocal Rank Fusion (RRF)**. Requires the collection to have been ingested with `search_mode: hybrid`.
+- `semantic` (default) — dense-only cosine search. Vector field is chosen by the request's `embedding_model`: `dense_openai` (1536-dim, OpenAI `text-embedding-3-small`) or `dense_bge_m3` (1024-dim, BGE-M3 via self-hosted TEI).
+- `hybrid` — dense (`dense_openai` or `dense_bge_m3`) + sparse (BM25) combined with **Reciprocal Rank Fusion (RRF)**. Requires the collection to have been ingested with `search_mode: hybrid`.
 
 **Permission model:**
 - `citizen` → sees only `visibility: "public"` documents
@@ -842,11 +842,11 @@ const response = await fetch("/api/v1/online/document-parse/upload", {
 
 ## `POST /api/v1/online/ingest`
 
-The RAG pipeline endpoint for web content. Takes parsed text and runs: **chunk -> classify -> embed (OpenAI + BGE-Gemma2 via LiteLLM) -> store (Qdrant)**.
+The RAG pipeline endpoint for web content. Takes parsed text and runs: **chunk -> classify -> embed -> store (Qdrant)**. The embedder is chosen by the request's `embedding_model` field: `bge_m3` (default, self-hosted TEI, 1024-dim → `dense_bge_m3`) or `openai` (`text-embedding-3-small`, 1536-dim → `dense_openai`).
 
 Uses `url` instead of `file_path` to identify the source. The `url` is automatically stored as `source_url` in every Qdrant point's metadata.
 
-Every point stores **multi-vector** embeddings: `dense_openai` (primary, 1536-dim) and `dense_bge_gemma2` (fallback, configurable dim via `BGE_GEMMA2_DENSE_DIM`). If one embedder is unavailable during ingest, the point is still stored with the other's vector.
+Each Qdrant point stores the dense vector under the field name matching the chosen embedder (`dense_openai` or `dense_bge_m3`). When `vector_config.search_mode=hybrid`, an additional sparse vector is stored for BM25/RRF fusion at query time.
 
 The collection is **auto-created** if it does not exist, using the specified `vector_config` settings.
 
