@@ -55,14 +55,11 @@ class ScrapeRequest(BaseModel):
     scraper: Literal["crawl4ai", "jina", "firecrawl"] = Field(
         default_factory=_default_scraper,
         description=(
-            "Preferred scraping backend. Defaults to the value of the "
-            "`DEFAULT_SCRAPER` env var (`jina` if unset or invalid). "
+            "Preferred scraping backend (default `jina`, configurable server-side). "
             "`jina` uses the Jina Reader API (Chromium engine). `crawl4ai` "
             "uses the Crawl4AI `POST /md` endpoint. `firecrawl` uses "
-            "Firecrawl's `POST /v2/scrape` (requires `FIRECRAWL_API_KEY`; "
-            "point `FIRECRAWL_API_URL` at a self-hosted instance for EU "
-            "data residency). The other backends (and raw httpx) remain as "
-            "automatic fallbacks if the selected one fails."
+            "Firecrawl's `POST /v2/scrape` (when configured). The other backends "
+            "(and raw httpx) remain as automatic fallbacks if the selected one fails."
         ),
     )
     links_summary: bool = Field(
@@ -90,17 +87,17 @@ class ScrapeRequest(BaseModel):
     model_config = {
         "json_schema_extra": {
             "examples": [
-                {"url": "https://www.wiener-neudorf.gv.at/foerderungen"},
+                {"url": "https://www.example.gv.at/foerderungen"},
                 {
-                    "url": "https://transparenzportal.gv.at/tdb/tp/leistung/1051580.html",
+                    "url": "https://www.example.gv.at/article",
                     "markdown_type": "fit",
                     "exclude_tags": ["nav", "footer", "aside"],
                     "css_selector": "main",
                 },
-                {"url": "https://www.wiener-neudorf.gv.at/foerderungen", "inner_img": True, "inner_docs": True},
-                {"url": "https://www.wiener-neudorf.gv.at/foerderungen", "scraper": "crawl4ai"},
-                {"url": "https://www.wiener-neudorf.gv.at/foerderungen", "scraper": "firecrawl"},
-                {"url": "https://www.wiener-neudorf.gv.at/foerderungen", "links_summary": True},
+                {"url": "https://www.example.gv.at/foerderungen", "inner_img": True, "inner_docs": True},
+                {"url": "https://www.example.gv.at/foerderungen", "scraper": "crawl4ai"},
+                {"url": "https://www.example.gv.at/foerderungen", "scraper": "firecrawl"},
+                {"url": "https://www.example.gv.at/foerderungen", "links_summary": True},
             ]
         }
     }
@@ -171,31 +168,27 @@ class CrawlRequest(BaseModel):
         default_factory=_default_crawler,
         description=(
             "Backend used during BFS `crawl` discovery (ignored when `method='sitemap'`). "
-            "Defaults to the value of the `DEFAULT_CRAWLER` env var (`httpx` if unset or invalid).\n"
+            "Default `httpx`, configurable server-side.\n"
             "- `httpx` — raw HTTP fetches, no JS rendering. Fast and free; "
             "sufficient for sites with server-rendered nav menus (most muni/gov portals).\n"
-            "- `crawl4ai` — server-side BFS via Crawl4AI's `POST /crawl` endpoint with "
-            "`BFSDeepCrawlStrategy`. One round-trip; the server runs the loop. Use for "
-            "deep/large crawls where you want filter chains or relevance pruning. Falls "
-            "back to the Python BFS over httpx if the deep-crawl call fails.\n"
+            "- `crawl4ai` — server-side BFS via Crawl4AI. Use for deep/large crawls. "
+            "Falls back to the Python BFS over httpx if the deep-crawl call fails.\n"
             "- `jina` — per-URL Python BFS through Jina's hosted Chromium engine. "
-            "Expensive (one Jina call per discovered URL) — only pick this when the link "
-            "graph is genuinely JS-injected and httpx misses links.\n"
-            "- `firecrawl` — single-shot URL map via Firecrawl's `POST /v2/map`. "
-            "Returns a flat domain-wide URL list in one round-trip (no `max_depth` — "
-            "ignored on this backend). Requires `FIRECRAWL_API_KEY`. Falls back to "
-            "the Python BFS over httpx if the map call fails."
+            "Expensive — only pick this when the link graph is genuinely JS-injected and "
+            "httpx misses links.\n"
+            "- `firecrawl` — single-shot URL map via Firecrawl (when configured). Falls "
+            "back to the Python BFS over httpx if the map call fails."
         ),
     )
 
     model_config = {
         "json_schema_extra": {
             "examples": [
-                {"url": "https://www.wiener-neudorf.gv.at/sitemap.xml", "method": "sitemap", "max_urls": 500},
-                {"url": "https://www.wiener-neudorf.gv.at", "method": "crawl", "max_depth": 3, "max_urls": 100},
-                {"url": "https://www.wiener-neudorf.gv.at", "method": "crawl", "scraper": "crawl4ai"},
-                {"url": "https://www.wiener-neudorf.gv.at", "method": "crawl", "scraper": "jina"},
-                {"url": "https://www.wiener-neudorf.gv.at", "method": "crawl", "scraper": "firecrawl"},
+                {"url": "https://www.example.gv.at/sitemap.xml", "method": "sitemap", "max_urls": 500},
+                {"url": "https://www.example.gv.at", "method": "crawl", "max_depth": 3, "max_urls": 100},
+                {"url": "https://www.example.gv.at", "method": "crawl", "scraper": "crawl4ai"},
+                {"url": "https://www.example.gv.at", "method": "crawl", "scraper": "jina"},
+                {"url": "https://www.example.gv.at", "method": "crawl", "scraper": "firecrawl"},
             ]
         }
     }

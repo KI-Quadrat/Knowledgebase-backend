@@ -82,7 +82,7 @@ data: <JSON>
 | `started` | `source_id` |
 | `chunked` | `chunks` |
 | `enriched` | `chunks` (may include `error` if contextual enrichment failed — non-fatal). Only emitted when `chunking.strategy = "contextual"`. |
-| `embedded` | `chunks`, `primary_vector` (name of the dense field — `dense_openai` or `dense_bge_m3`), `has_sparse` (true when hybrid mode produced a sparse vector via `sparse.ki2.at`), `duration_ms` |
+| `embedded` | `chunks`, `primary_vector` (name of the dense field — `dense_openai` or `dense_bge_m3`), `has_sparse` (true when hybrid mode produced a sparse vector), `duration_ms` |
 | `funding_extracted` | `fields` — list of metadata keys extracted. Only emitted when `assistant_type = "funding"`. |
 | `stored` | `vectors`, `collection` |
 
@@ -105,15 +105,15 @@ const resp = await fetch("/api/v1/online/ingest/stream", {
   method: "POST",
   headers: {
     "Content-Type": "application/json",
-    "X-API-Key": "your-key",  // only if DP_ONLINE_API_KEYS is configured
+    "X-API-Key": "your-key",  // only when API-key auth is configured
   },
   body: JSON.stringify({
-    collection_name: "wiener-neudorf",
+    collection_name: "example-municipality",
     source_id: "web_foerderungen_001",
     url: "https://example.gv.at/page",
     content: "...",
     content_type: ["funding"],
-    metadata: { assistant_id: "asst_01", municipality_id: "wiener-neudorf" },
+    metadata: { assistant_id: "asst_01", municipality_id: "example-municipality" },
   }),
 });
 
@@ -158,12 +158,12 @@ import json
 import httpx
 
 payload = {
-    "collection_name": "wiener-neudorf",
+    "collection_name": "example-municipality",
     "source_id": "web_foerderungen_001",
     "url": "https://example.gv.at/page",
     "content": "...",
     "content_type": ["funding"],
-    "metadata": {"assistant_id": "asst_01", "municipality_id": "wiener-neudorf"},
+    "metadata": {"assistant_id": "asst_01", "municipality_id": "example-municipality"},
 }
 
 with httpx.Client(timeout=None) as client:
@@ -191,7 +191,7 @@ with httpx.Client(timeout=None) as client:
 curl -N -X POST http://localhost:8000/api/v1/online/ingest/stream \\
   -H "Content-Type: application/json" \\
   -H "X-API-Key: your-key" \\
-  -d '{"collection_name":"wiener-neudorf","source_id":"doc_1","url":"https://example.gv.at","content":"...","content_type":["funding"],"metadata":{"assistant_id":"asst_01","municipality_id":"wiener-neudorf"}}'
+  -d '{"collection_name":"example-municipality","source_id":"doc_1","url":"https://example.gv.at","content":"...","content_type":["funding"],"metadata":{"assistant_id":"asst_01","municipality_id":"example-municipality"}}'
 ```
 
 The `-N` flag (no buffering) is important — without it curl waits for the
@@ -207,7 +207,7 @@ its **idle read timeout** above your worst-case ingest time (e.g. 300 s).
 Heartbeats every 15 s help but aren't enough if the proxy has a hard
 response-time cap.
 
-**Optional X-API-Key header** — required only when `DP_ONLINE_API_KEYS` is configured.
+**Optional X-API-Key header** when API-key auth is configured.
 
 **Error codes** (same as `/online/ingest`): `VALIDATION_EMPTY_CONTENT`, `EMBEDDING_MODEL_NOT_LOADED`, `EMBEDDING_FAILED`, `EMBEDDING_OOM`, `QDRANT_CONNECTION_FAILED`, `QDRANT_COLLECTION_NOT_FOUND`, `QDRANT_UPSERT_FAILED`, `QDRANT_DISK_FULL`.
 """

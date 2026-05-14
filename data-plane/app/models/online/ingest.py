@@ -42,7 +42,7 @@ class OnlineVectorConfig(BaseModel):
     """Configuration for vector storage in Qdrant."""
 
     vector_size: int | None = Field(None, ge=64, le=4096, description="Dimensionality of the dense embedding vector. When omitted, derived from `embedding_model` (1536 for openai, 1024 for bge_m3).")
-    search_mode: SearchMode = Field(SearchMode.semantic, description="'semantic' — dense cosine vector only. 'hybrid' — dense + sparse vector from the TEI sparse endpoint at `SPARSE_EMBED_URL_AT` (sparse.ki2.at) for combined semantic + lexical search.")
+    search_mode: SearchMode = Field(SearchMode.semantic, description="'semantic' — dense cosine vector only. 'hybrid' — dense + sparse vector for combined semantic + lexical search.")
 
 
 class OnlineIngestMetadata(BaseModel):
@@ -96,8 +96,8 @@ class OnlineIngestRequest(BaseModel):
         EmbeddingModel.bge_m3,
         description=(
             "Primary embedder for this ingest. `bge_m3` (default) uses "
-            "BGE-M3 via the TEI endpoint at `TEI_EMBED_URL_AT` (1024-dim, "
-            "stored as `dense_bge_m3`). `openai` uses `text-embedding-3-small` "
+            "BGE-M3 via the configured TEI endpoint (1024-dim, stored as "
+            "`dense_bge_m3`). `openai` uses `text-embedding-3-small` "
             "(1536-dim, stored as `dense_openai`). A collection is tied to "
             "the model it was first ingested with — mixing models in one "
             "collection is not supported."
@@ -117,17 +117,17 @@ class OnlineIngestRequest(BaseModel):
         "json_schema_extra": {
             "examples": [
                 {
-                    "collection_name": "wiener-neudorf",
+                    "collection_name": "example-municipality",
                     "source_id": "web_foerderungen_001",
-                    "url": "https://www.wiener-neudorf.gv.at/foerderungen",
-                    "content": "Förderungen der Gemeinde Wiener Neudorf\n\nDie Gemeinde bietet verschiedene Förderungen...",
+                    "url": "https://www.example.gv.at/foerderungen",
+                    "content": "Förderungen der Gemeinde\n\nDie Gemeinde bietet verschiedene Förderungen...",
                     "content_type": ["funding", "renewable_energy"],
                     "language": "de",
                     "metadata": {
-                        "assistant_id": "asst_wiener_neudorf_01",
-                        "title": "Förderungen - Gemeinde Wiener Neudorf",
+                        "assistant_id": "asst_01",
+                        "title": "Förderungen - Gemeinde",
                         "source_type": "web",
-                        "municipality_id": "wiener-neudorf",
+                        "municipality_id": "example-municipality",
                         "department": ["Bürgerservice", "Förderungen"],
                     },
                     "vector_config": {
@@ -159,9 +159,8 @@ class BatchIngestRequest(BaseModel):
         ...,
         description=(
             "List of ingest requests. Each item is identical in shape to the "
-            "body of `POST /api/v1/online/ingest`. Capped by the "
-            "`DP_MAX_BATCH_INGEST_ITEMS` env var (default 50). Empty list "
-            "returns `VALIDATION_BATCH_EMPTY`."
+            "body of `POST /api/v1/online/ingest`. Capped by a server-side "
+            "maximum. Empty list returns `VALIDATION_BATCH_EMPTY`."
         ),
     )
 

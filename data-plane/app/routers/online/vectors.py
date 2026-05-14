@@ -132,11 +132,11 @@ async def delete_by_filter(
     "/vectors/sparse-encode",
     summary="Encode text into a TEI sparse vector",
     description=(
-        "Proxy the TEI sparse embedding server at `SPARSE_EMBED_URL_AT` "
-        "(sparse.ki2.at) — the same endpoint used during `POST /online/ingest` "
-        "with `search_mode: hybrid` and during hybrid search query encoding. "
-        "Useful when a caller needs to reproduce the exact `sparse` vector that "
-        "ingest would have stored, without going through the full ingest pipeline.\n\n"
+        "Proxy the configured TEI sparse embedding server — the same endpoint "
+        "used during `POST /online/ingest` with `search_mode: hybrid` and during "
+        "hybrid search query encoding. Useful when a caller needs to reproduce "
+        "the exact `sparse` vector that ingest would have stored, without going "
+        "through the full ingest pipeline.\n\n"
         "**Error codes:** `VALIDATION_EMPTY_CONTENT`, `EMBEDDING_MODEL_NOT_LOADED`, "
         "`EMBEDDING_FAILED`"
     ),
