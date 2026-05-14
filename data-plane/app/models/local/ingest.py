@@ -46,7 +46,7 @@ class LocalIngestRequest(BaseModel):
         "json_schema_extra": {
             "examples": [
                 {
-                    "collection_name": "wiener-neudorf",
+                    "collection_name": "example-municipality",
                     "source_id": "doc_abc123",
                     "file_path": "//server/bauamt/bauantraege/antrag_001.pdf",
                     "content": "Bauantrag Nr. 2024-001\nAntragsteller: Max Mustermann\n\nDer Antrag auf Errichtung eines Einfamilienhauses...",
@@ -64,7 +64,7 @@ class LocalIngestRequest(BaseModel):
                         "uploaded_by": "moderator_01",
                         "source_type": "smb",
                         "mime_type": "application/pdf",
-                        "municipality_id": "wiener-neudorf",
+                        "municipality_id": "example-municipality",
                         "department": "bauamt",
                     },
                     "chunking": {

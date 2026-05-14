@@ -16,7 +16,7 @@ class ClassifyRequest(BaseModel):
         "json_schema_extra": {
             "examples": [
                 {
-                    "content": "Das Förderprogramm für erneuerbare Energien gilt ab 01.04.2025. Antragsfrist bis 30.06.2025. Förderhöhe bis EUR 5.000. Kontakt: energie@wiener-neudorf.gv.at, Umweltamt.",
+                    "content": "Das Förderprogramm für erneuerbare Energien gilt ab 01.04.2025. Antragsfrist bis 30.06.2025. Förderhöhe bis EUR 5.000. Kontakt: energie@example.gv.at, Umweltamt.",
                     "language": "de",
                 }
             ]

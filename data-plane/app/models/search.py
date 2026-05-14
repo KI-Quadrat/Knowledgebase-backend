@@ -31,7 +31,7 @@ class SearchRequest(BaseModel):
 
     **Search modes:**
     - `semantic` (default) — dense-only cosine search
-    - `hybrid` — dense + sparse (TEI sparse at `SPARSE_EMBED_URL_AT`) with Reciprocal Rank Fusion (RRF)
+    - `hybrid` — dense + sparse with Reciprocal Rank Fusion (RRF)
 
     ``embedding_model`` must match the model that ingested the collection
     (``openai`` → ``dense_openai`` vector, ``bge_m3`` → ``dense_bge_m3``).
@@ -41,7 +41,7 @@ class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, description="Natural language search query")
     user: UserContext = Field(..., description="User identity for permission filtering (always required)")
     filters: SearchFilters | None = Field(None, description="Optional content filters")
-    search_mode: str = Field("semantic", description="'semantic' (dense cosine only, default) or 'hybrid' (dense + TEI sparse with RRF)")
+    search_mode: str = Field("semantic", description="'semantic' (dense cosine only, default) or 'hybrid' (dense + sparse with RRF)")
     embedding_model: EmbeddingModel = Field(
         EmbeddingModel.openai,
         description=(
@@ -57,11 +57,11 @@ class SearchRequest(BaseModel):
         "json_schema_extra": {
             "examples": [
                 {
-                    "collection_name": "wiener-neudorf",
+                    "collection_name": "example-municipality",
                     "query": "Wann ist die nächste Förderung für Solaranlagen?",
                     "user": {
                         "type": "employee",
-                        "user_id": "maria@wiener-neudorf.gv.at",
+                        "user_id": "user@example.gv.at",
                         "groups": ["DOMAIN\\Bauamt-Mitarbeiter", "DOMAIN\\Alle-Mitarbeiter"],
                         "roles": ["member"],
                         "department": "bauamt",
@@ -72,7 +72,7 @@ class SearchRequest(BaseModel):
                     "score_threshold": 0.5,
                 },
                 {
-                    "collection_name": "wiener-neudorf",
+                    "collection_name": "example-municipality",
                     "query": "Öffnungszeiten Gemeindeamt",
                     "user": {"type": "citizen", "user_id": "anonymous"},
                     "top_k": 5,
