@@ -5,6 +5,7 @@ refusal) is consumed. We mock the underlying HTTP layer rather than
 hitting OpenAI.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -152,12 +153,13 @@ async def test_batch_malformed_json_falls_back(enricher):
 @pytest.mark.asyncio
 async def test_enrich_chunks_prepends_context_to_each_chunk(enricher):
     """End-to-end: one window of 2 chunks → 2 enriched outputs of the form
-    '{context}\\n\\n{original chunk}'."""
+    '{context}\\n\\n{original chunk}'. enrich_chunks also returns a usage
+    record sourced from the OpenAI ``usage`` block."""
     enricher._client.post = AsyncMock(
         return_value=_ok_response(["context for A", "context for B"])
     )
 
-    enriched = await enricher.enrich_chunks(
+    enriched, usage = await enricher.enrich_chunks(
         document="the full document",
         chunks=["chunk A content", "chunk B content"],
     )
@@ -165,4 +167,57 @@ async def test_enrich_chunks_prepends_context_to_each_chunk(enricher):
     assert enriched == [
         "context for A\n\nchunk A content",
         "context for B\n\nchunk B content",
+    ]
+    # The ok-response helper doesn't include a usage block, so the
+    # aggregated usage is None in this minimal test.
+    assert usage is None
+
+
+@pytest.mark.asyncio
+async def test_contextual_chat_calls_are_concurrency_limited():
+    enricher = ContextualEnricher(model="gpt-4o-mini", max_concurrent=2)
+    enricher._api_key = "test-key"
+    enricher._client = MagicMock()
+    active = 0
+    max_active = 0
+
+    async def _slow_post(*_args, **_kwargs):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return _ok_response(["ctx"])
+
+    enricher._client.post = AsyncMock(side_effect=_slow_post)
+
+    results = await asyncio.gather(
+        *(enricher._chat_with_fallback({"model": "gpt-4o-mini"}, "test") for _ in range(5))
+    )
+
+    assert results == ['{"contexts": ["ctx"]}'] * 5
+    assert max_active == 2
+
+
+@pytest.mark.asyncio
+async def test_fallback_window_keeps_other_chunks_when_one_fails(enricher):
+    async def _batch_fails(*_args, **_kwargs):
+        return None
+
+    async def _single_or_fail(_document, chunk, _usage_records):
+        if chunk == "bad":
+            raise RuntimeError("single chunk failed")
+        return f"context for {chunk}\n\n{chunk}"
+
+    with (
+        patch.object(enricher, "_enrich_batch_single_call", AsyncMock(side_effect=_batch_fails)),
+        patch.object(enricher, "_enrich_single", AsyncMock(side_effect=_single_or_fail)),
+    ):
+        enriched, fell_back = await enricher._enrich_window("doc", ["good", "bad", "other"], [])
+
+    assert fell_back is True
+    assert enriched == [
+        "context for good\n\ngood",
+        "bad",
+        "context for other\n\nother",
     ]

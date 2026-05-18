@@ -62,6 +62,8 @@ def client(mock_ingest):
     app.state.ingest = MagicMock()
     app.state.search = MagicMock()
     app.state.scraping = MagicMock()
+    # Stream router persists usage to ClickHouse via scraping.audit.
+    app.state.scraping.audit.log_usage = AsyncMock()
     app.state.sitemap_parser = MagicMock()
     app.state.parser = MagicMock()
     app.state.embedder = MagicMock()

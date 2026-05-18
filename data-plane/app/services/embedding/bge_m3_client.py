@@ -5,6 +5,7 @@ import time
 import httpx
 
 from app.config import ext
+from app.models.common import StageUsage
 from app.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -34,6 +35,11 @@ class BGEM3Client:
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
         self._base_url = ext.bge_m3_url.rstrip("/")
+        # ``last_usage`` is set after every ``embed_batch`` call so callers
+        # (IngestService) can attribute embedding cost without a method
+        # signature change. Self-hosted → always $0; the field is kept for
+        # contract parity with ``OpenAIEmbedClient.last_usage``.
+        self.last_usage: StageUsage | None = None
 
     async def startup(self) -> None:
         self._client = httpx.AsyncClient(
@@ -82,6 +88,9 @@ class BGEM3Client:
             count=len(texts),
             duration_ms=duration,
             windows=(len(texts) + max_batch - 1) // max_batch,
+        )
+        self.last_usage = StageUsage(
+            stage="embedding", provider="bge_m3", model="bge-m3", cost_usd=0.0
         )
         return results
 

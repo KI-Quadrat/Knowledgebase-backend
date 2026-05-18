@@ -7,6 +7,8 @@ import httpx
 from bs4 import BeautifulSoup
 
 from app.config import ext, settings
+from app.models.common import StageUsage
+from app.services import cost
 from app.services.metrics import mark_crawl4ai
 from app.utils.content import clean_html, clean_markdown
 from app.utils.logger import get_logger
@@ -41,6 +43,7 @@ class CrawlResult:
         error: str | None = None,
         duration_ms: int = 0,
         scraper_used: str | None = None,
+        usage: StageUsage | None = None,
     ):
         self.markdown = markdown
         self.html = html
@@ -63,6 +66,11 @@ class CrawlResult:
         # Which backend actually produced the markdown — set per-branch in
         # ``crawl()`` after a backend succeeds. ``None`` on failed results.
         self.scraper_used = scraper_used
+        # Per-call billing record. Populated by each backend branch from the
+        # provider's own response (Jina ``meta.usage.tokens``, Firecrawl
+        # ``creditsUsed``). Self-hosted / httpx leave this as a zero entry so
+        # the schema is uniform.
+        self.usage = usage
 
 
 class Crawl4AIClient:
@@ -154,6 +162,9 @@ class Crawl4AIClient:
                     result.duration_ms = int((time.monotonic() - start) * 1000)
                     if result.success:
                         result.scraper_used = "crawl4ai"
+                        # Self-hosted — zero-cost usage entry so the response
+                        # schema stays uniform with billed backends.
+                        result.usage = StageUsage(stage="scraper", provider="crawl4ai", cost_usd=0.0)
                         mark_crawl4ai("success", time.monotonic() - start)
                         return result
                     log.warning("crawl4ai_failed_falling_back", url=url, error=result.error)
@@ -213,6 +224,7 @@ class Crawl4AIClient:
         result.duration_ms = int((time.monotonic() - start) * 1000)
         if result.success:
             result.scraper_used = "httpx"
+            result.usage = StageUsage(stage="scraper", provider="httpx", cost_usd=0.0)
         return result
 
     async def _crawl_via_api(
@@ -486,6 +498,16 @@ class Crawl4AIClient:
             return CrawlResult(success=False, error="Jina returned empty content")
 
         markdown = clean_markdown(content)
+        # Jina returns ``meta.usage.tokens`` on every successful read. Newer
+        # responses surface it at top level; some older / proxy variants
+        # nest it under ``data.usage``. Try both before giving up.
+        tokens = _extract_jina_tokens(data, data_section)
+        usage = StageUsage(
+            stage="scraper",
+            provider="jina",
+            scrape_tokens=tokens,
+            cost_usd=cost.jina_cost(tokens),
+        )
         return CrawlResult(
             markdown=markdown,
             html="",
@@ -493,6 +515,7 @@ class Crawl4AIClient:
             links=links,
             images=images,
             success=True,
+            usage=usage,
         )
 
     async def _scrape_with_firecrawl(
@@ -574,12 +597,20 @@ class Crawl4AIClient:
                         seen.add(candidate)
                         links.append(candidate)
 
+        credits = _extract_firecrawl_credits(data, result_data)
+        usage = StageUsage(
+            stage="scraper",
+            provider="firecrawl",
+            credits=credits,
+            cost_usd=cost.firecrawl_cost(credits),
+        )
         return CrawlResult(
             markdown=clean_markdown(markdown),
             html=html_value,
             title=title,
             links=links,
             success=True,
+            usage=usage,
         )
 
     async def _map_with_firecrawl(
@@ -589,17 +620,19 @@ class Crawl4AIClient:
         max_pages: int,
         same_domain_only: bool,
         timeout: int,
-    ) -> tuple[bool, list[str], list[dict], str | None]:
+    ) -> tuple[bool, list[str], list[dict], str | None, StageUsage | None]:
         """Discover URLs via Firecrawl's ``POST /v2/map``.
 
-        Returns the same ``(success, visited, links, error)`` tuple shape as
-        ``deep_crawl``. Firecrawl's map endpoint returns a flat URL list in a
-        single round-trip — we treat that list as both the visited set and the
-        source of ``discovered_links``, so the caller's downstream
+        Returns ``(success, visited, links, error, usage)``. ``usage``
+        captures the credits billed by Firecrawl for the map call (one
+        credit per URL returned on standard plans). Firecrawl's map
+        endpoint returns a flat URL list in a single round-trip — we treat
+        that list as both the visited set and the source of
+        ``discovered_links``, so the caller's downstream
         ``split_documents_and_links`` still partitions pages from documents.
         """
         if not self._firecrawl_key:
-            return False, [], [], "Firecrawl API key not configured"
+            return False, [], [], "Firecrawl API key not configured", None
 
         payload: dict = {
             "url": url,
@@ -620,14 +653,14 @@ class Crawl4AIClient:
             resp.raise_for_status()
             data = resp.json()
         except httpx.TimeoutException:
-            return False, [], [], f"Firecrawl map timeout after {timeout}s"
+            return False, [], [], f"Firecrawl map timeout after {timeout}s", None
         except httpx.HTTPStatusError as exc:
-            return False, [], [], f"Firecrawl map HTTP {exc.response.status_code}"
+            return False, [], [], f"Firecrawl map HTTP {exc.response.status_code}", None
         except Exception as exc:
-            return False, [], [], f"Firecrawl map error: {exc}"
+            return False, [], [], f"Firecrawl map error: {exc}", None
 
         if not data.get("success", True):
-            return False, [], [], str(data.get("error") or "Firecrawl map success=false")
+            return False, [], [], str(data.get("error") or "Firecrawl map success=false"), None
 
         raw_links = data.get("links") or []
         root_domain = urlparse(url).netloc.lower()
@@ -662,7 +695,19 @@ class Crawl4AIClient:
                 seen_links.add(absolute)
                 discovered.append({"href": absolute, "text": text})
 
-        return True, visited, discovered, None
+        # Firecrawl bills its map endpoint per URL returned. Some plans
+        # report ``creditsUsed`` explicitly; fall back to ``len(visited)`` so
+        # the count is at least directionally correct when missing.
+        credits = _extract_firecrawl_credits(data, None)
+        if credits == 0 and visited:
+            credits = float(len(visited))
+        usage = StageUsage(
+            stage="links_map",
+            provider="firecrawl",
+            credits=credits,
+            cost_usd=cost.firecrawl_cost(credits),
+        )
+        return True, visited, discovered, None, usage
 
     async def _scrape_with_httpx(
         self,
@@ -778,6 +823,50 @@ def _extract_error(result_data: dict) -> str | None:
         if isinstance(value, str) and value:
             return value
     return None
+
+
+def _extract_jina_tokens(data: dict, data_section: dict) -> int:
+    """Pull Jina's token usage off the response.
+
+    Jina docs surface it at ``meta.usage.tokens`` (top level); some older
+    builds nest it under ``data.usage.tokens``. Try both, default to 0.
+    """
+    for container in (data.get("meta"), data_section.get("meta"), data, data_section):
+        if not isinstance(container, dict):
+            continue
+        usage = container.get("usage")
+        if isinstance(usage, dict):
+            tokens = usage.get("tokens")
+            if isinstance(tokens, (int, float)) and tokens > 0:
+                return int(tokens)
+    return 0
+
+
+def _extract_firecrawl_credits(data: dict, result_data: dict | None) -> float:
+    """Pull Firecrawl's ``creditsUsed`` off the response.
+
+    The v2 scrape envelope reports it on the top-level response or under
+    ``data.metadata.creditsUsed``; the v2 map endpoint reports it on the
+    top level when present. Returns 0.0 when the field is absent — the
+    caller can fall back to a heuristic (e.g. ``len(visited)`` for map).
+    """
+    candidates: list[dict] = []
+    if isinstance(data, dict):
+        candidates.append(data)
+        metadata = data.get("metadata")
+        if isinstance(metadata, dict):
+            candidates.append(metadata)
+    if isinstance(result_data, dict):
+        candidates.append(result_data)
+        result_meta = result_data.get("metadata")
+        if isinstance(result_meta, dict):
+            candidates.append(result_meta)
+    for container in candidates:
+        for key in ("creditsUsed", "credits_used", "credits"):
+            value = container.get(key)
+            if isinstance(value, (int, float)) and value > 0:
+                return float(value)
+    return 0.0
 
 
 def _extract_jina_links(data: dict, base_url: str) -> list[str]:

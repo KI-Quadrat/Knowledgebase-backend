@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 
 from app.config import ext
 from app.models.classify import ExtractedEntities
+from app.models.common import UsageSummary
 
 
 _VALID_SCRAPERS: set[str] = {"crawl4ai", "jina", "firecrawl"}
@@ -73,6 +74,13 @@ class ScrapeRequest(BaseModel):
             "Triggers one extra raw-HTML fetch (~small)."
         ),
     )
+    classify: bool = Field(
+        True,
+        description=(
+            "If true, run content classification and entity extraction after scraping. "
+            "Set false to return only scraped content and skip the LLM classifier."
+        ),
+    )
     bypass_cache: bool = Field(
         False,
         description=(
@@ -98,6 +106,7 @@ class ScrapeRequest(BaseModel):
                 {"url": "https://www.example.gv.at/foerderungen", "scraper": "crawl4ai"},
                 {"url": "https://www.example.gv.at/foerderungen", "scraper": "firecrawl"},
                 {"url": "https://www.example.gv.at/foerderungen", "links_summary": True},
+                {"url": "https://www.example.gv.at/foerderungen", "classify": False},
             ]
         }
     }
@@ -149,12 +158,24 @@ class ScrapeData(BaseModel):
     language: str | None = Field(None, description="Detected language (ISO 639-1 code, e.g. 'de')")
     links_found: int = Field(0, description="Number of links discovered on the page")
     last_modified: str | None = Field(None, description="Last-Modified header value if present")
-    content_type: list[str] = Field(default_factory=list, description="Classifier-derived content categories for the page (e.g. ['funding', 'renewable_energy']). Pass this verbatim to /online/ingest.")
-    entities: ExtractedEntities | None = Field(None, description="Structured entities extracted by the classifier (dates, deadlines, amounts, contacts, departments). Null when classification failed.")
+    content_type: list[str] = Field(default_factory=list, description="Classifier-derived content categories for the page (e.g. ['funding', 'renewable_energy']). Empty when the request uses classify=false. Pass this verbatim to /online/ingest only when classification was enabled.")
+    entities: ExtractedEntities | None = Field(None, description="Structured entities extracted by the classifier (dates, deadlines, amounts, contacts, departments). Null when classification failed or the request uses classify=false.")
     inner_images: list[InnerImageData] | None = Field(None, description="Parsed images found on the page (only when inner_img=true)")
     inner_documents: list[InnerDocData] | None = Field(None, description="Parsed documents linked on the page (only when inner_docs=true)")
     links_summary: LinksSummary | None = Field(None, description="Deduped URL lists grouped by kind (only when links_summary=true)")
     scraper_used: str | None = Field(None, description="Backend that produced the content: 'crawl4ai', 'jina', 'firecrawl', or 'httpx' (final fallback). Null on failure or cache hits with no recorded backend.")
+    usage: UsageSummary | None = Field(
+        None,
+        description=(
+            "Per-stage billing for this scrape. ``by_stage`` carries one "
+            "entry per external call (`scraper`, `classifier`, optional "
+            "`inner_img` / `inner_docs`). For Jina the scraper entry "
+            "reports ``scrape_tokens`` from ``meta.usage.tokens``; for "
+            "Firecrawl it reports ``credits``; Crawl4AI and httpx are "
+            "self-hosted so ``cost_usd`` is 0. Cache hits report a "
+            "``cache`` provider with 0 cost."
+        ),
+    )
 
 
 class CrawlRequest(BaseModel):
@@ -221,5 +242,15 @@ class CrawlData(BaseModel):
             "`scraper` value when every BFS hit was a legacy cache entry "
             "without a recorded backend. Null for `method='sitemap'` (no "
             "scraping involved) or when no pages were discovered at all."
+        ),
+    )
+    usage: UsageSummary | None = Field(
+        None,
+        description=(
+            "Aggregated scrape usage across the BFS. The Python BFS path "
+            "sums per-page Jina tokens / Firecrawl credits / $0 entries "
+            "into a single ``scraper`` row; the Crawl4AI server-side BFS "
+            "and Firecrawl ``/v2/map`` paths report one row for the single "
+            "API call. Null for `method='sitemap'` (no scraping involved)."
         ),
     )

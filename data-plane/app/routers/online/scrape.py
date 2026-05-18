@@ -8,8 +8,9 @@ import asyncio
 import httpx
 from fastapi import APIRouter, Request
 
+from app.config import settings
 from app.models.classify import ExtractedEntities as ClassifyEntities
-from app.models.common import ErrorCode, ResponseEnvelope
+from app.models.common import ErrorCode, ResponseEnvelope, StageUsage, UsageSummary
 from app.models.online.scrape import (
     CrawlData,
     CrawlRequest,
@@ -20,6 +21,7 @@ from app.models.online.scrape import (
     ScrapeData,
     ScrapeRequest,
 )
+from app.services import cost
 from app.services.parsing.models import ParseStatus
 from app.services.scraping.document_discovery import (
     DiscoveredImage,
@@ -143,6 +145,9 @@ def _is_thin_output(markdown: str | None, html: str | None) -> bool:
         "`links_summary.documents` is populated only when `inner_docs=true`; "
         "`links_summary.images` is populated only when `inner_img=true`. "
         "Triggers one extra lightweight raw-HTML fetch. |\n"
+        "| `classify` | boolean | Optional | `true` | If true, runs the LLM classifier after scraping "
+        "and returns `content_type`, `entities`, and classifier usage. Set `false` to skip that extra "
+        "LLM call; the response then returns `content_type: []` and `entities: null`. |\n"
         "| `bypass_cache` | boolean | Optional | `false` | If true, skip the Redis cache and force a "
         "fresh origin fetch (cache is then updated with the new content). `links_summary`, "
         "`inner_img`, and `inner_docs` already imply a fresh fetch. |\n\n"
@@ -168,6 +173,10 @@ def _is_thin_output(markdown: str | None, html: str | None) -> bool:
         "**Force the Crawl4AI `/md` backend as primary:**\n"
         "```json\n"
         "{ \"url\": \"https://example.com/article\", \"scraper\": \"crawl4ai\" }\n"
+        "```\n\n"
+        "**Skip classification to reduce latency/cost:**\n"
+        "```json\n"
+        "{ \"url\": \"https://example.com/article\", \"classify\": false }\n"
         "```\n\n"
         "---\n\n"
         "## Content filtering tips\n\n"
@@ -347,12 +356,52 @@ async def scrape(body: ScrapeRequest, request: Request) -> ResponseEnvelope[Scra
                 include_images=body.inner_img,
             )
 
-    # ── Classify scraped content ──
-    content_type, entities = await _classify_content(
-        request.app.state.classifier,
-        content,
-        language=result.metadata.language,
-        source_url=result.url,
+    # ── Classify scraped content, unless the caller only wants extraction ──
+    content_type: list[str] = []
+    entities: ClassifyEntities | None = None
+    classify_usage: StageUsage | None = None
+    if body.classify:
+        content_type, entities, classify_usage = await _classify_content(
+            request.app.state.classifier,
+            content,
+            language=result.metadata.language,
+            source_url=result.url,
+        )
+
+    # ── Build per-stage billing summary ──
+    # Each stage contributes one StageUsage: scraper (Jina tokens, Firecrawl
+    # credits, $0 for self-hosted / cache), classifier (OpenAI tokens),
+    # plus per-page LlamaParse cost for inner_img / inner_docs.
+    usage_entries: list[StageUsage] = []
+    if result.usage is not None:
+        usage_entries.append(result.usage)
+    if classify_usage is not None:
+        usage_entries.append(classify_usage)
+    parser_uses_llama = bool(getattr(request.app.state.parser, "_use_llama", False))
+    if inner_images and parser_uses_llama:
+        pages = sum(1 for img in inner_images if img.content)
+        usage_entries.append(StageUsage(
+            stage="inner_img",
+            provider="llamaparse",
+            pages=pages,
+            cost_usd=cost.llamaparse_cost(pages),
+        ))
+    if inner_documents and parser_uses_llama:
+        pages = sum(doc.pages or 0 for doc in inner_documents)
+        usage_entries.append(StageUsage(
+            stage="inner_docs",
+            provider="llamaparse",
+            pages=pages,
+            cost_usd=cost.llamaparse_cost(pages),
+        ))
+    usage = UsageSummary.from_entries(usage_entries) if usage_entries else None
+
+    # ── Persist usage to ClickHouse (best-effort, swallowed on failure) ──
+    await scraper.audit.log_usage(
+        usage_entries,
+        endpoint="scrape",
+        request_id=request_id,
+        url=result.url,
     )
 
     return ResponseEnvelope(
@@ -371,6 +420,7 @@ async def scrape(body: ScrapeRequest, request: Request) -> ResponseEnvelope[Scra
             inner_documents=inner_documents,
             links_summary=links_summary,
             scraper_used=result.scraper_used,
+            usage=usage,
         ),
         request_id=request_id,
     )
@@ -528,7 +578,7 @@ async def crawl(body: CrawlRequest, request: Request) -> ResponseEnvelope[CrawlD
         )
 
     # method == "crawl" — BFS discovery
-    pages, docs, scraper_used = await scraper.discover_urls(
+    pages, docs, scraper_used, usage = await scraper.discover_urls(
         body.url,
         max_depth=body.max_depth,
         max_pages=body.max_urls,
@@ -539,6 +589,13 @@ async def crawl(body: CrawlRequest, request: Request) -> ResponseEnvelope[CrawlD
     crawl_urls = [CrawlUrl(url=u, type="page", last_modified=None) for u in pages]
     crawl_urls += [CrawlUrl(url=d.url, type="document", last_modified=None) for d in docs]
 
+    await scraper.audit.log_usage(
+        usage.by_stage.values() if usage else [],
+        endpoint="crawl",
+        request_id=request_id,
+        url=body.url,
+    )
+
     return ResponseEnvelope(
         success=True,
         data=CrawlData(
@@ -547,6 +604,7 @@ async def crawl(body: CrawlRequest, request: Request) -> ResponseEnvelope[CrawlD
             urls=crawl_urls,
             total_urls=len(crawl_urls),
             scraper_used=scraper_used,
+            usage=usage,
         ),
         request_id=request_id,
     )
@@ -555,11 +613,15 @@ async def crawl(body: CrawlRequest, request: Request) -> ResponseEnvelope[CrawlD
 async def _parse_inner_images(
     parser, images: list, request_id: str
 ) -> list[InnerImageData]:
-    """Parse each discovered image URL via the ParserService (LlamaParse OCR) concurrently."""
+    """Parse each discovered image URL via the ParserService (LlamaParse OCR)."""
+    semaphore = asyncio.Semaphore(max(1, settings.inner_parse_concurrency))
 
     async def _parse_one(img) -> InnerImageData:
         try:
-            parse_result = await parser.parse_from_url(img.url)
+            async with semaphore:
+                parse_result = await _parse_url_with_rate_limit_retry(
+                    parser, img.url, kind="inner_img",
+                )
             if parse_result.status == ParseStatus.SUCCESS and parse_result.text:
                 return InnerImageData(
                     url=img.url,
@@ -591,11 +653,15 @@ async def _parse_inner_images(
 async def _parse_inner_documents(
     parser, documents: list, request_id: str
 ) -> list[InnerDocData]:
-    """Parse each discovered document URL via the ParserService concurrently."""
+    """Parse each discovered document URL via the ParserService."""
+    semaphore = asyncio.Semaphore(max(1, settings.inner_parse_concurrency))
 
     async def _parse_one(doc) -> InnerDocData:
         try:
-            parse_result = await parser.parse_from_url(doc.url)
+            async with semaphore:
+                parse_result = await _parse_url_with_rate_limit_retry(
+                    parser, doc.url, kind="inner_doc",
+                )
             if parse_result.status == ParseStatus.SUCCESS:
                 return InnerDocData(
                     url=doc.url,
@@ -626,19 +692,70 @@ async def _parse_inner_documents(
     return list(results)
 
 
+async def _parse_url_with_rate_limit_retry(parser, url: str, *, kind: str):
+    """Parse a URL, retrying once when the parser/provider reports a rate limit."""
+    try:
+        result = await parser.parse_from_url(url)
+    except Exception as exc:
+        if not _is_rate_limit_error(exc):
+            raise
+        log.warning(f"{kind}_parse_rate_limited_retrying", url=url, error=str(exc))
+        if settings.inner_parse_rate_limit_retry_delay > 0:
+            await asyncio.sleep(settings.inner_parse_rate_limit_retry_delay)
+        return await parser.parse_from_url(url)
+
+    if _is_rate_limited_parse_result(result):
+        log.warning(f"{kind}_parse_rate_limited_retrying", url=url, error=result.error)
+        if settings.inner_parse_rate_limit_retry_delay > 0:
+            await asyncio.sleep(settings.inner_parse_rate_limit_retry_delay)
+        return await parser.parse_from_url(url)
+
+    return result
+
+
+def _is_rate_limited_parse_result(result) -> bool:
+    return (
+        getattr(result, "status", None) == ParseStatus.FAILED
+        and _looks_rate_limited(getattr(result, "error", None))
+    )
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) == 429:
+        return True
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 429:
+        return True
+    return _looks_rate_limited(str(exc))
+
+
+def _looks_rate_limited(value: str | None) -> bool:
+    text = (value or "").lower()
+    return (
+        "429" in text
+        or "rate limit" in text
+        or "rate_limit" in text
+        or "too many requests" in text
+        or "quota" in text
+    )
+
+
 async def _classify_content(
     classifier, content: str, language: str | None, source_url: str
-) -> tuple[list[str], ClassifyEntities | None]:
-    """Run the classifier over content and return (content_type, entities).
+) -> tuple[list[str], ClassifyEntities | None, StageUsage | None]:
+    """Run the classifier over content and return (content_type, entities, usage).
 
-    Failures are logged and degraded to (['general'], None) — classification
-    is informational on scrape/parse, so it should not fail the request.
+    Failures are logged and degraded to (['general'], None, None) —
+    classification is informational on scrape/parse, so it should not fail
+    the request. The usage record is forwarded so the response surfaces
+    classifier token spend alongside scraper usage.
     """
     try:
         result = await classifier.classify(content, language=language or "de")
     except Exception as exc:
         log.warning("classify_after_scrape_failed", url=source_url, error=str(exc))
-        return (["general"], None)
+        return (["general"], None, None)
 
     content_type = [result.category.value] + result.sub_categories
     entities = ClassifyEntities(
@@ -648,7 +765,7 @@ async def _classify_content(
         contacts=result.entities.contacts,
         departments=result.entities.departments,
     )
-    return (content_type, entities)
+    return (content_type, entities, getattr(result, "usage", None))
 
 
 def _map_scrape_error(status: str, error_msg: str | None) -> str:
