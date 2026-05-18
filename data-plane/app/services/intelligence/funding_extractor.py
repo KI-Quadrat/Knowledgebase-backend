@@ -16,10 +16,19 @@ from datetime import datetime, timezone
 from openai import AsyncOpenAI, BadRequestError, RateLimitError
 
 from app.config import ext
+from app.models.common import StageUsage
+from app.services import cost
 from app.services.intelligence import llm_router
 from app.utils.logger import get_logger
 
 log = get_logger(__name__)
+
+# Sentinel key the extractor adds to its result dict to ship the per-call
+# usage record back to the caller (the funding result otherwise becomes
+# Qdrant payload, so an unprefixed ``usage`` key would conflict with real
+# document metadata). ``IngestService.ingest`` pops this key before
+# merging the rest into the stored payload.
+_KEY_USAGE = "__usage__"
 
 # ---------------------------------------------------------------------------
 # Official first-level administrative divisions per country.
@@ -591,15 +600,42 @@ class FundingExtractor:
             "scraped_at": scraped_at,
         }
 
+        usage_obj = response.usage
+        prompt_tokens = getattr(usage_obj, "prompt_tokens", 0) if usage_obj else 0
+        completion_tokens = getattr(usage_obj, "completion_tokens", 0) if usage_obj else 0
+        cached_tokens = 0
+        details = getattr(usage_obj, "prompt_tokens_details", None) if usage_obj else None
+        if details is not None:
+            cached_tokens = getattr(details, "cached_tokens", 0) or 0
+
         log.info(
             "funding_metadata_extracted",
             title=result["title"][:80],
             country=result["country_code"],
             states=result["state_or_province"],
             status=result["status"],
-            tokens_used=response.usage.total_tokens if response.usage else 0,
+            tokens_used=getattr(usage_obj, "total_tokens", 0) if usage_obj else 0,
         )
 
+        # Stash usage on the result dict under a sentinel key so the caller
+        # (``ingest_online`` via ``_safe_extract_funding``) can lift it out
+        # before merging the rest into Qdrant metadata. ``_KEY_USAGE`` is
+        # filtered by ``IngestService.ingest`` so it never lands in the
+        # stored payload.
+        result[_KEY_USAGE] = StageUsage(
+            stage="funding",
+            provider=self._provider,
+            model=self._model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cached_tokens=cached_tokens,
+            cost_usd=cost.chat_cost(
+                self._provider, self._model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cached_tokens=cached_tokens,
+            ),
+        )
         return result
 
     async def _chat_with_rate_limit_retry(self, system_prompt: str, user_content: str):

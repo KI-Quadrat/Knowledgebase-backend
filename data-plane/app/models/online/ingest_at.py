@@ -11,6 +11,7 @@ fallback) on first use to match the TEI embedding model behind
 from pydantic import BaseModel, Field
 
 from app.models.classify import ExtractedEntities
+from app.models.common import UsageSummary
 from app.models.online.ingest import EmbeddingModel, OnlineChunkingConfig, OnlineIngestMetadata
 
 
@@ -89,3 +90,13 @@ class OnlineIngestATData(BaseModel):
     content_type: list[str] = Field(..., description="Content categories passed through from the request.")
     embedding_time_ms: int = Field(..., description="Time spent on embedding (ms).")
     total_time_ms: int = Field(..., description="Total pipeline duration (ms).")
+    usage: UsageSummary | None = Field(
+        None,
+        description=(
+            "Per-stage billing for this AT ingest. Always carries the "
+            "funding extractor's OpenAI tokens; carries contextual "
+            "enrichment tokens when `chunking.strategy='contextual'`; "
+            "carries embedding tokens when `embedding_model='openai'` "
+            "($0 self-hosted otherwise)."
+        ),
+    )

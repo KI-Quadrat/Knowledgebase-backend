@@ -338,6 +338,20 @@ async def ingest_online_stream(body: OnlineIngestRequest, request: Request) -> S
                 yield _format_sse("error", {"code": code_str, "detail": str(e)})
                 return
 
+            # Audit usage as soon as the pipeline completes so ClickHouse
+            # has a row even if the client tears down the SSE stream right
+            # after the ``completed`` event. Reuses the scraper's audit
+            # client (same lifecycle as the rest of the audit pipeline).
+            await request.app.state.scraping.audit.log_usage(
+                result.usage.by_stage.values(),
+                endpoint="ingest_stream",
+                request_id=request_id,
+                url=body.url,
+                municipality_id=body.metadata.municipality_id or "",
+                assistant_id=body.metadata.assistant_id or "",
+                assistant_type=body.assistant_type or "",
+            )
+
             yield _format_sse(
                 "completed",
                 {
@@ -348,6 +362,7 @@ async def ingest_online_stream(body: OnlineIngestRequest, request: Request) -> S
                     "content_type": result.classification,
                     "embedding_time_ms": result.embedding_time_ms,
                     "total_time_ms": result.total_time_ms,
+                    "usage": result.usage.model_dump(),
                 },
             )
 

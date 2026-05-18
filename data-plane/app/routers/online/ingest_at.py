@@ -40,7 +40,7 @@ import time
 
 from fastapi import APIRouter, Request
 
-from app.models.common import ErrorCode, ResponseEnvelope
+from app.models.common import ErrorCode, ResponseEnvelope, StageUsage, UsageSummary
 from app.models.online.ingest import EmbeddingModel
 from app.models.online.ingest_at import OnlineIngestATData, OnlineIngestATRequest
 from app.services.embedding.bge_m3_client import EmbeddingError
@@ -254,6 +254,11 @@ async def ingest_online_at(
         embedder = request.app.state.tei_embedder_at
         dense_dim = 1024
 
+    # Per-stage usage collected as the hand-rolled pipeline runs; rolled
+    # into the response envelope's ``usage`` summary at the end. Mirrors
+    # what IngestService.ingest() does for the standard /online/ingest path.
+    usage_entries: list[StageUsage] = []
+
     # ── 1. Funding extraction (once) ──
     extracted = await _safe_extract_funding(
         extractor,
@@ -261,6 +266,11 @@ async def ingest_online_at(
         source_url=body.url,
         source_id=body.source_id,
     )
+    # Funding extractor stashes its StageUsage under ``__usage__`` so the
+    # caller can lift it out before merging the rest into Qdrant metadata.
+    funding_usage = extracted.pop("__usage__", None) if isinstance(extracted, dict) else None
+    if isinstance(funding_usage, StageUsage):
+        usage_entries.append(funding_usage)
 
     # ── 2. Chunk (+ optional contextual enrichment) ──
     chunking = body.chunking
@@ -285,7 +295,9 @@ async def ingest_online_at(
     chunks = chunk_result.chunks
     if use_contextual and contextual_enricher:
         try:
-            chunks = await contextual_enricher.enrich_chunks(document=body.content, chunks=chunks)
+            chunks, ctx_usage = await contextual_enricher.enrich_chunks(document=body.content, chunks=chunks)
+            if ctx_usage is not None:
+                usage_entries.append(ctx_usage)
         except Exception as e:
             log.warning("ingest_online_at_contextual_failed", source_id=body.source_id, error=str(e))
 
@@ -293,6 +305,12 @@ async def ingest_online_at(
     embed_start = time.monotonic()
     try:
         embeddings = await embedder.embed_batch(chunks)
+        embed_usage = getattr(embedder, "last_usage", None)
+        # isinstance gates out MagicMock / test stubs that don't actually
+        # implement the contract; production clients set this to a real
+        # StageUsage in ``embed_batch``.
+        if isinstance(embed_usage, StageUsage):
+            usage_entries.append(embed_usage)
     except EmbeddingError as e:
         msg = str(e).lower()
         if "oom" in msg or "memory" in msg:
@@ -397,6 +415,16 @@ async def ingest_online_at(
         total_ms=total_ms,
     )
 
+    await request.app.state.scraping.audit.log_usage(
+        usage_entries,
+        endpoint="ingest_at",
+        request_id=request_id,
+        url=body.url,
+        municipality_id=body.metadata.municipality_id or "",
+        assistant_id=body.metadata.assistant_id or "",
+        assistant_type=_AT_ASSISTANT_TYPE,
+    )
+
     return ResponseEnvelope(
         success=True,
         data=OnlineIngestATData(
@@ -407,6 +435,7 @@ async def ingest_online_at(
             content_type=body.content_type,
             embedding_time_ms=embedding_time_ms,
             total_time_ms=total_ms,
+            usage=UsageSummary.from_entries(usage_entries),
         ),
         request_id=request_id,
     )

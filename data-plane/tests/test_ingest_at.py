@@ -186,7 +186,12 @@ def _install(*, extract_return: dict | None = None, embed_dim: int = 1024):
     app.state.chunker = chunker
 
     enricher = MagicMock()
-    enricher.enrich_chunks = AsyncMock(side_effect=lambda document, chunks: list(chunks))
+    # enrich_chunks now returns (enriched_chunks, usage). Tests don't care
+    # about usage so pass None — the AT router treats None as "no contextual
+    # spend this call" and skips that stage in its UsageSummary.
+    enricher.enrich_chunks = AsyncMock(
+        side_effect=lambda document, chunks: (list(chunks), None)
+    )
     app.state.contextual_enricher = enricher
 
     embedder = MagicMock()
@@ -202,6 +207,12 @@ def _install(*, extract_return: dict | None = None, embed_dim: int = 1024):
     qdrant.delete_by_filter = AsyncMock(return_value=0)
     qdrant.upsert_points = AsyncMock(side_effect=lambda _col, points: len(points))
     app.state.qdrant_at = qdrant
+
+    # AT router persists usage to ClickHouse via scraping.audit. Tests
+    # mock the whole scraping service away, so swap the one awaited method.
+    scraping = MagicMock()
+    scraping.audit.log_usage = AsyncMock()
+    app.state.scraping = scraping
 
     return {"chunker": chunker, "embedder": embedder, "extractor": extractor, "qdrant": qdrant}
 

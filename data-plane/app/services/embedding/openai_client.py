@@ -5,6 +5,8 @@ import time
 import httpx
 
 from app.config import ext
+from app.models.common import StageUsage
+from app.services import cost
 from app.services.embedding.bge_m3_client import EmbeddingError, EmbeddingResult
 from app.utils.logger import get_logger
 
@@ -21,6 +23,10 @@ class OpenAIEmbedClient:
         self._client: httpx.AsyncClient | None = None
         self._model = model
         self._api_key = ext.openai_api_key
+        # Per-call usage record set after every ``embed_batch`` so callers
+        # (IngestService) can read it without changing return signatures.
+        # Aggregated across all windows of a single embed_batch invocation.
+        self.last_usage: StageUsage | None = None
 
     async def startup(self) -> None:
         if not self._api_key:
@@ -54,9 +60,12 @@ class OpenAIEmbedClient:
         max_batch = ext.openai_embed_max_batch or len(texts)
         start = time.monotonic()
         results: list[EmbeddingResult] = []
+        total_tokens = 0
         for offset in range(0, len(texts), max_batch):
             window = texts[offset : offset + max_batch]
-            results.extend(await self._embed_window(window))
+            window_results, window_tokens = await self._embed_window(window)
+            results.extend(window_results)
+            total_tokens += window_tokens
         duration = int((time.monotonic() - start) * 1000)
 
         log.info(
@@ -65,11 +74,23 @@ class OpenAIEmbedClient:
             count=len(texts),
             duration_ms=duration,
             windows=(len(texts) + max_batch - 1) // max_batch,
+            tokens=total_tokens,
+        )
+        self.last_usage = StageUsage(
+            stage="embedding",
+            provider="openai",
+            model=self._model,
+            embed_tokens=total_tokens,
+            cost_usd=cost.embed_cost("openai", self._model, tokens=total_tokens),
         )
         return results
 
-    async def _embed_window(self, texts: list[str]) -> list[EmbeddingResult]:
-        """POST a single ≤max_batch window to OpenAI and parse the response."""
+    async def _embed_window(self, texts: list[str]) -> tuple[list[EmbeddingResult], int]:
+        """POST a single ≤max_batch window to OpenAI and parse the response.
+
+        Returns ``(results, tokens)`` so the caller can aggregate token
+        usage across windows for billing.
+        """
         start = time.monotonic()
         try:
             resp = await self._client.post(
@@ -93,8 +114,12 @@ class OpenAIEmbedClient:
         data = resp.json()
 
         embeddings = sorted(data.get("data", []), key=lambda x: x["index"])
+        # OpenAI returns ``usage.{prompt_tokens, total_tokens}`` for embed
+        # responses. ``total_tokens`` is what gets billed.
+        usage_block = data.get("usage") or {}
+        tokens = int(usage_block.get("total_tokens") or usage_block.get("prompt_tokens") or 0)
 
         return [
             EmbeddingResult(dense=item["embedding"], sparse=None, duration_ms=duration)
             for item in embeddings
-        ]
+        ], tokens

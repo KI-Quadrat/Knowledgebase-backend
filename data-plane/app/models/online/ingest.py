@@ -3,6 +3,7 @@ from enum import Enum
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.models.classify import ExtractedEntities
+from app.models.common import UsageSummary
 
 
 class SearchMode(str, Enum):
@@ -149,6 +150,18 @@ class OnlineIngestData(BaseModel):
     content_type: list[str] = Field(..., description="Content categories stored with the vectors (passed through from the request body)")
     embedding_time_ms: int = Field(..., description="Time spent on embedding (ms)")
     total_time_ms: int = Field(..., description="Total pipeline duration (ms)")
+    usage: UsageSummary | None = Field(
+        None,
+        description=(
+            "Per-stage billing for this ingest. ``by_stage`` carries one "
+            "entry per external call (`contextual`, `funding`, "
+            "`embedding`, `sparse_embedding` when applicable). Stages that "
+            "use self-hosted services (BGE-M3, TEI sparse) report "
+            "``cost_usd: 0``. Stages whose provider rate is unset in "
+            "``pricing.yaml`` report ``cost_usd: null`` while still "
+            "recording raw token counts."
+        ),
+    )
 
 
 class BatchIngestRequest(BaseModel):
@@ -183,3 +196,13 @@ class BatchIngestData(BaseModel):
     failed: int = Field(..., description="Items that returned an error (still present in `results`)")
     results: list[BatchIngestItemResult] = Field(..., description="Per-item outcomes, same order as the request")
     total_time_ms: int = Field(..., description="Wall-clock duration of the entire batch")
+    total_usage: UsageSummary | None = Field(
+        None,
+        description=(
+            "Batch-level rollup of per-item usage. ``by_stage`` sums each "
+            "stage (classifier/contextual/funding/embedding) across all "
+            "successful items so a single number tells you the entire "
+            "batch's spend. Per-item ``usage`` is still on each "
+            "``results[i].data.usage`` for granular accounting."
+        ),
+    )

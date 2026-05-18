@@ -7,6 +7,7 @@ from urllib.parse import urljoin, urlparse
 from pydantic import BaseModel, Field
 
 from app.config import ext
+from app.models.common import StageUsage, UsageSummary
 from app.services.audit import AuditLogger
 from app.services.cache import ContentCache
 from app.services.metrics import mark_cache_hit, mark_cache_miss, set_active_jobs
@@ -141,6 +142,10 @@ class ScrapeResult(BaseModel):
     # Backend that actually produced the result: ``crawl4ai``, ``jina``, or
     # ``httpx`` (final fallback). ``None`` on failed scrapes.
     scraper_used: str | None = None
+    # Per-scrape billing record (tokens for Jina, credits for Firecrawl, $0
+    # for self-hosted). ``None`` on failed scrapes and on cache hits where
+    # the original backend wasn't recorded.
+    usage: StageUsage | None = None
 
 
 # ── Service ──────────────────────────────────────────
@@ -239,6 +244,16 @@ class ScraperService:
                     mark_cache_hit()
                     log.info("scrape_cache_hit", url=url)
                     cached_markdown = cached.get("markdown") or ""
+                    cached_scraper = cached.get("scraper_used")
+                    # Cache hits never billed the origin — no API call this
+                    # request. Surface a zero-cost ``cache`` provider so the
+                    # response always carries a scraper usage entry.
+                    cached_usage = StageUsage(
+                        stage="scraper",
+                        provider="cache",
+                        model=cached_scraper,
+                        cost_usd=0.0,
+                    )
                     return ScrapeResult(
                         url=url,
                         status=ScrapeStatus.SUCCESS,
@@ -248,7 +263,8 @@ class ScraperService:
                             word_count=count_words(cached_markdown),
                         ),
                         duration_ms=int((time.monotonic() - start) * 1000),
-                        scraper_used=cached.get("scraper_used"),
+                        scraper_used=cached_scraper,
+                        usage=cached_usage,
                     )
                 mark_cache_miss()
 
@@ -377,6 +393,7 @@ class ScraperService:
                 discovered_images=discovered_images,
                 duration_ms=duration_ms,
                 scraper_used=crawl_result.scraper_used,
+                usage=crawl_result.usage,
             )
 
         except TimeoutError:
@@ -409,7 +426,7 @@ class ScraperService:
         same_domain_only: bool = True,
         on_progress: Callable[[int, int, str], None] | None = None,
         scraper: str = "httpx",
-    ) -> tuple[list[str], list[DiscoveredDocument], str | None]:
+    ) -> tuple[list[str], list[DiscoveredDocument], str | None, UsageSummary]:
         """Breadth-first URL discovery.
 
         Backend behavior by ``scraper`` value:
@@ -423,10 +440,12 @@ class ScraperService:
         - ``httpx`` (**default**) — Python BFS with cheap raw HTTP fetches.
           Sufficient for sites with server-rendered nav.
 
-        Returns ``(pages, documents, scraper_used)``. ``scraper_used``
+        Returns ``(pages, documents, scraper_used, usage)``. ``scraper_used``
         prefers the first non-None backend actually reported across the
         BFS, and falls back to the caller's requested ``scraper`` when
         every result was a legacy cache entry without a recorded backend.
+        ``usage`` aggregates per-page scraper usage (Python BFS path) or
+        the single API call usage (Crawl4AI deep crawl / Firecrawl map).
         """
         if scraper == "crawl4ai":
             ok, pages, docs = await self._deep_crawl_via_crawl4ai(
@@ -437,18 +456,23 @@ class ScraperService:
                 on_progress=on_progress,
             )
             if ok:
-                return pages, docs, "crawl4ai"
+                # Crawl4AI is self-hosted — single zero-cost entry.
+                usage = UsageSummary.from_entries([
+                    StageUsage(stage="scraper", provider="crawl4ai", cost_usd=0.0)
+                ])
+                return pages, docs, "crawl4ai", usage
             log.info("deep_crawl_falling_back_to_python_bfs", url=root_url)
 
         if scraper == "firecrawl":
-            ok, pages, docs = await self._deep_crawl_via_firecrawl(
+            ok, pages, docs, fc_usage = await self._deep_crawl_via_firecrawl(
                 root_url,
                 max_pages=max_pages,
                 same_domain_only=same_domain_only,
                 on_progress=on_progress,
             )
             if ok:
-                return pages, docs, "firecrawl"
+                entries = [fc_usage] if fc_usage is not None else []
+                return pages, docs, "firecrawl", UsageSummary.from_entries(entries)
             log.info("firecrawl_map_falling_back_to_python_bfs", url=root_url)
 
         return await self._discover_urls_python_bfs(
@@ -515,15 +539,16 @@ class ScraperService:
         max_pages: int,
         same_domain_only: bool,
         on_progress: Callable[[int, int, str], None] | None,
-    ) -> tuple[bool, list[str], list[DiscoveredDocument]]:
+    ) -> tuple[bool, list[str], list[DiscoveredDocument], "StageUsage | None"]:
         """URL discovery via ``Crawl4AIClient._map_with_firecrawl``.
 
         Firecrawl's ``/v2/map`` endpoint is single-shot — no depth control,
         so ``max_depth`` is ignored. The flat URL list is then partitioned
         into pages and documents via ``split_documents_and_links``, matching
-        the contract of ``_deep_crawl_via_crawl4ai``.
+        the contract of ``_deep_crawl_via_crawl4ai``. Returns the per-call
+        ``StageUsage`` so the router can surface Firecrawl credit billing.
         """
-        ok, visited, links, error = await self.crawl4ai._map_with_firecrawl(
+        ok, visited, links, error, usage = await self.crawl4ai._map_with_firecrawl(
             root_url,
             max_pages=max_pages,
             same_domain_only=same_domain_only,
@@ -531,7 +556,7 @@ class ScraperService:
         )
         if not ok:
             log.warning("firecrawl_map_failed", url=root_url, error=error)
-            return False, [], []
+            return False, [], [], None
 
         root_domain = urlparse(root_url).netloc.lower()
         absolute_links: list[str] = []
@@ -560,7 +585,7 @@ class ScraperService:
         page_only = [u for u in visited if u not in doc_urls] or page_links
         if on_progress:
             on_progress(len(page_only), max_pages, root_url)
-        return True, page_only, discovered_docs
+        return True, page_only, discovered_docs, usage
 
     async def _discover_urls_python_bfs(
         self,
@@ -571,18 +596,20 @@ class ScraperService:
         same_domain_only: bool,
         on_progress: Callable[[int, int, str], None] | None,
         scraper: str,
-    ) -> tuple[list[str], list[DiscoveredDocument], str | None]:
+    ) -> tuple[list[str], list[DiscoveredDocument], str | None, UsageSummary]:
         """In-process BFS — fan out per URL through ``scrape_url``.
 
         ``js_render`` is set based on the scraper choice: ``httpx`` skips
         rendering entirely (cheap fetches), while ``jina`` enables it so
-        the Chromium engine actually runs.
+        the Chromium engine actually runs. The returned ``UsageSummary``
+        aggregates per-page scraper usage across every BFS visit.
         """
         visited: set[str] = set()
         discovered_pages: list[str] = []
         doc_map: dict[str, DiscoveredDocument] = {}
         queue: deque[tuple[str, int]] = deque([(root_url, 0)])
         observed_scraper: str | None = None
+        bfs_usage_entries: list[StageUsage] = []
 
         root_domain = urlparse(root_url).netloc.lower()
         discover_options = ScrapeOptions(
@@ -602,6 +629,8 @@ class ScraperService:
             discovered_pages.append(current_url)
             if observed_scraper is None and result.scraper_used:
                 observed_scraper = result.scraper_used
+            if result.usage is not None:
+                bfs_usage_entries.append(result.usage)
             if on_progress:
                 on_progress(len(discovered_pages), max_pages, current_url)
 
@@ -620,4 +649,44 @@ class ScraperService:
                 queue.append((link, depth + 1))
 
         scraper_used = observed_scraper or (scraper if discovered_pages else None)
-        return discovered_pages, list(doc_map.values()), scraper_used
+        # Aggregate per-page entries (all with stage="scraper") into a single
+        # summed scraper entry — easier for the caller to surface than N rows.
+        agg_usage = _aggregate_bfs_scraper_usage(bfs_usage_entries, scraper_used or scraper)
+        return discovered_pages, list(doc_map.values()), scraper_used, agg_usage
+
+
+def _aggregate_bfs_scraper_usage(
+    entries: list[StageUsage], fallback_provider: str
+) -> UsageSummary:
+    """Collapse per-page scraper entries into a single summed entry.
+
+    All entries share ``stage="scraper"`` but may come from different
+    backends (e.g. cache hits intermixed with real fetches). We sum counts
+    and pick the first non-``cache`` provider as the headline; if every
+    entry was a cache hit, ``fallback_provider`` is used.
+    """
+    if not entries:
+        return UsageSummary.from_entries([
+            StageUsage(stage="scraper", provider=fallback_provider, cost_usd=0.0)
+        ])
+    headline_provider = next(
+        (e.provider for e in entries if e.provider != "cache"), entries[0].provider
+    )
+    headline_model = next(
+        (e.model for e in entries if e.provider != "cache" and e.model), None
+    )
+    merged = StageUsage(
+        stage="scraper",
+        provider=headline_provider,
+        model=headline_model,
+        cost_usd=0.0,
+    )
+    for e in entries:
+        merged.scrape_tokens += e.scrape_tokens
+        merged.credits += e.credits
+        merged.pages += e.pages
+        if merged.cost_usd is None or e.cost_usd is None:
+            merged.cost_usd = None
+        else:
+            merged.cost_usd = round(merged.cost_usd + e.cost_usd, 6)
+    return UsageSummary.from_entries([merged])

@@ -33,6 +33,11 @@ def mock_scraper():
     scraper.scrape_url = AsyncMock()
     scraper.discover_urls = AsyncMock()
     scraper.is_ready = True
+    # Routers now await scraper.audit.log_usage(...) on the success path —
+    # MagicMock's default attribute returns a MagicMock that isn't
+    # awaitable. Patch it as an AsyncMock so the audit no-ops cleanly under
+    # the test harness (ClickHouse isn't reachable from tests anyway).
+    scraper.audit.log_usage = AsyncMock()
     return scraper
 
 
@@ -95,6 +100,28 @@ def test_scrape_success(client, mock_scraper):
     assert data["request_id"]
     mock_scraper.scrape_url.assert_awaited_once()
     assert mock_scraper.scrape_url.await_args.kwargs["bypass_cache"] is False
+
+
+def test_scrape_can_skip_classification(client, mock_scraper, mock_classifier):
+    mock_scraper.scrape_url.return_value = ScrapeResult(
+        url="https://example.gv.at/page",
+        status=ScrapeStatus.SUCCESS,
+        markdown="# Hello\n\nSome content here.",
+        metadata=PageMetadata(title="Hello", language="de", word_count=4),
+        discovered_links=[],
+    )
+
+    response = client.post(
+        "/api/v1/online/scrape",
+        json={"url": "https://example.gv.at/page", "classify": False},
+    )
+
+    data = response.json()
+    assert response.status_code == 200
+    assert data["success"] is True
+    assert data["data"]["content_type"] == []
+    assert data["data"]["entities"] is None
+    mock_classifier.classify.assert_not_awaited()
 
 
 def test_scrape_bypasses_cache_for_links_summary(client, mock_scraper):
@@ -305,10 +332,17 @@ def test_crawl_sitemap_not_found(client, mock_sitemap_parser):
 
 
 def test_crawl_bfs(client, mock_scraper):
+    # discover_urls now returns (pages, docs, scraper_used, usage_summary).
+    # ``UsageSummary()`` is the empty-zero-cost default — the BFS aggregator
+    # would normally produce a populated summary, but the test only cares
+    # about pages/docs/scraper_used.
+    from app.models.common import UsageSummary
+
     mock_scraper.discover_urls.return_value = (
         ["https://example.gv.at/", "https://example.gv.at/about"],
         [DiscoveredDocument(url="https://example.gv.at/doc.pdf", type="pdf")],
         "jina",
+        UsageSummary(),
     )
 
     response = client.post("/api/v1/online/crawl", json={
@@ -437,6 +471,38 @@ def test_scrape_inner_img_parse_failure(client, mock_scraper, mock_parser):
     assert images[0]["alt"] == "test"
 
 
+def test_scrape_inner_img_retries_rate_limit_exception(client, mock_scraper, mock_parser, monkeypatch):
+    from app.routers.online import scrape as scrape_router
+
+    monkeypatch.setattr(scrape_router.settings, "inner_parse_rate_limit_retry_delay", 0)
+    mock_scraper.scrape_url.return_value = ScrapeResult(
+        url="https://example.gv.at/page",
+        status=ScrapeStatus.SUCCESS,
+        markdown="# Page",
+        html='<html><body><img src="/retry.jpg" alt="retry"></body></html>',
+        metadata=PageMetadata(word_count=1),
+    )
+    mock_parser.parse_from_url.side_effect = [
+        RuntimeError("429 Too Many Requests"),
+        ParseResult(
+            status=ParseStatus.SUCCESS,
+            document_type=DocumentType.JPG,
+            text="Recovered image text",
+            metadata=DocumentMetadata(),
+        ),
+    ]
+
+    response = client.post("/api/v1/online/scrape", json={
+        "url": "https://example.gv.at/page",
+        "inner_img": True,
+    })
+
+    data = response.json()
+    assert data["success"] is True
+    assert data["data"]["inner_images"][0]["content"] == "Recovered image text"
+    assert mock_parser.parse_from_url.await_count == 2
+
+
 def test_scrape_inner_img_false_returns_null(client, mock_scraper):
     """When inner_img=false (default), inner_images is null."""
     mock_scraper.scrape_url.return_value = ScrapeResult(
@@ -561,6 +627,45 @@ def test_scrape_inner_docs_parse_failure(client, mock_scraper, mock_parser):
     assert len(docs) == 1
     assert docs[0]["content"] is None
     assert docs[0]["error"] == "Document is encrypted"
+
+
+def test_scrape_inner_docs_retries_rate_limit_result(client, mock_scraper, mock_parser, monkeypatch):
+    from app.routers.online import scrape as scrape_router
+
+    monkeypatch.setattr(scrape_router.settings, "inner_parse_rate_limit_retry_delay", 0)
+    mock_scraper.scrape_url.return_value = ScrapeResult(
+        url="https://example.gv.at/page",
+        status=ScrapeStatus.SUCCESS,
+        markdown="# Page",
+        metadata=PageMetadata(word_count=1),
+        discovered_documents=[
+            DiscoveredDocument(url="https://example.gv.at/retry.pdf", type="pdf", link_text="Retry PDF"),
+        ],
+    )
+    mock_parser.parse_from_url.side_effect = [
+        ParseResult(
+            status=ParseStatus.FAILED,
+            document_type=DocumentType.PDF,
+            error="Rate limit exceeded",
+        ),
+        ParseResult(
+            status=ParseStatus.SUCCESS,
+            document_type=DocumentType.PDF,
+            text="Recovered PDF content",
+            metadata=DocumentMetadata(language="de"),
+            pages_parsed=1,
+        ),
+    ]
+
+    response = client.post("/api/v1/online/scrape", json={
+        "url": "https://example.gv.at/page",
+        "inner_docs": True,
+    })
+
+    data = response.json()
+    assert data["success"] is True
+    assert data["data"]["inner_documents"][0]["content"] == "Recovered PDF content"
+    assert mock_parser.parse_from_url.await_count == 2
 
 
 def test_scrape_inner_docs_exception(client, mock_scraper, mock_parser):
