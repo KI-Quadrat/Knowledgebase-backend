@@ -35,6 +35,7 @@ RUN uv sync --no-dev --frozen --no-install-project
 # Now copy the app source and install the project itself
 COPY README.md .
 COPY app/ ./app/
+COPY pricing.yaml ./
 
 RUN uv sync --no-dev --frozen
 
@@ -73,6 +74,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.5.18 /uv /bin/uv
 WORKDIR /app
 
 # Copy the fully-resolved virtual environment from the builder stage
+COPY --from=builder /app/pricing.yaml /app/pricing.yaml
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/app   /app/app
 COPY --from=builder /app/pyproject.toml /app/pyproject.toml
