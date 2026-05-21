@@ -11,6 +11,7 @@ fallback) on first use to match the TEI embedding model behind
 from pydantic import BaseModel, Field
 
 from app.models.classify import ExtractedEntities
+from app.models.common import UsageSummary
 from app.models.online.ingest import EmbeddingModel, OnlineChunkingConfig, OnlineIngestMetadata
 
 
@@ -36,16 +37,18 @@ class OnlineIngestATRequest(BaseModel):
         None,
         description=(
             "Optional explicit province override stored on every point as "
-            "`metadata.state_or_province`. English lowercase (e.g. "
-            "'lower austria', 'vienna'). When omitted, the funding extractor's "
-            "output is used."
+            "`metadata.state_or_province`. Accepts German or English input in "
+            "any casing — the values pass through the shared AT alias map and "
+            "are stored in canonical English lowercase (e.g. 'wien' → "
+            "'vienna', 'kärnten' → 'carinthia'). Unknown values are dropped. "
+            "When omitted, the funding extractor's output is used."
         ),
     )
     embedding_model: EmbeddingModel = Field(
         EmbeddingModel.bge_m3,
         description=(
-            "Embedder for this AT ingest. `bge_m3` (default) uses the TEI "
-            "endpoint at `TEI_EMBED_URL_AT` (1024-dim). `openai` uses "
+            "Embedder for this AT ingest. `bge_m3` (default) uses the "
+            "configured TEI endpoint (1024-dim). `openai` uses "
             "`text-embedding-3-small` (1536-dim). The AT collection is "
             "auto-created with the matching dim on first use; switching "
             "models requires a new collection name."
@@ -87,3 +90,13 @@ class OnlineIngestATData(BaseModel):
     content_type: list[str] = Field(..., description="Content categories passed through from the request.")
     embedding_time_ms: int = Field(..., description="Time spent on embedding (ms).")
     total_time_ms: int = Field(..., description="Total pipeline duration (ms).")
+    usage: UsageSummary | None = Field(
+        None,
+        description=(
+            "Per-stage billing for this AT ingest. Always carries the "
+            "funding extractor's OpenAI tokens; carries contextual "
+            "enrichment tokens when `chunking.strategy='contextual'`; "
+            "carries embedding tokens when `embedding_model='openai'` "
+            "($0 self-hosted otherwise)."
+        ),
+    )

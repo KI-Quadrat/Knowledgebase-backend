@@ -21,7 +21,7 @@ from app.routers.online import parse as online_parse
 from app.routers.online import scrape as online_scrape
 from app.routers.online import vectors as online_vectors
 from app.routers.online import vectors_at as online_vectors_at
-from app.routers.shared import classify, collections, health, metrics, search
+from app.routers.shared import classify, collections, health, metrics, probe, search
 from app.services.discovery.discovery_service import DiscoveryService
 from app.services.discovery.r2_client import R2Client
 from app.services.discovery.smb_client import SMBClient
@@ -36,6 +36,7 @@ from app.services.intelligence.chunker import Chunker
 from app.services.intelligence.classifier import Classifier
 from app.services.intelligence.contextual import ContextualEnricher
 from app.services.intelligence.funding_extractor import FundingExtractor
+from app.services.intelligence import llm_router
 from app.services.parsing.parser_service import ParserService
 from app.services.scraping.scraper_service import ScraperService
 from app.services.scraping.sitemap import SitemapParser
@@ -79,6 +80,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         app.state.parser = parser_svc
 
         # ── Intelligence ─────────────────────────────────
+        # The LLM router owns the per-task AsyncOpenAI client cache. Close
+        # it on shutdown so connection pools drain cleanly. Provider config
+        # is resolved lazily from env on the first task ``startup()`` call,
+        # so there's nothing to do here on the way up.
+        stack.push_async_callback(llm_router.close_all)
+
         classifier = Classifier()
         app.state.classifier = classifier
 
@@ -172,8 +179,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 tags_metadata = [
     {
         "name": "Health",
-        "description": "Liveness and readiness probes for container orchestrators and load balancers. "
-        "The `/ready` endpoint checks connectivity to Qdrant, BGE-M3 (local + AT TEI), OpenAI, TEI sparse (sparse.ki2.at), Parser (LlamaParse or local), Crawl4AI, LDAP, and Redis.",
+        "description": (
+            "Liveness and readiness probes for container orchestrators and load balancers.\n\n"
+            "**`GET /health`** — bare liveness, no auth, no downstream calls.\n\n"
+            "**`GET /ready`** — readiness. Returns minimal `{ready: true/false}` without "
+            "auth (suitable for an LB), or full per-service status when called with the "
+            "internal auth header.\n\n"
+            "For richer per-dependency health see the **Diagnostics** tag."
+        ),
     },
     {
         "name": "Metrics",
@@ -186,15 +199,15 @@ tags_metadata = [
     },
     {
         "name": "Local - Document Parsing",
-        "description": "Extract text, tables, and metadata from documents via file upload, SMB, or R2.\n\n"
+        "description": "Extract text, tables, and metadata from documents via file upload, SMB, or object storage.\n\n"
         "**Input methods:**\n"
         "- `POST /local/document-parse` with `source: smb` — parse from mounted file share\n"
-        "- `POST /local/document-parse` with `source: r2` — parse from Cloudflare R2 via presigned URL\n"
+        "- `POST /local/document-parse` with `source: r2` — parse from object storage via presigned URL\n"
         "- `POST /local/document-parse/upload` — upload a file directly\n\n"
         "**Supported formats:** PDF, DOCX, DOC, PPTX, ODT, XLSX, XLS, TXT, CSV, HTML, RTF.\n\n"
         "**Parser backends** (auto-selected at startup):\n"
-        "- **LlamaParse** (cloud) — `LLAMA_CLOUD_API_KEY` set → high-quality markdown extraction via LlamaCloud API\n"
-        "- **Local parsers** (no API key) — PyMuPDF for PDF, python-docx for DOCX — lightweight, no heavy dependencies\n"
+        "- **Cloud parser** (when configured) — high-quality markdown extraction\n"
+        "- **Local parsers** — PyMuPDF for PDF, python-docx for DOCX — lightweight, no heavy dependencies\n"
         "- **SpreadsheetParser** — always used for XLSX/XLS (openpyxl)\n"
         "- **TextParser** — always used for TXT, CSV, HTML, RTF",
     },
@@ -215,12 +228,12 @@ tags_metadata = [
     {
         "name": "Online - Collection Management",
         "description": "List and inspect available Qdrant collections.\n\n"
-        "**Optional X-API-Key header** — required only when `DP_ONLINE_API_KEYS` is configured.",
+        "**Optional X-API-Key header** when API-key auth is configured.",
     },
     {
         "name": "Online - Web Scraping",
-        "description": "Scrape webpages via Crawl4AI and discover URLs from sitemaps or BFS crawling.\n\n"
-        "**Optional X-API-Key header** — required only when `DP_ONLINE_API_KEYS` is configured.",
+        "description": "Scrape webpages and discover URLs from sitemaps or BFS crawling.\n\n"
+        "**Optional X-API-Key header** when API-key auth is configured.",
     },
     {
         "name": "Online - Document Parsing",
@@ -228,22 +241,22 @@ tags_metadata = [
         "**Input methods:**\n"
         "- `POST /online/document-parse` — parse from a public URL\n"
         "- `POST /online/document-parse/upload` — upload a file directly\n\n"
-        "**Optional X-API-Key header** — required only when `DP_ONLINE_API_KEYS` is configured.",
+        "**Optional X-API-Key header** when API-key auth is configured.",
     },
     {
         "name": "Online - Ingestion Pipeline",
         "description": "Full RAG ingestion pipeline for web-scraped content: chunk → classify → embed → store (Qdrant).\n\n"
         "Caller picks one of two embedding models per-request via `embedding_model`:\n"
         "- `openai` (default) — `text-embedding-3-small` (1536-dim, stored as `dense_openai`)\n"
-        "- `bge_m3` — BGE-M3 via the TEI endpoint at `TEI_EMBED_URL_AT` (1024-dim, stored as `dense_bge_m3`)\n\n"
+        "- `bge_m3` — BGE-M3 via the configured TEI endpoint (1024-dim, stored as `dense_bge_m3`)\n\n"
         "With `search_mode: hybrid` the point also carries a `sparse` vector produced by the "
-        "TEI sparse endpoint at `SPARSE_EMBED_URL_AT` (sparse.ki2.at).\n\n"
-        "**Optional X-API-Key header** — required only when `DP_ONLINE_API_KEYS` is configured.",
+        "configured TEI sparse endpoint.\n\n"
+        "**Optional X-API-Key header** when API-key auth is configured.",
     },
     {
         "name": "Online - Ingestion Pipeline (AT)",
         "description": "Dedicated ingest for the Austrian funding assistant (`POST /api/v1/online/ingest/at`). "
-        "Runs against a separate Qdrant instance (configured via `QDRANT_URL_AT` / `QDRANT_PORT_AT` / `QDRANT_API_KEY_AT`).\n\n"
+        "Runs against a separate Qdrant instance.\n\n"
         "**Caller picks the target collection** via `collection_name` — it is auto-created on first use "
         "with the AT legacy schema (single unnamed cosine vector at the embedder's dim, plus keyword "
         "indexes on `metadata.source_id` / `metadata.source_url`). There is **no per-province collection "
@@ -252,7 +265,7 @@ tags_metadata = [
         "Country (AT) and assistant type (funding) are implicit. The funding extractor always runs and "
         "its output is merged into `metadata.*`.\n\n"
         "**Embedding model** is selectable per request via `embedding_model`: `bge_m3` (default) uses "
-        "TEI at `TEI_EMBED_URL_AT` (1024-dim); `openai` uses `text-embedding-3-small` (1536-dim). "
+        "the configured TEI endpoint (1024-dim); `openai` uses `text-embedding-3-small` (1536-dim). "
         "Switching models requires a new collection name.",
     },
     {
@@ -260,18 +273,18 @@ tags_metadata = [
         "description": "Delete or sparse-encode vectors on the default online Qdrant instance.\n\n"
         "- `DELETE /online/vectors/{source_id}?collection_name=...` — remove all vectors for a document\n"
         "- `POST /online/vectors/delete-by-filter` — remove vectors matching metadata filters (AND-combined)\n"
-        "- `POST /online/vectors/sparse-encode` — return the TEI sparse vector for arbitrary text "
-        "(same encoder used by hybrid ingest/search at `SPARSE_EMBED_URL_AT`)\n\n"
-        "**Optional X-API-Key header** — required only when `DP_ONLINE_API_KEYS` is configured.",
+        "- `POST /online/vectors/sparse-encode` — return the configured TEI sparse vector for arbitrary text "
+        "(same encoder used by hybrid ingest/search)\n\n"
+        "**Optional X-API-Key header** when API-key auth is configured.",
     },
     {
         "name": "Online - Vector Management (AT)",
-        "description": "Delete vectors on the AT Qdrant instance (`QDRANT_URL_AT` / `QDRANT_PORT_AT` / `QDRANT_API_KEY_AT`).\n\n"
+        "description": "Delete vectors on the AT Qdrant instance.\n\n"
         "- `DELETE /online/vectors/at/{source_id}?collection_name=...` — mirrors the default delete "
         "endpoint, only the target Qdrant instance differs. `collection_name` must be one of the "
         "nine AT province collections (`Burgenland`, `Kärnten`, `Niederösterreich`, `Oberösterreich`, "
         "`Salzburg`, `Steiermark`, `Tirol`, `Vorarlberg`, `Wien`).\n\n"
-        "**Optional X-API-Key header** — required only when `DP_ONLINE_API_KEYS` is configured.",
+        "**Optional X-API-Key header** when API-key auth is configured.",
     },
     {
         "name": "Online - Ingestion Pipeline (AT)",
@@ -294,8 +307,7 @@ tags_metadata = [
         "**Search modes:**\n"
         "- `semantic` (default) — dense-only cosine search against whichever dense vector the "
         "collection was ingested with (`dense_openai` or `dense_bge_m3`)\n"
-        "- `hybrid` — dense + sparse (TEI sparse at `SPARSE_EMBED_URL_AT`) combined with "
-        "Reciprocal Rank Fusion (RRF)\n\n"
+        "- `hybrid` — dense + sparse combined with Reciprocal Rank Fusion (RRF)\n\n"
         "The caller tells search which dense vector to hit via `embedding_model` "
         "(`openai` → `dense_openai`, `bge_m3` → `dense_bge_m3`) — this must match the "
         "model used when the collection was ingested.\n\n"
@@ -308,8 +320,8 @@ tags_metadata = [
     {
         "name": "Collection Management",
         "description": "Create and inspect Qdrant vector collections for municipality tenants. "
-        "Online collections store a single dense vector named `dense_openai` (OpenAI) or "
-        "`dense_bge_m3` (BGE-M3 via TEI) plus an optional TEI `sparse` vector for hybrid search. "
+        "Online collections store a single dense vector named `dense_openai` or `dense_bge_m3` "
+        "plus an optional `sparse` vector for hybrid search. "
         "Local collections use BGE-M3.",
     },
 ]
@@ -321,30 +333,25 @@ app = FastAPI(
         "## Two Operational Modes\n\n"
         "### 1. Online Mode — Knowledgebase from Web Content (`/api/v1/online/...`)\n"
         "Update the knowledgebase using online URLs and cloud services. **Requires X-API-Key header.**\n"
-        "- **Scrape** web pages via Crawl4AI, discover URLs from sitemaps\n"
-        "- **Parse** documents from any public URL — uses **LlamaParse** (cloud) for high-quality extraction\n"
-        "- **Ingest** scraped/parsed content into Qdrant vector collections — caller picks OpenAI "
-        "(`text-embedding-3-small`, 1536) or BGE-M3 via TEI (`TEI_EMBED_URL_AT`, 1024) per request\n"
+        "- **Scrape** web pages, discover URLs from sitemaps\n"
+        "- **Parse** documents from any public URL using a cloud parser for high-quality extraction\n"
+        "- **Ingest** scraped/parsed content into Qdrant vector collections — caller picks "
+        "`text-embedding-3-small` (1536-dim) or BGE-M3 (1024-dim) per request\n"
         "- **AT funding pipeline** — `POST /api/v1/online/ingest/at` is a dedicated endpoint that writes to a "
-        "separate Qdrant instance (configured via `QDRANT_URL_AT` / `QDRANT_PORT_AT` / `QDRANT_API_KEY_AT`) "
-        "with nine per-province collections.\n"
-        "- Requires: `CRAWL4AI_URL`, `LLAMA_CLOUD_API_KEY` (optional), `OPENAI_API_KEY` (for classification + OpenAI embedding), "
-        "`TEI_EMBED_URL_AT` + `TEI_EMBED_API_KEY_AT` (for BGE-M3 embedding), "
-        "`SPARSE_EMBED_URL_AT` + `SPARSE_EMBED_API_KEY_AT` (for hybrid-search sparse vectors)\n\n"
+        "separate Qdrant instance with nine per-province collections.\n\n"
         "### 2. Local Mode — Fully Offline Document Processing (`/api/v1/local/...`)\n"
         "Process documents entirely locally without any third-party APIs. **No API key required.**\n"
         "- **Upload** documents directly via `POST /local/document-parse/upload` or read from **SMB file shares**\n"
         "- **Parse** locally using **PyMuPDF** (PDF) and **python-docx** (DOCX) — lightweight, no GPU or heavy dependencies\n"
-        "- **Discover** files from SMB shares with NTFS ACL extraction\n"
-        "- Requires: No external API keys — only Qdrant and BGE-M3 for embedding/search\n\n"
+        "- **Discover** files from SMB shares with NTFS ACL extraction\n\n"
         "## Authentication\n"
-        "- **HMAC auth** (all endpoints except `/health`): Set `DP_HMAC_SECRET` to enable.\n"
-        "- **API key auth** (online endpoints only): Optional. Set `DP_ONLINE_API_KEYS` to enable — clients must then send `X-API-Key` header. "
+        "- **HMAC auth** (all endpoints except `/health`): enabled when the deployment is configured for it.\n"
+        "- **API key auth** (online endpoints only): optional — when enabled clients send `X-API-Key`. "
         "If not configured, online endpoints are open.\n\n"
         "## Pipeline Flow\n"
-        "1. **Discover** → Scan file sources (SMB shares, Cloudflare R2) for new/changed documents\n"
-        "2. **Scrape / Parse** → Extract text from web pages (Crawl4AI) or documents (URL, upload, SMB, R2)\n"
-        "3. **Ingest** → Chunk, classify, embed (OpenAI or BGE-M3 via TEI for online / BGE-M3 for local), and store in Qdrant with metadata\n"
+        "1. **Discover** → Scan file sources for new/changed documents\n"
+        "2. **Scrape / Parse** → Extract text from web pages or documents (URL, upload, SMB, object storage)\n"
+        "3. **Ingest** → Chunk, classify, embed, and store in Qdrant with metadata\n"
         "4. **Search** → Permission-filtered semantic search across collections\n"
     ),
     version=settings.version,
@@ -370,6 +377,9 @@ app.include_router(metrics.router)
 app.include_router(classify.router)
 app.include_router(collections.router)
 app.include_router(search.router)
+# Probe router declares its own `Depends(require_api_key)` at the router level,
+# matching the `/model-health` pattern. No additional dependency needed here.
+app.include_router(probe.router)
 
 # ── Local Routers (no API key required) ───────────────
 app.include_router(local_parse.router)

@@ -7,6 +7,8 @@ import httpx
 from bs4 import BeautifulSoup
 
 from app.config import ext, settings
+from app.models.common import StageUsage
+from app.services import cost
 from app.services.metrics import mark_crawl4ai
 from app.utils.content import clean_html, clean_markdown
 from app.utils.logger import get_logger
@@ -34,17 +36,41 @@ class CrawlResult:
         *,
         markdown: str = "",
         html: str = "",
+        title: str | None = None,
         links: list[str] | None = None,
+        images: list[str] | None = None,
         success: bool = True,
         error: str | None = None,
         duration_ms: int = 0,
+        scraper_used: str | None = None,
+        usage: StageUsage | None = None,
     ):
         self.markdown = markdown
         self.html = html
+        # Title reported directly by the backend (Jina ``data.title``). The
+        # Crawl4AI ``/md`` endpoint does not return a title — the router falls
+        # back to whatever ``extract_metadata`` can pull from cached HTML or
+        # leaves it None. The httpx fallback returns rendered HTML, so the
+        # router extracts the title from there.
+        self.title = title
         self.links = links or []
+        # Image URLs harvested by the backend (Jina X-With-Images-Summary).
+        # Crawl4AI ``/md`` and httpx leave this empty — the router runs
+        # ``discover_images`` against rendered HTML for the httpx backend, and
+        # the Crawl4AI branch produces no HTML, so per-page image discovery is
+        # only available via the Jina/httpx paths.
+        self.images = images or []
         self.success = success
         self.error = error
         self.duration_ms = duration_ms
+        # Which backend actually produced the markdown — set per-branch in
+        # ``crawl()`` after a backend succeeds. ``None`` on failed results.
+        self.scraper_used = scraper_used
+        # Per-call billing record. Populated by each backend branch from the
+        # provider's own response (Jina ``meta.usage.tokens``, Firecrawl
+        # ``creditsUsed``). Self-hosted / httpx leave this as a zero entry so
+        # the schema is uniform.
+        self.usage = usage
 
 
 class Crawl4AIClient:
@@ -56,6 +82,8 @@ class Crawl4AIClient:
         self._api_token = ext.crawl4ai_api_token
         self._jina_url = ext.jina_api_url.rstrip("/")
         self._jina_key = ext.jina_api_key
+        self._firecrawl_url = ext.firecrawl_api_url.rstrip("/")
+        self._firecrawl_key = ext.firecrawl_api_key
 
     async def start(self) -> None:
         self._client = httpx.AsyncClient(
@@ -90,6 +118,7 @@ class Crawl4AIClient:
         markdown_type: str = "fit",
         exclude_tags: list[str] | None = None,
         with_links_summary: bool = False,
+        inner_img: bool = False,
         scraper: str = "crawl4ai",
     ) -> CrawlResult:
         if not self._client:
@@ -101,15 +130,26 @@ class Crawl4AIClient:
         # Build prioritized backend list based on client preference. The
         # non-preferred backend (and raw httpx) remain as automatic fallbacks
         # so requests stay best-effort even when the chosen backend fails.
-        if scraper == "jina":
+        # ``scraper="httpx"`` short-circuits both browser backends and goes
+        # straight to the raw httpx fallback below — used by /crawl BFS where
+        # Chromium-rendered fetches are wasted on per-URL link harvesting.
+        if scraper == "httpx":
+            backend_order: tuple[str, ...] = ()
+        elif scraper == "jina":
             backend_order = ("jina", "crawl4ai")
+        elif scraper == "firecrawl":
+            backend_order = ("firecrawl", "jina", "crawl4ai")
         else:
             backend_order = ("crawl4ai", "jina")
 
         for backend in backend_order:
+            # ``js_render=False`` opts out of every browser-rendered backend.
+            # Both Crawl4AI's ``/md`` and Jina's Chromium engine fetch via a
+            # headless browser, so the flag must skip both — otherwise Jina
+            # silently re-introduces the Chromium cost we asked to avoid.
+            if not js_render:
+                continue
             if backend == "crawl4ai":
-                if not js_render:
-                    continue
                 try:
                     result = await self._crawl_via_api(
                         url,
@@ -121,6 +161,10 @@ class Crawl4AIClient:
                     )
                     result.duration_ms = int((time.monotonic() - start) * 1000)
                     if result.success:
+                        result.scraper_used = "crawl4ai"
+                        # Self-hosted — zero-cost usage entry so the response
+                        # schema stays uniform with billed backends.
+                        result.usage = StageUsage(stage="scraper", provider="crawl4ai", cost_usd=0.0)
                         mark_crawl4ai("success", time.monotonic() - start)
                         return result
                     log.warning("crawl4ai_failed_falling_back", url=url, error=result.error)
@@ -139,14 +183,36 @@ class Crawl4AIClient:
                         exclude_tags=exclude_tags,
                         css_selector=css_selector,
                         with_links_summary=with_links_summary,
+                        inner_img=inner_img,
                     )
                     result.duration_ms = int((time.monotonic() - start) * 1000)
                     if result.success:
+                        result.scraper_used = "jina"
                         log.info("jina_scrape_success", url=url, primary=(scraper == "jina"))
                         return result
                     log.warning("jina_scrape_failed", url=url, error=result.error)
                 except Exception as exc:
                     log.warning("jina_scrape_error", url=url, error=str(exc))
+
+            elif backend == "firecrawl":
+                if not self._firecrawl_key:
+                    continue
+                try:
+                    result = await self._scrape_with_firecrawl(
+                        url,
+                        timeout=req_timeout,
+                        markdown_type=markdown_type,
+                        exclude_tags=exclude_tags,
+                        css_selector=css_selector,
+                    )
+                    result.duration_ms = int((time.monotonic() - start) * 1000)
+                    if result.success:
+                        result.scraper_used = "firecrawl"
+                        log.info("firecrawl_scrape_success", url=url, primary=(scraper == "firecrawl"))
+                        return result
+                    log.warning("firecrawl_scrape_failed", url=url, error=result.error)
+                except Exception as exc:
+                    log.warning("firecrawl_scrape_error", url=url, error=str(exc))
 
         # Final fallback: Raw httpx
         result = await self._scrape_with_httpx(
@@ -156,6 +222,9 @@ class Crawl4AIClient:
             exclude_tags=exclude_tags,
         )
         result.duration_ms = int((time.monotonic() - start) * 1000)
+        if result.success:
+            result.scraper_used = "httpx"
+            result.usage = StageUsage(stage="scraper", provider="httpx", cost_usd=0.0)
         return result
 
     async def _crawl_via_api(
@@ -168,55 +237,83 @@ class Crawl4AIClient:
         markdown_type: str = "fit",
         exclude_tags: list[str] | None = None,
     ) -> CrawlResult:
-        headers: dict[str, str] = {}
+        # Crawl4AI's /md endpoint takes a tiny payload — just url + filter.
+        # The legacy /crawl endpoint with browser_config / crawler_config /
+        # markdown_generator / magic was tripping the new server with
+        # "Invalid expression" on some pages, so we no longer construct that
+        # config envelope. Caller-supplied wait_for / css_selector /
+        # exclude_tags can't be forwarded here (the server applies its own
+        # defaults); they're still honored on the Jina branch where they map
+        # to request headers.
+        headers: dict[str, str] = {"Content-Type": "application/json"}
         if self._api_token:
             headers["Authorization"] = f"Bearer {self._api_token}"
 
-        crawler_params: dict = {
-            "scan_full_page": False,
-            "wait_until": "domcontentloaded",
-            "page_timeout": timeout * 1000,
-            "delay_before_return_html": 0.5,
-            "magic": True,
-            "remove_overlay_elements": True,
-            "cache_mode": "bypass",
-        }
-        if wait_for:
-            crawler_params["wait_for"] = f"css:{wait_for}"
-        if css_selector:
-            crawler_params["css_selector"] = css_selector
-        if exclude_tags:
-            crawler_params["excluded_tags"] = exclude_tags
-        if markdown_type == "fit":
-            crawler_params["markdown_generator"] = {
-                "type": "DefaultMarkdownGenerator",
-                "params": {
-                    "content_filter": {
-                        "type": "PruningContentFilter",
-                        "params": {
-                            "threshold": 0.48,
-                            "threshold_type": "fixed",
-                            "min_word_threshold": 0,
-                        },
-                    },
-                    "options": {"ignore_links": False, "escape_html": True},
-                },
-            }
+        result = await self._fetch_md(
+            url,
+            markdown_type=markdown_type,
+            timeout=timeout,
+            headers=headers,
+        )
 
-        payload: dict = {
-            "urls": [url],
-            "browser_config": {
-                "type": "BrowserConfig",
-                "params": {"headless": True},
-            },
-            "crawler_config": {
-                "type": "CrawlerRunConfig",
-                "params": crawler_params,
-            },
-        }
+        # Fit → raw fallback. Crawl4AI's PruningContentFilter (f=fit)
+        # occasionally strips pages whose payload is mostly tabular /
+        # label-value content (Austrian gov portals are the canonical case),
+        # leaving fit-mode markdown nearly empty. The /md branch has no HTML
+        # to compare against — only the markdown — so we use a word-count
+        # floor. Retry once with f=raw and keep that result if it's a real
+        # improvement (more words than the fit result); otherwise fall
+        # through to the original so the outer Jina/httpx chain can engage
+        # via the normal success=False path. Skipped for raw/citations —
+        # both already map to f=raw, so retrying would change nothing.
+        if (
+            markdown_type == "fit"
+            and result.success
+            and len(result.markdown.split()) < _FIT_FALLBACK_WORD_THRESHOLD
+        ):
+            log.info(
+                "crawl4ai_fit_thin_retry_raw",
+                url=url,
+                word_count=len(result.markdown.split()),
+            )
+            raw_result = await self._fetch_md(
+                url,
+                markdown_type="raw",
+                timeout=timeout,
+                headers=headers,
+            )
+            if (
+                raw_result.success
+                and raw_result.markdown.strip()
+                and len(raw_result.markdown.split()) > len(result.markdown.split())
+            ):
+                return raw_result
+
+        return result
+
+    async def _fetch_md(
+        self,
+        url: str,
+        *,
+        markdown_type: str,
+        timeout: int,
+        headers: dict[str, str],
+    ) -> CrawlResult:
+        """POST one /md request and parse the response into a CrawlResult.
+
+        Maps the public ``markdown_type`` (fit / raw / citations) to /md's
+        ``f`` filter via ``_FILTER_BY_MARKDOWN_TYPE``. The /md endpoint only
+        supports raw | fit | bm25 | llm — there is no citations filter, so
+        citations degrades to f=raw (same best-effort the Jina and httpx
+        branches already provide). Empty markdown and the literal
+        ``Crawl4AI Error`` preamble are surfaced as failures so the upstream
+        Jina/httpx fallback chain engages.
+        """
+        filter_value = _FILTER_BY_MARKDOWN_TYPE.get(markdown_type, "raw")
+        payload: dict = {"url": url, "f": filter_value}
 
         resp = await self._client.post(  # type: ignore[union-attr]
-            f"{self._base_url}/crawl",
+            f"{self._base_url}/md",
             json=payload,
             headers=headers,
             timeout=timeout + 10,
@@ -224,18 +321,120 @@ class Crawl4AIClient:
         resp.raise_for_status()
         data = resp.json()
 
-        results = data.get("results") or []
-        if isinstance(results, list) and results:
-            result_data = results[0]
+        markdown_value = data.get("markdown")
+        if isinstance(markdown_value, dict):
+            # /md returns a string today, but the older /crawl envelope used
+            # a dict keyed by fit_markdown / markdown_with_citations /
+            # raw_markdown. Defend against either shape: prefer the variant
+            # that matches the caller's markdown_type, fall through the rest.
+            markdown = _extract_markdown(markdown_value, preferred=markdown_type)
+        elif isinstance(markdown_value, str):
+            markdown = markdown_value
         else:
-            result_data = data.get("result", data)
+            markdown = ""
 
-        success = bool(result_data.get("success", data.get("success", False)))
-        markdown = _extract_markdown(result_data.get("markdown"), preferred=markdown_type)
-        html = _extract_html(result_data)
-        error = _extract_error(result_data)
+        success = bool(data.get("success", bool(markdown.strip())))
+        error = _extract_error(data)
 
-        return CrawlResult(markdown=clean_markdown(markdown), html=html, success=success, error=error)
+        # New server still occasionally returns success=true with the literal
+        # "Crawl4AI Error" preamble baked into the markdown body. Treat that
+        # as a failure so the Jina/httpx fallback chain engages.
+        if success and markdown.lstrip().startswith("Crawl4AI Error"):
+            success = False
+            error = markdown.split("\n", 1)[0].strip()
+            markdown = ""
+
+        return CrawlResult(markdown=clean_markdown(markdown), html="", success=success, error=error)
+
+    async def deep_crawl(
+        self,
+        root_url: str,
+        *,
+        max_depth: int = 3,
+        max_pages: int = 50,
+        same_domain_only: bool = True,
+        timeout: int = 120,
+    ) -> tuple[bool, list[str], list[dict], str | None]:
+        """Server-side BFS via Crawl4AI ``POST /crawl`` + ``BFSDeepCrawlStrategy``.
+
+        Returns ``(success, visited_urls, discovered_links, error)``.
+
+        - ``visited_urls`` — pages the server actually crawled (one per result).
+        - ``discovered_links`` — the union of internal ``links`` reported across
+          all crawled pages, as ``[{"href": ..., "text": ...}, ...]``. Used by
+          the caller to classify pages vs documents.
+        - On failure ``success=False`` with ``error`` set; the caller is
+          expected to fall back to its own BFS.
+
+        The endpoint runs synchronously when ``stream=false`` (default) and
+        returns ``{"results": [...]}``. Older builds returned ``{"task_id": ...}``
+        for async polling — we treat that as unsupported here and surface a
+        failure so the caller falls back rather than hanging on a poll loop.
+        """
+        if not self._client:
+            raise RuntimeError("Client not started — call start() first")
+
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self._api_token:
+            headers["Authorization"] = f"Bearer {self._api_token}"
+
+        payload: dict = {
+            "urls": [root_url],
+            "crawler_config": {
+                "deep_crawl_strategy": {
+                    "type": "BFSDeepCrawlStrategy",
+                    "max_depth": max_depth,
+                    "max_pages": max_pages,
+                    "include_external": not same_domain_only,
+                },
+                "stream": False,
+            },
+        }
+
+        try:
+            resp = await self._client.post(
+                f"{self._base_url}/crawl",
+                json=payload,
+                headers=headers,
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.TimeoutException:
+            return False, [], [], f"Crawl4AI deep_crawl timeout after {timeout}s"
+        except httpx.HTTPStatusError as exc:
+            return False, [], [], f"Crawl4AI deep_crawl HTTP {exc.response.status_code}"
+        except Exception as exc:
+            return False, [], [], f"Crawl4AI deep_crawl error: {exc}"
+
+        if "results" not in data:
+            # Async-task variant — poll-based. Treat as unsupported.
+            return False, [], [], "Crawl4AI returned task_id (async mode unsupported)"
+
+        results = data.get("results") or []
+        visited: list[str] = []
+        seen_visited: set[str] = set()
+        discovered: list[dict] = []
+        seen_links: set[str] = set()
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            url_value = item.get("url")
+            if isinstance(url_value, str) and url_value not in seen_visited:
+                visited.append(url_value)
+                seen_visited.add(url_value)
+            links_obj = item.get("links") or {}
+            internal = links_obj.get("internal") or [] if isinstance(links_obj, dict) else []
+            for link in internal:
+                if not isinstance(link, dict):
+                    continue
+                href = link.get("href")
+                if not isinstance(href, str) or href in seen_links:
+                    continue
+                seen_links.add(href)
+                discovered.append({"href": href, "text": link.get("text") or ""})
+
+        return True, visited, discovered, None
 
     async def _scrape_with_jina(
         self,
@@ -246,24 +445,32 @@ class Crawl4AIClient:
         exclude_tags: list[str] | None = None,
         css_selector: str | None = None,
         with_links_summary: bool = False,
+        inner_img: bool = False,
     ) -> CrawlResult:
-        """Scrape a URL via Jina Reader API — returns Markdown directly."""
+        """Scrape a URL via Jina Reader API — returns Markdown directly.
+
+        Uses the Chromium ``browser`` engine (best fidelity on JS-heavy
+        municipality portals). ``X-Retain-Images: none`` keeps inline image
+        markdown out of the returned content. Links summary and images summary
+        are requested only when the caller actually needs them
+        (``links_summary`` / ``inner_img``), since Jina is no-HTML and those
+        headers drive the side lists used by the router.
+        """
         headers = {
             "Authorization": f"Bearer {self._jina_key}",
             "Accept": "application/json",
+            "X-Engine": "browser",
             "X-Return-Format": "markdown",
+            "X-Retain-Images": "none",
         }
-        # "fit" → use readerlm-v2 engine for LLM-based main-content extraction
-        # (closest Jina analogue to Crawl4AI's PruningContentFilter).
-        # "raw" / "citations" → default engine (Jina has no citations mode).
-        if markdown_type == "fit":
-            headers["X-Engine"] = "readerlm-v2"
+        if with_links_summary:
+            headers["X-With-Links-Summary"] = "true"
+        if inner_img:
+            headers["X-With-Images-Summary"] = "true"
         if css_selector:
             headers["X-Target-Selector"] = css_selector
         if exclude_tags:
             headers["X-Remove-Selector"] = ",".join(exclude_tags)
-        if with_links_summary:
-            headers["X-With-Links-Summary"] = "true"
 
         try:
             resp = await self._client.get(  # type: ignore[union-attr]
@@ -280,14 +487,227 @@ class Crawl4AIClient:
             return CrawlResult(success=False, error=f"Jina error: {exc}")
 
         data = resp.json()
-        content = data.get("data", {}).get("content", "")
+        data_section = data.get("data", {}) if isinstance(data.get("data"), dict) else {}
+        content = data_section.get("content", "")
+        title_value = data_section.get("title")
+        title = title_value.strip() if isinstance(title_value, str) and title_value.strip() else None
         links = _extract_jina_links(data, url)
+        images = _extract_jina_images(data, url)
 
         if not content.strip():
             return CrawlResult(success=False, error="Jina returned empty content")
 
         markdown = clean_markdown(content)
-        return CrawlResult(markdown=markdown, html="", links=links, success=True)
+        # Jina returns ``meta.usage.tokens`` on every successful read. Newer
+        # responses surface it at top level; some older / proxy variants
+        # nest it under ``data.usage``. Try both before giving up.
+        tokens = _extract_jina_tokens(data, data_section)
+        usage = StageUsage(
+            stage="scraper",
+            provider="jina",
+            scrape_tokens=tokens,
+            cost_usd=cost.jina_cost(tokens),
+        )
+        return CrawlResult(
+            markdown=markdown,
+            html="",
+            title=title,
+            links=links,
+            images=images,
+            success=True,
+            usage=usage,
+        )
+
+    async def _scrape_with_firecrawl(
+        self,
+        url: str,
+        *,
+        timeout: int = 30,
+        markdown_type: str = "fit",
+        exclude_tags: list[str] | None = None,
+        css_selector: str | None = None,
+    ) -> CrawlResult:
+        """Scrape a URL via Firecrawl's ``POST /v2/scrape``.
+
+        Requests both ``markdown`` and ``html`` formats so the router's
+        ``links_summary`` HTML path can parse the full link graph (Firecrawl
+        returns the rendered DOM, not a content-filtered subset). The
+        ``onlyMainContent`` flag maps from ``markdown_type``: ``fit`` keeps
+        article-only output, ``raw`` / ``citations`` keep the full page.
+        """
+        if not self._firecrawl_key:
+            return CrawlResult(success=False, error="Firecrawl API key not configured")
+
+        payload: dict = {
+            "url": url,
+            "formats": ["markdown", "html"],
+            "onlyMainContent": markdown_type == "fit",
+        }
+        if exclude_tags:
+            payload["excludeTags"] = list(exclude_tags)
+        if css_selector:
+            payload["includeTags"] = [css_selector]
+
+        headers = {
+            "Authorization": f"Bearer {self._firecrawl_key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            resp = await self._client.post(  # type: ignore[union-attr]
+                f"{self._firecrawl_url}/v2/scrape",
+                json=payload,
+                headers=headers,
+                timeout=timeout + 10,
+            )
+            resp.raise_for_status()
+        except httpx.TimeoutException:
+            return CrawlResult(success=False, error=f"Firecrawl timeout after {timeout}s")
+        except httpx.HTTPStatusError as exc:
+            return CrawlResult(success=False, error=f"Firecrawl HTTP {exc.response.status_code}")
+        except Exception as exc:
+            return CrawlResult(success=False, error=f"Firecrawl error: {exc}")
+
+        data = resp.json()
+        if not data.get("success", True):
+            return CrawlResult(success=False, error=str(data.get("error") or "Firecrawl returned success=false"))
+
+        result_data = data.get("data") if isinstance(data.get("data"), dict) else {}
+        markdown_value = result_data.get("markdown")
+        html_value = result_data.get("html") or result_data.get("rawHtml") or ""
+        metadata = result_data.get("metadata") if isinstance(result_data.get("metadata"), dict) else {}
+        title_value = metadata.get("title") or metadata.get("ogTitle")
+        title = title_value.strip() if isinstance(title_value, str) and title_value.strip() else None
+
+        markdown = markdown_value if isinstance(markdown_value, str) else ""
+        if not markdown.strip() and not html_value.strip():
+            return CrawlResult(success=False, error="Firecrawl returned empty content")
+
+        # ``links`` is a flat list of absolute URLs when Firecrawl populates it
+        # (the v2 API includes it whenever the rendered HTML is requested).
+        links_value = result_data.get("links")
+        links: list[str] = []
+        seen: set[str] = set()
+        if isinstance(links_value, list):
+            for entry in links_value:
+                if isinstance(entry, str):
+                    candidate = urljoin(url, entry.strip())
+                    parsed = urlparse(candidate)
+                    if parsed.scheme in {"http", "https"} and candidate not in seen:
+                        seen.add(candidate)
+                        links.append(candidate)
+
+        credits = _extract_firecrawl_credits(data, result_data)
+        usage = StageUsage(
+            stage="scraper",
+            provider="firecrawl",
+            credits=credits,
+            cost_usd=cost.firecrawl_cost(credits),
+        )
+        return CrawlResult(
+            markdown=clean_markdown(markdown),
+            html=html_value,
+            title=title,
+            links=links,
+            success=True,
+            usage=usage,
+        )
+
+    async def _map_with_firecrawl(
+        self,
+        url: str,
+        *,
+        max_pages: int,
+        same_domain_only: bool,
+        timeout: int,
+    ) -> tuple[bool, list[str], list[dict], str | None, StageUsage | None]:
+        """Discover URLs via Firecrawl's ``POST /v2/map``.
+
+        Returns ``(success, visited, links, error, usage)``. ``usage``
+        captures the credits billed by Firecrawl for the map call (one
+        credit per URL returned on standard plans). Firecrawl's map
+        endpoint returns a flat URL list in a single round-trip — we treat
+        that list as both the visited set and the source of
+        ``discovered_links``, so the caller's downstream
+        ``split_documents_and_links`` still partitions pages from documents.
+        """
+        if not self._firecrawl_key:
+            return False, [], [], "Firecrawl API key not configured", None
+
+        payload: dict = {
+            "url": url,
+            "limit": max_pages,
+        }
+        headers = {
+            "Authorization": f"Bearer {self._firecrawl_key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            resp = await self._client.post(  # type: ignore[union-attr]
+                f"{self._firecrawl_url}/v2/map",
+                json=payload,
+                headers=headers,
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.TimeoutException:
+            return False, [], [], f"Firecrawl map timeout after {timeout}s", None
+        except httpx.HTTPStatusError as exc:
+            return False, [], [], f"Firecrawl map HTTP {exc.response.status_code}", None
+        except Exception as exc:
+            return False, [], [], f"Firecrawl map error: {exc}", None
+
+        if not data.get("success", True):
+            return False, [], [], str(data.get("error") or "Firecrawl map success=false"), None
+
+        raw_links = data.get("links") or []
+        root_domain = urlparse(url).netloc.lower()
+        visited: list[str] = []
+        discovered: list[dict] = []
+        seen_visited: set[str] = set()
+        seen_links: set[str] = set()
+        for entry in raw_links:
+            # Firecrawl v2 returns either bare URL strings or
+            # ``{"url": ..., "title": ...}`` objects depending on the request
+            # mode. Handle both so the caller sees the same shape.
+            if isinstance(entry, str):
+                href = entry
+                text = ""
+            elif isinstance(entry, dict):
+                href = entry.get("url") or entry.get("link") or ""
+                text = entry.get("title") or entry.get("text") or ""
+            else:
+                continue
+            if not isinstance(href, str) or not href.strip():
+                continue
+            absolute = urljoin(url, href.strip())
+            parsed = urlparse(absolute)
+            if parsed.scheme not in {"http", "https"}:
+                continue
+            if same_domain_only and parsed.netloc.lower() != root_domain:
+                continue
+            if absolute not in seen_visited:
+                seen_visited.add(absolute)
+                visited.append(absolute)
+            if absolute not in seen_links:
+                seen_links.add(absolute)
+                discovered.append({"href": absolute, "text": text})
+
+        # Firecrawl bills its map endpoint per URL returned. Some plans
+        # report ``creditsUsed`` explicitly; fall back to ``len(visited)`` so
+        # the count is at least directionally correct when missing.
+        credits = _extract_firecrawl_credits(data, None)
+        if credits == 0 and visited:
+            credits = float(len(visited))
+        usage = StageUsage(
+            stage="links_map",
+            provider="firecrawl",
+            credits=credits,
+            cost_usd=cost.firecrawl_cost(credits),
+        )
+        return True, visited, discovered, None, usage
 
     async def _scrape_with_httpx(
         self,
@@ -359,6 +779,24 @@ def _html_to_markdown(soup: BeautifulSoup) -> str:
     return "\n".join(lines)
 
 
+# Map the public markdown_type (fit / raw / citations) to Crawl4AI's /md
+# ``f`` filter. /md supports raw | fit | bm25 | llm only — citations is a
+# /crawl-only feature, so it degrades to f=raw here (same best-effort the
+# Jina and httpx branches already provide).
+_FILTER_BY_MARKDOWN_TYPE: dict[str, str] = {
+    "fit": "fit",
+    "raw": "raw",
+    "citations": "raw",
+}
+
+# Word-count floor for the Crawl4AI /md fit→raw fallback. The /md endpoint
+# returns markdown only (no HTML), so the router's ratio-based thin check
+# (which needs both) is bypassed; this is the in-client backstop. Tuned to
+# match the router's _THIN_WORD_THRESHOLD so both heuristics agree on what
+# counts as "suspiciously short."
+_FIT_FALLBACK_WORD_THRESHOLD = 20
+
+
 _MARKDOWN_PRIORITY: dict[str, tuple[str, ...]] = {
     "fit": ("fit_markdown", "markdown_with_citations", "raw_markdown"),
     "citations": ("markdown_with_citations", "raw_markdown", "fit_markdown"),
@@ -379,22 +817,56 @@ def _extract_markdown(markdown_value: object, *, preferred: str = "fit") -> str:
     return ""
 
 
-def _extract_html(result_data: dict) -> str:
-    # Preserve the full rendered DOM when available so downstream link discovery
-    # can see links that may be dropped from cleaned/fit variants.
-    for key in ("html", "cleaned_html", "fit_html"):
-        value = result_data.get(key)
-        if isinstance(value, str) and value.strip():
-            return value
-    return ""
-
-
 def _extract_error(result_data: dict) -> str | None:
     for key in ("error_message", "error"):
         value = result_data.get(key)
         if isinstance(value, str) and value:
             return value
     return None
+
+
+def _extract_jina_tokens(data: dict, data_section: dict) -> int:
+    """Pull Jina's token usage off the response.
+
+    Jina docs surface it at ``meta.usage.tokens`` (top level); some older
+    builds nest it under ``data.usage.tokens``. Try both, default to 0.
+    """
+    for container in (data.get("meta"), data_section.get("meta"), data, data_section):
+        if not isinstance(container, dict):
+            continue
+        usage = container.get("usage")
+        if isinstance(usage, dict):
+            tokens = usage.get("tokens")
+            if isinstance(tokens, (int, float)) and tokens > 0:
+                return int(tokens)
+    return 0
+
+
+def _extract_firecrawl_credits(data: dict, result_data: dict | None) -> float:
+    """Pull Firecrawl's ``creditsUsed`` off the response.
+
+    The v2 scrape envelope reports it on the top-level response or under
+    ``data.metadata.creditsUsed``; the v2 map endpoint reports it on the
+    top level when present. Returns 0.0 when the field is absent — the
+    caller can fall back to a heuristic (e.g. ``len(visited)`` for map).
+    """
+    candidates: list[dict] = []
+    if isinstance(data, dict):
+        candidates.append(data)
+        metadata = data.get("metadata")
+        if isinstance(metadata, dict):
+            candidates.append(metadata)
+    if isinstance(result_data, dict):
+        candidates.append(result_data)
+        result_meta = result_data.get("metadata")
+        if isinstance(result_meta, dict):
+            candidates.append(result_meta)
+    for container in candidates:
+        for key in ("creditsUsed", "credits_used", "credits"):
+            value = container.get(key)
+            if isinstance(value, (int, float)) and value > 0:
+                return float(value)
+    return 0.0
 
 
 def _extract_jina_links(data: dict, base_url: str) -> list[str]:
@@ -466,5 +938,50 @@ def _extract_jina_links(data: dict, base_url: str) -> list[str]:
 
     for candidate in candidates:
         _walk(candidate)
+
+    return urls
+
+
+def _extract_jina_images(data: dict, base_url: str) -> list[str]:
+    """Extract image URLs from Jina's ``data.images`` block.
+
+    Jina returns images as a dict (``{"Image 1": "url", ...}`` or
+    ``{"<alt>": "url"}``). Older / different responses may use a list of
+    dicts or strings — handle both. Returns deduped, absolute http(s) URLs.
+    """
+    data_section = data.get("data", {})
+    raw = data_section.get("images")
+    if raw is None:
+        raw = data.get("images")
+    if raw is None:
+        return []
+
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def _add(value: str) -> None:
+        normalized = urljoin(base_url, value.strip())
+        parsed = urlparse(normalized)
+        if parsed.scheme not in {"http", "https"}:
+            return
+        if normalized in seen:
+            return
+        seen.add(normalized)
+        urls.append(normalized)
+
+    if isinstance(raw, dict):
+        for value in raw.values():
+            if isinstance(value, str) and value.strip():
+                _add(value)
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str) and item.strip():
+                _add(item)
+            elif isinstance(item, dict):
+                for key in ("url", "src", "href"):
+                    nested = item.get(key)
+                    if isinstance(nested, str) and nested.strip():
+                        _add(nested)
+                        break
 
     return urls

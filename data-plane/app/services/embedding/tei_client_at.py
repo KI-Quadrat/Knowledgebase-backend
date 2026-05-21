@@ -13,6 +13,7 @@ import time
 import httpx
 
 from app.config import ext
+from app.models.common import StageUsage
 from app.services.embedding.bge_m3_client import EmbeddingError, EmbeddingResult
 from app.utils.logger import get_logger
 
@@ -29,6 +30,8 @@ class TEIEmbedClientAT:
         self._model = ext.tei_embed_model_at
         self._cf_client_id = ext.tei_cf_access_client_id_at
         self._cf_client_secret = ext.tei_cf_access_client_secret_at
+        # Self-hosted — zero-cost usage entry set after every embed_batch.
+        self.last_usage: StageUsage | None = None
 
     async def startup(self) -> None:
         if not self._api_key:
@@ -80,6 +83,9 @@ class TEIEmbedClientAT:
             count=len(texts),
             duration_ms=duration,
             windows=(len(texts) + max_batch - 1) // max_batch,
+        )
+        self.last_usage = StageUsage(
+            stage="embedding", provider="bge_m3", model=self._model or "bge-m3", cost_usd=0.0
         )
         return results
 

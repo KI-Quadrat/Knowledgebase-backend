@@ -62,6 +62,63 @@ class TestNormalizeProvinces:
         assert _normalize_provinces(["NiederÖsterreich"]) == ["lower austria"]
 
 
+class TestNormalizeProvincesMultiCountry:
+    """Coverage for the shared cross-country normalize_provinces helper.
+
+    Same alias-map machinery as the AT-pinned wrapper, but parameterized by
+    country code. Used by /ingest and /ingest/stream when callers pass
+    `state_or_province` overrides for any country.
+    """
+
+    def test_de_german_to_english(self):
+        from app.services.intelligence.funding_extractor import normalize_provinces
+        assert normalize_provinces("DE", ["Bayern"]) == ["bavaria"]
+        assert normalize_provinces("DE", ["Niedersachsen", "BERLIN"]) == ["lower saxony", "berlin"]
+        assert normalize_provinces("DE", ["Thüringen"]) == ["thuringia"]
+
+    def test_ch_multilingual_aliases(self):
+        from app.services.intelligence.funding_extractor import normalize_provinces
+        # German / French / Italian inputs all collapse to canonical English
+        assert normalize_provinces("CH", ["Zürich"]) == ["zurich"]
+        assert normalize_provinces("CH", ["Genève", "Genf", "Geneva"]) == ["geneva"]
+        assert normalize_provinces("CH", ["Tessin"]) == ["ticino"]
+        assert normalize_provinces("CH", ["Wallis", "Valais"]) == ["valais"]
+
+    def test_ro_diacritics_handled(self):
+        from app.services.intelligence.funding_extractor import normalize_provinces
+        assert normalize_provinces("RO", ["București"]) == ["bucharest"]
+        assert normalize_provinces("RO", ["Bucuresti"]) == ["bucharest"]
+        assert normalize_provinces("RO", ["Iași", "Cluj"]) == ["iasi", "cluj"]
+
+    def test_cz_czech_to_english(self):
+        from app.services.intelligence.funding_extractor import normalize_provinces
+        assert normalize_provinces("CZ", ["Praha"]) == ["prague"]
+        assert normalize_provinces("CZ", ["Středočeský"]) == ["central bohemia"]
+
+    def test_unknown_value_dropped_for_known_country(self):
+        from app.services.intelligence.funding_extractor import normalize_provinces
+        assert normalize_provinces("DE", ["Atlantis", "Bayern"]) == ["bavaria"]
+        # AT-only province should not survive in DE
+        assert normalize_provinces("DE", ["vienna"]) == []
+
+    def test_unknown_country_passes_through_lowercase(self):
+        from app.services.intelligence.funding_extractor import normalize_provinces
+        # No alias map, no PROVINCES_BY_COUNTRY entry — just lowercase + dedup
+        assert normalize_provinces("US", ["California", "TEXAS", "california"]) == [
+            "california", "texas",
+        ]
+
+    def test_none_country_passes_through_lowercase(self):
+        from app.services.intelligence.funding_extractor import normalize_provinces
+        assert normalize_provinces(None, ["Foo", "Bar"]) == ["foo", "bar"]
+
+    def test_empty_inputs(self):
+        from app.services.intelligence.funding_extractor import normalize_provinces
+        assert normalize_provinces("DE", []) == []
+        assert normalize_provinces("DE", None) == []
+        assert normalize_provinces(None, None) == []
+
+
 class TestComposeBaseUrl:
     """Ensures QDRANT_URL_AT + QDRANT_PORT_AT compose correctly, matching the
     upstream qdrant-client pattern (URL and port supplied separately)."""
@@ -129,7 +186,12 @@ def _install(*, extract_return: dict | None = None, embed_dim: int = 1024):
     app.state.chunker = chunker
 
     enricher = MagicMock()
-    enricher.enrich_chunks = AsyncMock(side_effect=lambda document, chunks: list(chunks))
+    # enrich_chunks now returns (enriched_chunks, usage). Tests don't care
+    # about usage so pass None — the AT router treats None as "no contextual
+    # spend this call" and skips that stage in its UsageSummary.
+    enricher.enrich_chunks = AsyncMock(
+        side_effect=lambda document, chunks: (list(chunks), None)
+    )
     app.state.contextual_enricher = enricher
 
     embedder = MagicMock()
@@ -145,6 +207,12 @@ def _install(*, extract_return: dict | None = None, embed_dim: int = 1024):
     qdrant.delete_by_filter = AsyncMock(return_value=0)
     qdrant.upsert_points = AsyncMock(side_effect=lambda _col, points: len(points))
     app.state.qdrant_at = qdrant
+
+    # AT router persists usage to ClickHouse via scraping.audit. Tests
+    # mock the whole scraping service away, so swap the one awaited method.
+    scraping = MagicMock()
+    scraping.audit.log_usage = AsyncMock()
+    app.state.scraping = scraping
 
     return {"chunker": chunker, "embedder": embedder, "extractor": extractor, "qdrant": qdrant}
 
@@ -318,15 +386,19 @@ class TestEndpoint:
             assert p["payload"]["metadata"]["program_name"] == "Sportförderung 2025"
 
     def test_extracted_contact_fields_land_in_metadata(self):
-        """program_name / processing_office / contract_email / contract_phone
-        from the funding extractor flow through to point metadata.
-        contract_email / contract_phone are arrays — a funding doc can list
-        multiple contacts."""
+        """program_name / processing_office / contract_email / contract_phone /
+        application_form from the funding extractor flow through to point
+        metadata. The list-typed fields are arrays — a funding doc can list
+        multiple contacts and multiple application forms."""
         handles = _install(extract_return={
             "program_name": "Sportförderung 2025",
             "processing_office": ["Abteilung Sport, Land Salzburg", "Magistrat Salzburg"],
             "contract_email": ["sport@salzburg.gv.at", "foerderungen@salzburg.gv.at"],
             "contract_phone": ["+43 662 8042 3333", "+43 662 8042 3334"],
+            "application_form": [
+                "https://www.salzburg.gv.at/forms/sportfoerderung-antrag.pdf",
+                "Antragsformular Sportförderung 2025",
+            ],
             "state_or_province": ["salzburg"],
         })
 
@@ -342,6 +414,10 @@ class TestEndpoint:
             assert md["processing_office"] == ["Abteilung Sport, Land Salzburg", "Magistrat Salzburg"]
             assert md["contract_email"] == ["sport@salzburg.gv.at", "foerderungen@salzburg.gv.at"]
             assert md["contract_phone"] == ["+43 662 8042 3333", "+43 662 8042 3334"]
+            assert md["application_form"] == [
+                "https://www.salzburg.gv.at/forms/sportfoerderung-antrag.pdf",
+                "Antragsformular Sportförderung 2025",
+            ]
 
     def test_metadata_includes_source_id_and_omits_chunk_fields(self):
         """source_id is written to every point's metadata; chunk_id and

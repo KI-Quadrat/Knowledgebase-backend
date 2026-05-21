@@ -40,11 +40,12 @@ import time
 
 from fastapi import APIRouter, Request
 
-from app.models.common import ErrorCode, ResponseEnvelope
+from app.models.common import ErrorCode, ResponseEnvelope, StageUsage, UsageSummary
 from app.models.online.ingest import EmbeddingModel
 from app.models.online.ingest_at import OnlineIngestATData, OnlineIngestATRequest
 from app.services.embedding.bge_m3_client import EmbeddingError
 from app.services.embedding.qdrant_service import QdrantError
+from app.services.intelligence.funding_extractor import normalize_provinces
 from app.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -96,49 +97,12 @@ _KNOWN_METADATA_KEYS = {
 }
 
 
-# German / English → canonical English-lowercase form. The canonical forms
-# match funding_extractor.PROVINCES_BY_COUNTRY["AT"] exactly so overrides and
-# extractor output produce the same stored metadata.state_or_province value
-# regardless of caller input casing or language.
-_AT_PROVINCE_ALIASES: dict[str, str] = {
-    # English (canonical)
-    "burgenland": "burgenland",
-    "carinthia": "carinthia",
-    "lower austria": "lower austria",
-    "upper austria": "upper austria",
-    "salzburg": "salzburg",
-    "styria": "styria",
-    "tyrol": "tyrol",
-    "vorarlberg": "vorarlberg",
-    "vienna": "vienna",
-    # German
-    "kärnten": "carinthia",
-    "niederösterreich": "lower austria",
-    "oberösterreich": "upper austria",
-    "steiermark": "styria",
-    "tirol": "tyrol",
-    "wien": "vienna",
-}
-
-
+# Province normalization is delegated to ``funding_extractor.normalize_provinces``
+# so AT, DE, CH, and any other supported country share the same alias map +
+# validation logic. The wrapper below pins the country to AT — that is the
+# only country this endpoint serves.
 def _normalize_provinces(names: list[str] | None) -> list[str]:
-    """Canonicalize AT province names to the same English-lowercase form the
-    funding extractor emits.
-
-    Accepts German or English input, any casing. Unknown values are dropped so
-    the stored ``metadata.state_or_province`` is always a subset of the nine
-    official AT provinces — search-time filters stay consistent across ingests.
-    """
-    if not names:
-        return []
-    seen: set[str] = set()
-    out: list[str] = []
-    for raw in names:
-        canonical = _AT_PROVINCE_ALIASES.get((raw or "").strip().lower())
-        if canonical and canonical not in seen:
-            seen.add(canonical)
-            out.append(canonical)
-    return out
+    return normalize_provinces(_AT_COUNTRY, names)
 
 
 def _build_point(
@@ -227,8 +191,11 @@ async def _delete_existing_by_source_id(qdrant, collection: str, source_id: str)
         "fast with `QDRANT_COLLECTION_NOT_FOUND`.\n\n"
         "**Metadata:** the funding extractor runs unconditionally and its "
         "output (title, program_name, processing_office, contract_email, "
-        "contract_phone, state_or_province, funding_type, status, …) is "
-        "merged into `metadata.*` on every point. `state_or_province` in the "
+        "contract_phone, application_form, state_or_province, funding_type, "
+        "status, …) is merged into `metadata.*` on every point. `application_form` "
+        "is a list of URLs to the program's application forms (PDF or online "
+        "form pages); when no URL is available the LLM may include a form name "
+        "verbatim instead. `state_or_province` in the "
         "request body overrides the extractor's choice for the stored "
         "metadata only — there is no per-province collection routing.\n\n"
         "**Idempotency:** prior points for the same `source_id` are deleted via "
@@ -236,15 +203,13 @@ async def _delete_existing_by_source_id(qdrant, collection: str, source_id: str)
         "fully replaces stored chunks, correctly handling cases where the new "
         "content produces a different chunk count.\n\n"
         "**Embedding:** picked by `embedding_model`. `bge_m3` (default) uses "
-        "the TEI server at `TEI_EMBED_URL_AT` (OpenAI-compatible, bearer-auth "
-        "via `TEI_EMBED_API_KEY_AT`, 1024-dim, stored in the AT collection's "
-        "single unnamed vector slot). `openai` uses `text-embedding-3-small` "
-        "(1536-dim) and requires a fresh collection sized to that dim.\n\n"
-        "**Qdrant target:** uses `QDRANT_URL_AT` / `QDRANT_PORT_AT` / `QDRANT_API_KEY_AT` "
-        "when set, falling back to the default Qdrant endpoint otherwise. "
-        "`QDRANT_PORT_AT` has no default — leave it unset when the port is "
-        "already embedded in `QDRANT_URL_AT`.\n\n"
-        "**Optional X-API-Key header** — required only when `DP_ONLINE_API_KEYS` is configured.\n\n"
+        "the configured TEI server (OpenAI-compatible, bearer-auth, 1024-dim, "
+        "stored in the AT collection's single unnamed vector slot). `openai` "
+        "uses `text-embedding-3-small` (1536-dim) and requires a fresh collection "
+        "sized to that dim.\n\n"
+        "**Qdrant target:** AT-pipeline Qdrant instance when configured, falling "
+        "back to the default Qdrant endpoint otherwise.\n\n"
+        "**Optional X-API-Key header** when API-key auth is configured.\n\n"
         "**Error codes:** `VALIDATION_EMPTY_CONTENT`, `EMBEDDING_MODEL_NOT_LOADED`, "
         "`EMBEDDING_FAILED`, `EMBEDDING_OOM`, `QDRANT_CONNECTION_FAILED`, "
         "`QDRANT_COLLECTION_NOT_FOUND`, `QDRANT_UPSERT_FAILED`, `QDRANT_DISK_FULL`."
@@ -289,6 +254,11 @@ async def ingest_online_at(
         embedder = request.app.state.tei_embedder_at
         dense_dim = 1024
 
+    # Per-stage usage collected as the hand-rolled pipeline runs; rolled
+    # into the response envelope's ``usage`` summary at the end. Mirrors
+    # what IngestService.ingest() does for the standard /online/ingest path.
+    usage_entries: list[StageUsage] = []
+
     # ── 1. Funding extraction (once) ──
     extracted = await _safe_extract_funding(
         extractor,
@@ -296,6 +266,11 @@ async def ingest_online_at(
         source_url=body.url,
         source_id=body.source_id,
     )
+    # Funding extractor stashes its StageUsage under ``__usage__`` so the
+    # caller can lift it out before merging the rest into Qdrant metadata.
+    funding_usage = extracted.pop("__usage__", None) if isinstance(extracted, dict) else None
+    if isinstance(funding_usage, StageUsage):
+        usage_entries.append(funding_usage)
 
     # ── 2. Chunk (+ optional contextual enrichment) ──
     chunking = body.chunking
@@ -320,7 +295,9 @@ async def ingest_online_at(
     chunks = chunk_result.chunks
     if use_contextual and contextual_enricher:
         try:
-            chunks = await contextual_enricher.enrich_chunks(document=body.content, chunks=chunks)
+            chunks, ctx_usage = await contextual_enricher.enrich_chunks(document=body.content, chunks=chunks)
+            if ctx_usage is not None:
+                usage_entries.append(ctx_usage)
         except Exception as e:
             log.warning("ingest_online_at_contextual_failed", source_id=body.source_id, error=str(e))
 
@@ -328,6 +305,12 @@ async def ingest_online_at(
     embed_start = time.monotonic()
     try:
         embeddings = await embedder.embed_batch(chunks)
+        embed_usage = getattr(embedder, "last_usage", None)
+        # isinstance gates out MagicMock / test stubs that don't actually
+        # implement the contract; production clients set this to a real
+        # StageUsage in ``embed_batch``.
+        if isinstance(embed_usage, StageUsage):
+            usage_entries.append(embed_usage)
     except EmbeddingError as e:
         msg = str(e).lower()
         if "oom" in msg or "memory" in msg:
@@ -432,6 +415,16 @@ async def ingest_online_at(
         total_ms=total_ms,
     )
 
+    await request.app.state.scraping.audit.log_usage(
+        usage_entries,
+        endpoint="ingest_at",
+        request_id=request_id,
+        url=body.url,
+        municipality_id=body.metadata.municipality_id or "",
+        assistant_id=body.metadata.assistant_id or "",
+        assistant_type=_AT_ASSISTANT_TYPE,
+    )
+
     return ResponseEnvelope(
         success=True,
         data=OnlineIngestATData(
@@ -442,6 +435,7 @@ async def ingest_online_at(
             content_type=body.content_type,
             embedding_time_ms=embedding_time_ms,
             total_time_ms=total_ms,
+            usage=UsageSummary.from_entries(usage_entries),
         ),
         request_id=request_id,
     )

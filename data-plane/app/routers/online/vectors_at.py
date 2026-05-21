@@ -23,14 +23,13 @@ router = APIRouter(prefix="/api/v1/online", tags=["Online - Vector Management (A
     summary="Delete all AT vectors for a document",
     description=(
         "Remove all vector points associated with a `source_id` from the specified "
-        "Qdrant collection on the AT Qdrant instance (`QDRANT_URL_AT` / "
-        "`QDRANT_PORT_AT` / `QDRANT_API_KEY_AT`).\n\n"
+        "Qdrant collection on the AT Qdrant instance.\n\n"
         "Mirrors `DELETE /api/v1/online/vectors/{source_id}` — same signature, "
         "only the target Qdrant instance differs.\n\n"
         "**Required query parameter:** `collection_name` — one of the nine AT "
         "province collections (`Burgenland`, `Kärnten`, `Niederösterreich`, "
         "`Oberösterreich`, `Salzburg`, `Steiermark`, `Tirol`, `Vorarlberg`, `Wien`).\n\n"
-        "**Optional X-API-Key header** — required only when `DP_ONLINE_API_KEYS` is configured.\n\n"
+        "**Optional X-API-Key header** when API-key auth is configured.\n\n"
         "**Error codes:** `QDRANT_CONNECTION_FAILED`, `QDRANT_DELETE_FAILED`"
     ),
     response_description="Deletion confirmation with count of removed vectors",

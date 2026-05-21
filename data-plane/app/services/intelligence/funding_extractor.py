@@ -16,9 +16,19 @@ from datetime import datetime, timezone
 from openai import AsyncOpenAI, BadRequestError, RateLimitError
 
 from app.config import ext
+from app.models.common import StageUsage
+from app.services import cost
+from app.services.intelligence import llm_router
 from app.utils.logger import get_logger
 
 log = get_logger(__name__)
+
+# Sentinel key the extractor adds to its result dict to ship the per-call
+# usage record back to the caller (the funding result otherwise becomes
+# Qdrant payload, so an unprefixed ``usage`` key would conflict with real
+# document metadata). ``IngestService.ingest`` pops this key before
+# merging the rest into the stored payload.
+_KEY_USAGE = "__usage__"
 
 # ---------------------------------------------------------------------------
 # Official first-level administrative divisions per country.
@@ -98,6 +108,323 @@ PROVINCES_BY_COUNTRY: dict[str, list[str]] = {
     ],
 }
 
+# ---------------------------------------------------------------------------
+# Local-language → canonical English-lowercase aliases for province overrides.
+# Keyed by ISO country code. The canonical (right-hand) values must match
+# PROVINCES_BY_COUNTRY exactly so request overrides and extractor output
+# produce the same stored ``metadata.state_or_province`` value regardless of
+# input language or casing. Add aliases per country as needed — unknown
+# inputs for a country with a known list are dropped during normalization.
+# ---------------------------------------------------------------------------
+PROVINCE_ALIASES_BY_COUNTRY: dict[str, dict[str, str]] = {
+    "AT": {
+        # English (canonical, identity entries so case-only inputs still resolve)
+        "burgenland": "burgenland",
+        "carinthia": "carinthia",
+        "lower austria": "lower austria",
+        "upper austria": "upper austria",
+        "salzburg": "salzburg",
+        "styria": "styria",
+        "tyrol": "tyrol",
+        "vorarlberg": "vorarlberg",
+        "vienna": "vienna",
+        # German
+        "kärnten": "carinthia",
+        "niederösterreich": "lower austria",
+        "oberösterreich": "upper austria",
+        "steiermark": "styria",
+        "tirol": "tyrol",
+        "wien": "vienna",
+    },
+    "DE": {
+        # German → English (canonical PROVINCES_BY_COUNTRY entries)
+        "baden-württemberg": "baden-wurttemberg",
+        "bayern": "bavaria",
+        "berlin": "berlin",
+        "brandenburg": "brandenburg",
+        "bremen": "bremen",
+        "hamburg": "hamburg",
+        "hessen": "hesse",
+        "niedersachsen": "lower saxony",
+        "mecklenburg-vorpommern": "mecklenburg-vorpommern",
+        "nordrhein-westfalen": "north rhine-westphalia",
+        "rheinland-pfalz": "rhineland-palatinate",
+        "saarland": "saarland",
+        "sachsen": "saxony",
+        "sachsen-anhalt": "saxony-anhalt",
+        "schleswig-holstein": "schleswig-holstein",
+        "thüringen": "thuringia",
+    },
+    "CH": {
+        # German / French / Italian → English (canonical PROVINCES_BY_COUNTRY entries)
+        "zürich": "zurich",
+        "zuerich": "zurich",
+        "bern": "bern",
+        "berne": "bern",
+        "luzern": "lucerne",
+        "lucerne": "lucerne",
+        "uri": "uri",
+        "schwyz": "schwyz",
+        "obwalden": "obwalden",
+        "nidwalden": "nidwalden",
+        "glarus": "glarus",
+        "zug": "zug",
+        "fribourg": "fribourg",
+        "freiburg": "fribourg",
+        "solothurn": "solothurn",
+        "soleure": "solothurn",
+        "basel-stadt": "basel-stadt",
+        "bâle-ville": "basel-stadt",
+        "basel-landschaft": "basel-landschaft",
+        "bâle-campagne": "basel-landschaft",
+        "schaffhausen": "schaffhausen",
+        "appenzell ausserrhoden": "appenzell ausserrhoden",
+        "appenzell innerrhoden": "appenzell innerrhoden",
+        "st. gallen": "st. gallen",
+        "sankt gallen": "st. gallen",
+        "graubünden": "graubunden",
+        "graubunden": "graubunden",
+        "grisons": "graubunden",
+        "aargau": "aargau",
+        "argovie": "aargau",
+        "thurgau": "thurgau",
+        "thurgovie": "thurgau",
+        "ticino": "ticino",
+        "tessin": "ticino",
+        "vaud": "vaud",
+        "waadt": "vaud",
+        "valais": "valais",
+        "wallis": "valais",
+        "neuchâtel": "neuchatel",
+        "neuchatel": "neuchatel",
+        "neuenburg": "neuchatel",
+        "genève": "geneva",
+        "geneve": "geneva",
+        "geneva": "geneva",
+        "genf": "geneva",
+        "jura": "jura",
+    },
+    "RO": {
+        # Romanian local names + diacritic-stripped variants → canonical
+        "alba": "alba",
+        "arad": "arad",
+        "argeș": "arges", "arges": "arges",
+        "bacău": "bacau", "bacau": "bacau",
+        "bihor": "bihor",
+        "bistrița-năsăud": "bistrita-nasaud", "bistrita-nasaud": "bistrita-nasaud",
+        "botoșani": "botosani", "botosani": "botosani",
+        "brăila": "braila", "braila": "braila",
+        "brașov": "brasov", "brasov": "brasov",
+        "bucurești": "bucharest", "bucuresti": "bucharest", "bucharest": "bucharest",
+        "buzău": "buzau", "buzau": "buzau",
+        "călărași": "calarasi", "calarasi": "calarasi",
+        "caraș-severin": "caras-severin", "caras-severin": "caras-severin",
+        "cluj": "cluj",
+        "constanța": "constanta", "constanta": "constanta",
+        "covasna": "covasna",
+        "dâmbovița": "dambovita", "dambovita": "dambovita",
+        "dolj": "dolj",
+        "galați": "galati", "galati": "galati",
+        "giurgiu": "giurgiu",
+        "gorj": "gorj",
+        "harghita": "harghita",
+        "hunedoara": "hunedoara",
+        "ialomița": "ialomita", "ialomita": "ialomita",
+        "iași": "iasi", "iasi": "iasi",
+        "ilfov": "ilfov",
+        "maramureș": "maramures", "maramures": "maramures",
+        "mehedinți": "mehedinti", "mehedinti": "mehedinti",
+        "mureș": "mures", "mures": "mures",
+        "neamț": "neamt", "neamt": "neamt",
+        "olt": "olt",
+        "prahova": "prahova",
+        "sălaj": "salaj", "salaj": "salaj",
+        "satu mare": "satu mare",
+        "sibiu": "sibiu",
+        "suceava": "suceava",
+        "teleorman": "teleorman",
+        "timiș": "timis", "timis": "timis",
+        "tulcea": "tulcea",
+        "vâlcea": "valcea", "valcea": "valcea",
+        "vaslui": "vaslui",
+        "vrancea": "vrancea",
+    },
+    "IT": {
+        # Italian regions → English canonical
+        "abruzzo": "abruzzo",
+        "valle d'aosta": "aosta valley", "valle daosta": "aosta valley", "aosta valley": "aosta valley",
+        "puglia": "apulia", "apulia": "apulia",
+        "basilicata": "basilicata",
+        "calabria": "calabria",
+        "campania": "campania",
+        "emilia-romagna": "emilia-romagna",
+        "friuli-venezia giulia": "friuli venezia giulia", "friuli venezia giulia": "friuli venezia giulia",
+        "lazio": "lazio",
+        "liguria": "liguria",
+        "lombardia": "lombardy", "lombardy": "lombardy",
+        "marche": "marche",
+        "molise": "molise",
+        "piemonte": "piedmont", "piedmont": "piedmont",
+        "sardegna": "sardinia", "sardinia": "sardinia",
+        "sicilia": "sicily", "sicily": "sicily",
+        "alto adige": "south tyrol", "südtirol": "south tyrol",
+        "trentino-alto adige": "trentino", "trentino": "trentino",
+        "toscana": "tuscany", "tuscany": "tuscany",
+        "umbria": "umbria",
+        "veneto": "veneto",
+    },
+    "FR": {
+        # French region names → English canonical (already mostly French in PROVINCES_BY_COUNTRY)
+        "auvergne-rhône-alpes": "auvergne-rhone-alpes", "auvergne-rhone-alpes": "auvergne-rhone-alpes",
+        "bourgogne-franche-comté": "bourgogne-franche-comte", "bourgogne-franche-comte": "bourgogne-franche-comte",
+        "bretagne": "brittany", "brittany": "brittany",
+        "centre-val de loire": "centre-val de loire",
+        "corse": "corsica", "corsica": "corsica",
+        "grand est": "grand est",
+        "hauts-de-france": "hauts-de-france",
+        "île-de-france": "ile-de-france", "ile-de-france": "ile-de-france",
+        "normandie": "normandy", "normandy": "normandy",
+        "nouvelle-aquitaine": "nouvelle-aquitaine",
+        "occitanie": "occitanie",
+        "pays de la loire": "pays de la loire",
+        "provence-alpes-côte d'azur": "provence-alpes-cote d'azur",
+        "provence-alpes-cote d'azur": "provence-alpes-cote d'azur",
+        "paca": "provence-alpes-cote d'azur",
+    },
+    "HU": {
+        # Hungarian county names → canonical (PROVINCES_BY_COUNTRY uses ASCII-stripped Hungarian)
+        "bács-kiskun": "bacs-kiskun", "bacs-kiskun": "bacs-kiskun",
+        "baranya": "baranya",
+        "békés": "bekes", "bekes": "bekes",
+        "borsod-abaúj-zemplén": "borsod-abauj-zemplen", "borsod-abauj-zemplen": "borsod-abauj-zemplen",
+        "budapest": "budapest",
+        "csongrád-csanád": "csongrad-csanad", "csongrad-csanad": "csongrad-csanad",
+        "fejér": "fejer", "fejer": "fejer",
+        "győr-moson-sopron": "gyor-moson-sopron", "gyor-moson-sopron": "gyor-moson-sopron",
+        "hajdú-bihar": "hajdu-bihar", "hajdu-bihar": "hajdu-bihar",
+        "heves": "heves",
+        "jász-nagykun-szolnok": "jasz-nagykun-szolnok", "jasz-nagykun-szolnok": "jasz-nagykun-szolnok",
+        "komárom-esztergom": "komarom-esztergom", "komarom-esztergom": "komarom-esztergom",
+        "nógrád": "nograd", "nograd": "nograd",
+        "pest": "pest",
+        "somogy": "somogy",
+        "szabolcs-szatmár-bereg": "szabolcs-szatmar-bereg", "szabolcs-szatmar-bereg": "szabolcs-szatmar-bereg",
+        "tolna": "tolna",
+        "vas": "vas",
+        "veszprém": "veszprem", "veszprem": "veszprem",
+        "zala": "zala",
+    },
+    "CZ": {
+        # Czech regions → English canonical
+        "středočeský": "central bohemia", "stredocesky": "central bohemia", "central bohemia": "central bohemia",
+        "královéhradecký": "hradec kralove", "kralovehradecky": "hradec kralove", "hradec kralove": "hradec kralove",
+        "karlovarský": "karlovy vary", "karlovarsky": "karlovy vary", "karlovy vary": "karlovy vary",
+        "liberecký": "liberec", "liberecky": "liberec", "liberec": "liberec",
+        "moravskoslezský": "moravian-silesian", "moravskoslezsky": "moravian-silesian", "moravian-silesian": "moravian-silesian",
+        "olomoucký": "olomouc", "olomoucky": "olomouc", "olomouc": "olomouc",
+        "pardubický": "pardubice", "pardubicky": "pardubice", "pardubice": "pardubice",
+        "plzeňský": "plzen", "plzensky": "plzen", "plzen": "plzen",
+        "praha": "prague", "prague": "prague",
+        "jihočeský": "south bohemia", "jihocesky": "south bohemia", "south bohemia": "south bohemia",
+        "jihomoravský": "south moravia", "jihomoravsky": "south moravia", "south moravia": "south moravia",
+        "ústecký": "usti nad labem", "ustecky": "usti nad labem", "usti nad labem": "usti nad labem",
+        "vysočina": "vysocina", "vysocina": "vysocina",
+        "zlínský": "zlin", "zlinsky": "zlin", "zlin": "zlin",
+    },
+    "SK": {
+        # Slovak regions → English canonical (PROVINCES_BY_COUNTRY uses Slovak with diacritics for some)
+        "banská bystrica": "banská bystrica", "banska bystrica": "banská bystrica",
+        "bratislava": "bratislava",
+        "košice": "kosice", "kosice": "kosice",
+        "nitra": "nitra",
+        "prešov": "presov", "presov": "presov",
+        "trenčín": "trencin", "trencin": "trencin",
+        "trnava": "trnava",
+        "žilina": "zilina", "zilina": "zilina",
+    },
+    "SI": {
+        # Slovenian statistical regions → English canonical
+        "zasavska": "central sava", "central sava": "central sava",
+        "osrednjeslovenska": "central slovenia", "central slovenia": "central slovenia",
+        "koroška": "carinthia", "koroska": "carinthia", "carinthia": "carinthia",
+        "obalno-kraška": "coastal-karst", "obalno-kraska": "coastal-karst", "coastal-karst": "coastal-karst",
+        "podravska": "drava", "drava": "drava",
+        "goriška": "gorizia", "goriska": "gorizia", "gorizia": "gorizia",
+        "notranjsko-kraška": "inner carniola-karst", "notranjsko-kraska": "inner carniola-karst", "inner carniola-karst": "inner carniola-karst",
+        "primorsko-notranjska": "littoral-inner carniola", "littoral-inner carniola": "littoral-inner carniola",
+        "posavska": "lower sava", "lower sava": "lower sava",
+        "pomurska": "mura", "mura": "mura",
+        "podravje": "podravje",
+        "pomurje": "pomurje",
+        "savinjska": "savinja", "savinja": "savinja",
+        "jugovzhodna slovenija": "southeast slovenia", "southeast slovenia": "southeast slovenia",
+        "gorenjska": "upper carniola", "upper carniola": "upper carniola",
+    },
+    "HR": {
+        # Croatian counties → English canonical
+        "bjelovarsko-bilogorska": "bjelovar-bilogora", "bjelovar-bilogora": "bjelovar-bilogora",
+        "brodsko-posavska": "brod-posavina", "brod-posavina": "brod-posavina",
+        "dubrovačko-neretvanska": "dubrovnik-neretva", "dubrovacko-neretvanska": "dubrovnik-neretva", "dubrovnik-neretva": "dubrovnik-neretva",
+        "istarska": "istria", "istria": "istria",
+        "karlovačka": "karlovac", "karlovacka": "karlovac", "karlovac": "karlovac",
+        "koprivničko-križevačka": "koprivnica-krizevci", "koprivnicko-krizevacka": "koprivnica-krizevci", "koprivnica-krizevci": "koprivnica-krizevci",
+        "krapinsko-zagorska": "krapina-zagorje", "krapina-zagorje": "krapina-zagorje",
+        "ličko-senjska": "lika-senj", "licko-senjska": "lika-senj", "lika-senj": "lika-senj",
+        "međimurska": "medimurje", "medimurska": "medimurje", "medimurje": "medimurje",
+        "osječko-baranjska": "osijek-baranja", "osjecko-baranjska": "osijek-baranja", "osijek-baranja": "osijek-baranja",
+        "požeško-slavonska": "pozega-slavonia", "pozesko-slavonska": "pozega-slavonia", "pozega-slavonia": "pozega-slavonia",
+        "primorsko-goranska": "primorje-gorski kotar", "primorje-gorski kotar": "primorje-gorski kotar",
+        "šibensko-kninska": "sibenik-knin", "sibensko-kninska": "sibenik-knin", "sibenik-knin": "sibenik-knin",
+        "sisačko-moslavačka": "sisak-moslavina", "sisacko-moslavacka": "sisak-moslavina", "sisak-moslavina": "sisak-moslavina",
+        "splitsko-dalmatinska": "split-dalmatia", "split-dalmatia": "split-dalmatia",
+        "varaždinska": "varazdin", "varazdinska": "varazdin", "varazdin": "varazdin",
+        "virovitičko-podravska": "virovitica-podravina", "viroviticko-podravska": "virovitica-podravina", "virovitica-podravina": "virovitica-podravina",
+        "vukovarsko-srijemska": "vukovar-srijem", "vukovar-srijem": "vukovar-srijem",
+        "zadarska": "zadar", "zadar": "zadar",
+        "grad zagreb": "zagreb", "zagreb": "zagreb",
+        "zagrebačka": "zagreb county", "zagrebacka": "zagreb county", "zagreb county": "zagreb county",
+    },
+}
+
+
+def normalize_provinces(country: str | None, names: list[str] | None) -> list[str]:
+    """Canonicalize province names to English-lowercase form, deduped.
+
+    Resolution order (per name):
+      1. Strip + lowercase.
+      2. If the country has an entry in ``PROVINCE_ALIASES_BY_COUNTRY``, look
+         up the alias (handles local-language → English).
+      3. If the country has an entry in ``PROVINCES_BY_COUNTRY`` (the
+         authoritative list), keep only values present in that list.
+      4. Otherwise return the lowercased value (no validation).
+
+    Empty / unknown values are dropped — the resulting list is always a clean
+    subset suitable for search-time filtering. Order is preserved.
+    """
+    if not names:
+        return []
+    country_code = (country or "").upper().strip()
+    aliases = PROVINCE_ALIASES_BY_COUNTRY.get(country_code, {})
+    known = PROVINCES_BY_COUNTRY.get(country_code)
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in names:
+        if not isinstance(raw, str):
+            continue
+        key = raw.strip().lower()
+        if not key:
+            continue
+        canonical = aliases.get(key, key)
+        if known is not None and canonical not in known:
+            continue
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        out.append(canonical)
+    return out
+
+
 _BASE_SYSTEM_PROMPT = """\
 You are a metadata extractor for government funding documents.
 
@@ -116,6 +443,7 @@ Respond ONLY with valid JSON matching this exact schema:
   "processing_office": ["<names of the offices/departments that process applications. Multiple allowed. Empty list if unknown>"],
   "contract_email": ["<contract/contact email addresses found in the document. Multiple allowed. Empty list if none>"],
   "contract_phone": ["<contract/contact phone numbers found in the document. Multiple allowed. Empty list if none>"],
+  "application_form": ["<URLs to application forms (PDF or online form pages) referenced in the document. Multiple allowed. If no URL is available but a form is named, include the form name verbatim. Empty list if none>"],
   "country_code": "<ISO 3166-1 alpha-2 country code, e.g. AT, DE, RO>",
   "state_or_province": ["<official states/provinces in english lowercase — see constraint above. Multiple allowed. Empty list if unknown>"],
   "city": ["<city names in english lowercase. Multiple allowed. Empty list if unknown>"],
@@ -172,17 +500,26 @@ class FundingExtractor:
 
     def __init__(self) -> None:
         self._client: AsyncOpenAI | None = None
-        self._model = ext.openai_model
+        self._model: str = ext.openai_model
+        self._provider: str = "openai"
 
     def is_available(self) -> bool:
         return self._client is not None
 
     def startup(self) -> None:
-        if not ext.openai_api_key:
-            log.info("funding_extractor_disabled", reason="no OPENAI_API_KEY")
+        try:
+            resolved = llm_router.for_funding()
+        except llm_router.LLMRouterError as exc:
+            log.info("funding_extractor_disabled", reason=str(exc))
             return
-        self._client = AsyncOpenAI(api_key=ext.openai_api_key)
-        log.info("funding_extractor_started", model=self._model)
+        self._client = llm_router.get_client(resolved)
+        self._model = resolved.model
+        self._provider = resolved.provider
+        log.info(
+            "funding_extractor_started",
+            provider=resolved.provider,
+            model=self._model,
+        )
 
     async def extract(
         self,
@@ -218,20 +555,26 @@ class FundingExtractor:
 
         scraped_at = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-        # Normalize state_or_province to lowercase list and validate against known list
+        # Normalize state_or_province through the shared helper: applies the
+        # per-country alias map (local-language → English), drops values not in
+        # the official list, and dedupes. Same code path used by request
+        # overrides on /ingest/at, /ingest, /ingest/stream, so an extractor-
+        # produced and a caller-supplied value land in the same canonical form.
         country_code = str(data.get("country_code", country or "")).upper().strip()
-        states_raw = _as_list(data.get("state_or_province", []))
-        states_raw = [s.lower().strip() for s in states_raw if s.strip()]
-        known = PROVINCES_BY_COUNTRY.get(country_code)
-        if known:
-            invalid = [s for s in states_raw if s not in known]
-            if invalid:
+        raw_states = _as_list(data.get("state_or_province", []))
+        states_raw = normalize_provinces(country_code, raw_states)
+        if PROVINCES_BY_COUNTRY.get(country_code) is not None:
+            dropped = [
+                s for s in raw_states
+                if isinstance(s, str) and s.strip()
+                and not normalize_provinces(country_code, [s])
+            ]
+            if dropped:
                 log.warning(
                     "funding_provinces_not_in_known_list",
-                    extracted=invalid,
+                    extracted=dropped,
                     country=country_code,
                 )
-            states_raw = [s for s in states_raw if s in known]
 
         result = {
             "title": str(data.get("title", "")),
@@ -239,6 +582,7 @@ class FundingExtractor:
             "processing_office": _as_list(data.get("processing_office", [])),
             "contract_email": _as_list(data.get("contract_email", [])),
             "contract_phone": _as_list(data.get("contract_phone", [])),
+            "application_form": _as_list(data.get("application_form", [])),
             "country_code": country_code,
             "state_or_province": states_raw,
             "city": [c.lower().strip() for c in _as_list(data.get("city", [])) if c.strip()],
@@ -256,15 +600,42 @@ class FundingExtractor:
             "scraped_at": scraped_at,
         }
 
+        usage_obj = response.usage
+        prompt_tokens = getattr(usage_obj, "prompt_tokens", 0) if usage_obj else 0
+        completion_tokens = getattr(usage_obj, "completion_tokens", 0) if usage_obj else 0
+        cached_tokens = 0
+        details = getattr(usage_obj, "prompt_tokens_details", None) if usage_obj else None
+        if details is not None:
+            cached_tokens = getattr(details, "cached_tokens", 0) or 0
+
         log.info(
             "funding_metadata_extracted",
             title=result["title"][:80],
             country=result["country_code"],
             states=result["state_or_province"],
             status=result["status"],
-            tokens_used=response.usage.total_tokens if response.usage else 0,
+            tokens_used=getattr(usage_obj, "total_tokens", 0) if usage_obj else 0,
         )
 
+        # Stash usage on the result dict under a sentinel key so the caller
+        # (``ingest_online`` via ``_safe_extract_funding``) can lift it out
+        # before merging the rest into Qdrant metadata. ``_KEY_USAGE`` is
+        # filtered by ``IngestService.ingest`` so it never lands in the
+        # stored payload.
+        result[_KEY_USAGE] = StageUsage(
+            stage="funding",
+            provider=self._provider,
+            model=self._model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cached_tokens=cached_tokens,
+            cost_usd=cost.chat_cost(
+                self._provider, self._model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cached_tokens=cached_tokens,
+            ),
+        )
         return result
 
     async def _chat_with_rate_limit_retry(self, system_prompt: str, user_content: str):

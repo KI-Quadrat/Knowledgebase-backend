@@ -16,14 +16,14 @@ class InitCollectionRequest(BaseModel):
     returns `created: false` without error.
     """
 
-    collection_name: str = Field(..., description="Collection name (typically the municipality slug, e.g. 'wiener-neudorf')")
+    collection_name: str = Field(..., description="Collection name (typically the tenant/municipality slug)")
     vector_config: VectorConfig | None = Field(None, description="Override default vector configuration (1024-dim dense + sparse)")
 
     model_config = {
         "json_schema_extra": {
             "examples": [
                 {
-                    "collection_name": "wiener-neudorf",
+                    "collection_name": "example-municipality",
                     "vector_config": {"dense_dim": 1024, "sparse": True, "distance": "cosine"},
                 }
             ]

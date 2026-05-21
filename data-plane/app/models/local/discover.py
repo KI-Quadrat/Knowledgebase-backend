@@ -28,7 +28,7 @@ class DiscoverRequest(BaseModel):
                 },
                 {
                     "source": "r2",
-                    "paths": ["tenant/wiener-neudorf/uploads/"],
+                    "paths": ["tenant/example-municipality/uploads/"],
                     "since_hash_map": {},
                 },
             ]

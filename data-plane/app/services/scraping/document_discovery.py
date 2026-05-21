@@ -149,6 +149,9 @@ def extract_documents_and_links(html: str, base_url: str, found_on: str | None =
             continue
         if abs_url in doc_urls:
             continue
+        path_lower = parsed.path.lower()
+        if any(path_lower.endswith(ext) for ext in IMAGE_EXTENSIONS):
+            continue
         if abs_url in seen_links:
             continue
 
@@ -163,7 +166,13 @@ def extract_documents_and_links(html: str, base_url: str, found_on: str | None =
 
 
 def split_documents_and_links(urls: list[str], found_on: str | None = None) -> tuple[list[DiscoveredDoc], list[str]]:
-    """Split a flat list of absolute URLs into documents and non-document page links."""
+    """Split a flat list of absolute URLs into documents and page links.
+
+    Page links exclude both document-extension URLs (which go to ``docs``) and
+    image-extension URLs (which belong in the separate images list). This
+    keeps the Jina-path ``urls`` array free of PDFs/JPGs even when Jina's
+    links_summary contains them.
+    """
     docs: list[DiscoveredDoc] = []
     links: list[str] = []
     seen_docs: set[str] = set()
@@ -193,6 +202,10 @@ def split_documents_and_links(urls: list[str], found_on: str | None = None) -> t
                     found_on=found_on,
                 )
             )
+            continue
+
+        path_lower = parsed.path.lower()
+        if any(path_lower.endswith(ext) for ext in IMAGE_EXTENSIONS):
             continue
 
         if normalized in seen_links:

@@ -18,7 +18,7 @@ from app.services.parsing.models import (
     ParseStatus,
 )
 from app.routers.online.scrape import _is_thin_output
-from app.services.scraping.crawl4ai_client import _extract_jina_links
+from app.services.scraping.crawl4ai_client import _extract_jina_images, _extract_jina_links
 from app.services.scraping.scraper_service import (
     DiscoveredDocument,
     PageMetadata,
@@ -33,6 +33,11 @@ def mock_scraper():
     scraper.scrape_url = AsyncMock()
     scraper.discover_urls = AsyncMock()
     scraper.is_ready = True
+    # Routers now await scraper.audit.log_usage(...) on the success path —
+    # MagicMock's default attribute returns a MagicMock that isn't
+    # awaitable. Patch it as an AsyncMock so the audit no-ops cleanly under
+    # the test harness (ClickHouse isn't reachable from tests anyway).
+    scraper.audit.log_usage = AsyncMock()
     return scraper
 
 
@@ -95,6 +100,28 @@ def test_scrape_success(client, mock_scraper):
     assert data["request_id"]
     mock_scraper.scrape_url.assert_awaited_once()
     assert mock_scraper.scrape_url.await_args.kwargs["bypass_cache"] is False
+
+
+def test_scrape_can_skip_classification(client, mock_scraper, mock_classifier):
+    mock_scraper.scrape_url.return_value = ScrapeResult(
+        url="https://example.gv.at/page",
+        status=ScrapeStatus.SUCCESS,
+        markdown="# Hello\n\nSome content here.",
+        metadata=PageMetadata(title="Hello", language="de", word_count=4),
+        discovered_links=[],
+    )
+
+    response = client.post(
+        "/api/v1/online/scrape",
+        json={"url": "https://example.gv.at/page", "classify": False},
+    )
+
+    data = response.json()
+    assert response.status_code == 200
+    assert data["success"] is True
+    assert data["data"]["content_type"] == []
+    assert data["data"]["entities"] is None
+    mock_classifier.classify.assert_not_awaited()
 
 
 def test_scrape_bypasses_cache_for_links_summary(client, mock_scraper):
@@ -305,9 +332,17 @@ def test_crawl_sitemap_not_found(client, mock_sitemap_parser):
 
 
 def test_crawl_bfs(client, mock_scraper):
+    # discover_urls now returns (pages, docs, scraper_used, usage_summary).
+    # ``UsageSummary()`` is the empty-zero-cost default — the BFS aggregator
+    # would normally produce a populated summary, but the test only cares
+    # about pages/docs/scraper_used.
+    from app.models.common import UsageSummary
+
     mock_scraper.discover_urls.return_value = (
         ["https://example.gv.at/", "https://example.gv.at/about"],
         [DiscoveredDocument(url="https://example.gv.at/doc.pdf", type="pdf")],
+        "jina",
+        UsageSummary(),
     )
 
     response = client.post("/api/v1/online/crawl", json={
@@ -436,6 +471,38 @@ def test_scrape_inner_img_parse_failure(client, mock_scraper, mock_parser):
     assert images[0]["alt"] == "test"
 
 
+def test_scrape_inner_img_retries_rate_limit_exception(client, mock_scraper, mock_parser, monkeypatch):
+    from app.routers.online import scrape as scrape_router
+
+    monkeypatch.setattr(scrape_router.settings, "inner_parse_rate_limit_retry_delay", 0)
+    mock_scraper.scrape_url.return_value = ScrapeResult(
+        url="https://example.gv.at/page",
+        status=ScrapeStatus.SUCCESS,
+        markdown="# Page",
+        html='<html><body><img src="/retry.jpg" alt="retry"></body></html>',
+        metadata=PageMetadata(word_count=1),
+    )
+    mock_parser.parse_from_url.side_effect = [
+        RuntimeError("429 Too Many Requests"),
+        ParseResult(
+            status=ParseStatus.SUCCESS,
+            document_type=DocumentType.JPG,
+            text="Recovered image text",
+            metadata=DocumentMetadata(),
+        ),
+    ]
+
+    response = client.post("/api/v1/online/scrape", json={
+        "url": "https://example.gv.at/page",
+        "inner_img": True,
+    })
+
+    data = response.json()
+    assert data["success"] is True
+    assert data["data"]["inner_images"][0]["content"] == "Recovered image text"
+    assert mock_parser.parse_from_url.await_count == 2
+
+
 def test_scrape_inner_img_false_returns_null(client, mock_scraper):
     """When inner_img=false (default), inner_images is null."""
     mock_scraper.scrape_url.return_value = ScrapeResult(
@@ -560,6 +627,45 @@ def test_scrape_inner_docs_parse_failure(client, mock_scraper, mock_parser):
     assert len(docs) == 1
     assert docs[0]["content"] is None
     assert docs[0]["error"] == "Document is encrypted"
+
+
+def test_scrape_inner_docs_retries_rate_limit_result(client, mock_scraper, mock_parser, monkeypatch):
+    from app.routers.online import scrape as scrape_router
+
+    monkeypatch.setattr(scrape_router.settings, "inner_parse_rate_limit_retry_delay", 0)
+    mock_scraper.scrape_url.return_value = ScrapeResult(
+        url="https://example.gv.at/page",
+        status=ScrapeStatus.SUCCESS,
+        markdown="# Page",
+        metadata=PageMetadata(word_count=1),
+        discovered_documents=[
+            DiscoveredDocument(url="https://example.gv.at/retry.pdf", type="pdf", link_text="Retry PDF"),
+        ],
+    )
+    mock_parser.parse_from_url.side_effect = [
+        ParseResult(
+            status=ParseStatus.FAILED,
+            document_type=DocumentType.PDF,
+            error="Rate limit exceeded",
+        ),
+        ParseResult(
+            status=ParseStatus.SUCCESS,
+            document_type=DocumentType.PDF,
+            text="Recovered PDF content",
+            metadata=DocumentMetadata(language="de"),
+            pages_parsed=1,
+        ),
+    ]
+
+    response = client.post("/api/v1/online/scrape", json={
+        "url": "https://example.gv.at/page",
+        "inner_docs": True,
+    })
+
+    data = response.json()
+    assert data["success"] is True
+    assert data["data"]["inner_documents"][0]["content"] == "Recovered PDF content"
+    assert mock_parser.parse_from_url.await_count == 2
 
 
 def test_scrape_inner_docs_exception(client, mock_scraper, mock_parser):
@@ -701,3 +807,159 @@ def test_extract_jina_links_prefers_direct_links_summary_urls():
         "https://example.test/resources/feed.xml",
         "https://example.test/programs/open-call",
     ]
+
+
+def test_extract_jina_links_dedupes_and_normalizes():
+    """Mixed shapes (relative + absolute, duplicates) collapse to a unique
+    set of absolute http(s) URLs in original order."""
+    data = {
+        "data": {
+            "links_summary": {
+                "urls": [
+                    "/page-a",
+                    "https://example.test/page-a",  # duplicate after urljoin
+                    "https://example.test/page-b",
+                    "/files/handout.pdf",
+                    "ftp://example.test/skip-me",  # non-http(s), filtered
+                    "  ",  # blank, filtered
+                ]
+            }
+        }
+    }
+
+    links = _extract_jina_links(data, "https://example.test/")
+    assert links == [
+        "https://example.test/page-a",
+        "https://example.test/page-b",
+        "https://example.test/files/handout.pdf",
+    ]
+
+
+def test_extract_jina_images_dedupes_and_normalizes():
+    """Jina returns images as a dict keyed by alt/index. Output must be
+    deduped absolute http(s) URLs."""
+    data = {
+        "data": {
+            "images": {
+                "Image 1": "/static/hero.jpg",
+                "Logo": "https://cdn.example.test/logo.png",
+                "Dup": "https://example.test/static/hero.jpg",  # same as Image 1
+                "Bad": "data:image/png;base64,xxx",  # filtered
+                "Blank": "",  # filtered
+            }
+        }
+    }
+
+    images = _extract_jina_images(data, "https://example.test/")
+    assert images == [
+        "https://example.test/static/hero.jpg",
+        "https://cdn.example.test/logo.png",
+    ]
+
+
+def test_links_summary_jina_path_separates_urls_docs_images(client, mock_scraper):
+    """End-to-end check of the Jina-path links_summary branch in the router.
+
+    Jina returns no HTML, so the router falls through to the
+    ``elif result.discovered_links or ...`` branch and builds LinksSummary
+    from the side lists already populated on ``ScrapeResult``. This test
+    asserts the router:
+      - puts only page URLs in ``urls`` (PDFs/images already filtered upstream)
+      - includes ``documents`` only when inner_docs=true
+      - includes ``images`` only when inner_img=true
+      - does NOT trigger the raw-HTML fallback fetch (Jina case)
+    """
+    mock_scraper.scrape_url.return_value = ScrapeResult(
+        url="https://example.gv.at/page",
+        status=ScrapeStatus.SUCCESS,
+        markdown="# Hello\n\nSome content.",
+        html="",  # Jina path — no HTML
+        metadata=PageMetadata(title="Hello", language="de", word_count=4),
+        discovered_links=[
+            "https://example.gv.at/about",
+            "https://example.gv.at/contact",
+        ],
+        discovered_documents=[
+            DiscoveredDocument(
+                url="https://example.gv.at/files/foerderung.pdf", type="pdf"
+            ),
+            DiscoveredDocument(
+                url="https://example.gv.at/files/antrag.docx", type="docx"
+            ),
+        ],
+        discovered_images=[
+            "https://example.gv.at/static/logo.png",
+            "https://example.gv.at/static/hero.jpg",
+        ],
+        scraper_used="jina",
+    )
+
+    response = client.post(
+        "/api/v1/online/scrape",
+        json={
+            "url": "https://example.gv.at/page",
+            "scraper": "jina",
+            "links_summary": True,
+            "inner_docs": True,
+            "inner_img": True,
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["success"] is True
+
+    summary = data["data"]["links_summary"]
+    assert summary is not None
+
+    # Page URLs only — docs/images live in their own buckets.
+    assert summary["urls"] == [
+        "https://example.gv.at/about",
+        "https://example.gv.at/contact",
+    ]
+    assert summary["documents"] == [
+        "https://example.gv.at/files/foerderung.pdf",
+        "https://example.gv.at/files/antrag.docx",
+    ]
+    assert summary["images"] == [
+        "https://example.gv.at/static/logo.png",
+        "https://example.gv.at/static/hero.jpg",
+    ]
+
+    # Each list is already deduped (set semantics).
+    assert len(summary["urls"]) == len(set(summary["urls"]))
+    assert len(summary["documents"]) == len(set(summary["documents"]))
+    assert len(summary["images"]) == len(set(summary["images"]))
+
+
+def test_links_summary_jina_omits_docs_and_images_when_not_opted_in(client, mock_scraper):
+    """When ``inner_docs`` / ``inner_img`` are False, the router exposes
+    ``urls`` only — ``documents`` and ``images`` come back empty even if
+    Jina surfaced them. Caller opts in per kind."""
+    mock_scraper.scrape_url.return_value = ScrapeResult(
+        url="https://example.gv.at/page",
+        status=ScrapeStatus.SUCCESS,
+        markdown="# Hello\n\nSome content.",
+        html="",
+        metadata=PageMetadata(title="Hello", language="de", word_count=4),
+        discovered_links=["https://example.gv.at/about"],
+        discovered_documents=[
+            DiscoveredDocument(url="https://example.gv.at/foo.pdf", type="pdf"),
+        ],
+        discovered_images=["https://example.gv.at/img.png"],
+        scraper_used="jina",
+    )
+
+    response = client.post(
+        "/api/v1/online/scrape",
+        json={
+            "url": "https://example.gv.at/page",
+            "scraper": "jina",
+            "links_summary": True,
+            # inner_docs / inner_img omitted → default False
+        },
+    )
+    assert response.status_code == 200
+    summary = response.json()["data"]["links_summary"]
+    assert summary["urls"] == ["https://example.gv.at/about"]
+    assert summary["documents"] == []
+    assert summary["images"] == []
