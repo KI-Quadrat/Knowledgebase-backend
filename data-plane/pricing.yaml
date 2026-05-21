@@ -1,0 +1,98 @@
+# Pricing for every billable third-party service the data-plane calls.
+# All rates are USD. Edit this file when a provider changes pricing —
+# changes ship on the next tag-based deploy (file is loaded at startup).
+#
+# Schema per (provider, model):
+#   input_per_1m        — chat input tokens (USD per 1,000,000)
+#   output_per_1m       — chat output tokens (USD per 1,000,000)
+#   cached_input_per_1m — OpenAI auto-cache rate for the input prefix
+#   embed_per_1m        — embedding tokens (USD per 1,000,000)
+#   per_token           — Jina-style token-metered scraping (USD per token)
+#   per_credit          — Firecrawl credits (USD per credit)
+#   per_page            — LlamaParse OCR (USD per page)
+#
+# `null` means "unknown / plan-dependent" — cost_usd will be returned as
+# null in API responses and ClickHouse rows, while the raw token / credit /
+# page count is still recorded. Set the field to switch on cost computation.
+#
+# Self-hosted providers (crawl4ai, httpx, bge_m3, tei_sparse, qdrant, redis)
+# are intentionally omitted; cost.py returns 0.0 for any provider absent
+# from this table.
+#
+# Keep this file in sync with COST.md §2.
+
+# ── LLM providers (chat) ─────────────────────────────────────────────
+openai:
+  gpt-4o-mini:
+    input_per_1m: 0.150
+    output_per_1m: 0.600
+    cached_input_per_1m: 0.075
+  gpt-4.1-nano:
+    input_per_1m: 0.100
+    output_per_1m: 0.400
+    cached_input_per_1m: 0.025
+  gpt-4.1-mini:
+    input_per_1m: 0.400
+    output_per_1m: 1.600
+    cached_input_per_1m: 0.100
+  gpt-4.1:
+    input_per_1m: 2.000
+    output_per_1m: 8.000
+    cached_input_per_1m: 0.500
+  gpt-4o:
+    input_per_1m: 2.500
+    output_per_1m: 10.000
+    cached_input_per_1m: 1.250
+  # ── Embeddings ──
+  text-embedding-3-small:
+    embed_per_1m: 0.020
+  text-embedding-3-large:
+    embed_per_1m: 0.130
+  text-embedding-ada-002:
+    embed_per_1m: 0.100
+
+# OpenAI-compatible providers wired through llm_router. Rates depend on
+# the specific model and your plan — fill in when you start using them.
+nebius:
+  "*":
+    input_per_1m: null
+    output_per_1m: null
+together:
+  "*":
+    input_per_1m: null
+    output_per_1m: null
+groq:
+  "*":
+    input_per_1m: null
+    output_per_1m: null
+fireworks:
+  "*":
+    input_per_1m: null
+    output_per_1m: null
+deepinfra:
+  "*":
+    input_per_1m: null
+    output_per_1m: null
+
+# ── Scrape providers ─────────────────────────────────────────────────
+jina:
+  "*":
+    # Jina Reader bills per token reported in meta.usage.tokens.
+    # Free key bundles 10M tokens; paid plans differ — adjust per plan.
+    per_token: 0.000005    # ≈ $0.005 / 1K tokens
+    notes: "Free key bundles 10M tokens; standard pay-as-you-go rate shown."
+
+firecrawl:
+  "*":
+    # Standard: $83/month billed yearly, includes 100,000 credits/pages.
+    # Effective included rate: 83 / 100000 = $0.00083 per credit.
+    # Overage rate: $47 / 35000 = $0.001343 per extra credit.
+    per_credit: 0.00083
+    notes: "Standard plan effective included rate. Overage is $0.001343/credit."
+
+# ── OCR / parsing ────────────────────────────────────────────────────
+llamaparse:
+  "*":
+    # LlamaParse charges per page; "basic" mode is ~$0.003/page (1k pages/day free).
+    per_page: 0.003
+    notes: "Free tier covers 1,000 pages/day; paid plans vary by mode."

@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     # the concurrency at or below your OpenAI tier's concurrent quota.
     max_batch_ingest_items: int = 50
     batch_ingest_concurrency: int = 10
+    contextual_concurrency: int = 5  # Max contextual-enrichment chat calls per worker
+    inner_parse_concurrency: int = 5  # Max inner image/document parses per scrape
+    inner_parse_rate_limit_retry_delay: float = 1.0  # Seconds before one 429 retry
 
     # Cache
     cache_ttl: int = 3600

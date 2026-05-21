@@ -6,6 +6,7 @@ import uuid
 from collections.abc import Awaitable
 
 from app.config import settings
+from app.models.common import StageUsage, UsageSummary
 from app.services.embedding.bge_m3_client import EmbeddingError
 from app.services.embedding.qdrant_service import QdrantError, QdrantService
 from app.services.intelligence.chunker import Chunker
@@ -32,6 +33,7 @@ class IngestResult:
         entities_extracted: dict,
         embedding_time_ms: int,
         total_time_ms: int,
+        usage: UsageSummary | None = None,
     ):
         self.source_id = source_id
         self.chunks_created = chunks_created
@@ -41,6 +43,10 @@ class IngestResult:
         self.entities_extracted = entities_extracted
         self.embedding_time_ms = embedding_time_ms
         self.total_time_ms = total_time_ms
+        # Aggregated per-stage billing from this ingest call (classifier,
+        # contextual, funding, embedding, sparse). Routers surface it on
+        # the response envelope and persist it to ClickHouse usage_log.
+        self.usage = usage or UsageSummary()
 
 
 class IngestService:
@@ -97,6 +103,11 @@ class IngestService:
         # embedder injected at startup.
         embedder = primary_embedder or self._embedder
 
+        # Per-stage billing records collected as the pipeline runs; rolled
+        # up into the ``UsageSummary`` returned on ``IngestResult`` so the
+        # router can put it on the response and persist to ClickHouse.
+        usage_entries: list[StageUsage] = []
+
         async def _emit(phase: str, **payload) -> None:
             if progress_queue is not None:
                 await progress_queue.put({"phase": phase, **payload})
@@ -137,10 +148,13 @@ class IngestService:
         # 1b. Contextual Retrieval — enrich each chunk with document-level context
         if use_contextual and self._contextual_enricher:
             try:
-                chunk_result.chunks = await self._contextual_enricher.enrich_chunks(
+                enriched_chunks, contextual_usage = await self._contextual_enricher.enrich_chunks(
                     document=content,
                     chunks=chunk_result.chunks,
                 )
+                chunk_result.chunks = enriched_chunks
+                if contextual_usage is not None:
+                    usage_entries.append(contextual_usage)
                 log.info("ingest_contextual_enriched", source_id=source_id, chunks=len(chunk_result.chunks))
                 await _emit("enriched", chunks=len(chunk_result.chunks))
             except Exception as e:
@@ -162,6 +176,8 @@ class IngestService:
 
             if classify_result:
                 classification = [classify_result.category.value] + classify_result.sub_categories
+                if classify_result.usage is not None:
+                    usage_entries.append(classify_result.usage)
             else:
                 classification = ["general"]
         entities_extracted = {
@@ -202,6 +218,17 @@ class IngestService:
                 raise IngestError(f"Sparse embed failed: {e}", code="EMBEDDING_FAILED") from e
 
         embedding_time_ms = int((time.monotonic() - embed_start) * 1000)
+        # Each embed client stashes its per-call usage on ``last_usage``
+        # after embed_batch — pull both (dense + optional sparse) into the
+        # aggregate. ``isinstance`` gates out test stubs (MagicMock leaves
+        # ``last_usage`` as a non-StageUsage attribute).
+        dense_usage = getattr(embedder, "last_usage", None)
+        if isinstance(dense_usage, StageUsage):
+            usage_entries.append(dense_usage)
+        if sparse_embeddings is not None and self._sparse_embedder is not None:
+            sparse_usage = getattr(self._sparse_embedder, "last_usage", None)
+            if isinstance(sparse_usage, StageUsage):
+                usage_entries.append(sparse_usage)
         log.info(
             "ingest_embedded",
             source_id=source_id,
@@ -228,6 +255,13 @@ class IngestService:
                 log.warning("ingest_deferred_metadata_failed", source_id=source_id, error=str(e))
                 deferred_meta = None
             if deferred_meta:
+                # Pull the billing sentinel out before merging — it must not
+                # land in the stored Qdrant payload. ``__usage__`` is the
+                # constant key the funding extractor stashes its StageUsage
+                # under (see funding_extractor._KEY_USAGE).
+                funding_usage = deferred_meta.pop("__usage__", None)
+                if isinstance(funding_usage, StageUsage):
+                    usage_entries.append(funding_usage)
                 metadata = {**deferred_meta, **metadata}
                 await _emit("funding_extracted", fields=sorted(deferred_meta.keys()))
             else:
@@ -350,4 +384,5 @@ class IngestService:
             entities_extracted=entities_extracted,
             embedding_time_ms=embedding_time_ms,
             total_time_ms=total_time_ms,
+            usage=UsageSummary.from_entries(usage_entries),
         )

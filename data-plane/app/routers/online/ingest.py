@@ -9,7 +9,7 @@ import time
 from fastapi import APIRouter, Request
 
 from app.config import settings
-from app.models.common import ErrorCode, ResponseEnvelope
+from app.models.common import ErrorCode, ResponseEnvelope, UsageSummary
 from app.models.online.ingest import (
     BatchIngestData,
     BatchIngestItemResult,
@@ -188,6 +188,20 @@ async def _ingest_one_item(
         log.error("ingest_online_failed", source_id=body.source_id, error=str(e), code=e.code)
         return False, None, error_code, str(e)
 
+    # Persist per-stage usage to ClickHouse. Audit logger is owned by the
+    # scraper service (it's the only async-loop participant configured at
+    # startup); reuse it so we don't need a separate CH client per service.
+    audit = app_state.scraping.audit
+    await audit.log_usage(
+        result.usage.by_stage.values(),
+        endpoint="ingest",
+        request_id=getattr(body, "request_id", "") or "",
+        url=body.url,
+        municipality_id=body.metadata.municipality_id or "",
+        assistant_id=body.metadata.assistant_id or "",
+        assistant_type=body.assistant_type or "",
+    )
+
     return (
         True,
         OnlineIngestData(
@@ -198,6 +212,7 @@ async def _ingest_one_item(
             content_type=result.classification,
             embedding_time_ms=result.embedding_time_ms,
             total_time_ms=result.total_time_ms,
+            usage=result.usage,
         ),
         None,
         None,
@@ -301,6 +316,13 @@ async def batch_ingest_online(
         total_time_ms=total_time_ms,
     )
 
+    # Roll up per-item usage into a batch-level total. Failed items have
+    # ``data=None`` and contribute nothing — UsageSummary.merge handles the
+    # ``None`` entries directly so we don't need a per-item filter here.
+    total_usage = UsageSummary.merge([
+        r.data.usage if r.data is not None else None for r in results
+    ])
+
     return ResponseEnvelope(
         success=True,
         data=BatchIngestData(
@@ -309,6 +331,7 @@ async def batch_ingest_online(
             failed=failed,
             results=list(results),
             total_time_ms=total_time_ms,
+            total_usage=total_usage,
         ),
         request_id=request_id,
     )

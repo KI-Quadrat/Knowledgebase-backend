@@ -18,6 +18,7 @@ import time
 import httpx
 
 from app.config import ext
+from app.models.common import StageUsage
 from app.services.embedding.bge_m3_client import EmbeddingError
 from app.utils.logger import get_logger
 
@@ -75,6 +76,8 @@ class TEISparseClientAT:
         self._api_key = ext.sparse_embed_api_key_at
         self._cf_client_id = ext.sparse_cf_access_client_id_at
         self._cf_client_secret = ext.sparse_cf_access_client_secret_at
+        # Self-hosted — zero-cost usage entry set after every encode_batch.
+        self.last_usage: StageUsage | None = None
 
     async def startup(self) -> None:
         if not self._api_key:
@@ -123,6 +126,12 @@ class TEISparseClientAT:
             count=len(texts),
             duration_ms=duration,
             windows=(len(texts) + max_batch - 1) // max_batch,
+        )
+        self.last_usage = StageUsage(
+            stage="sparse_embedding",
+            provider="tei_sparse",
+            model="bge-m3-sparse",
+            cost_usd=0.0,
         )
         return results
 

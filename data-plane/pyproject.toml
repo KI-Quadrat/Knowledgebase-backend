@@ -41,6 +41,9 @@ dependencies = [
     # Observability
     "prometheus-client>=0.21.1",
     "structlog>=24.4.0",
+
+    # Config
+    "pyyaml>=6.0",
 ]
 
 [build-system]

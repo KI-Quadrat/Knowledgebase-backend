@@ -10,6 +10,8 @@ import json
 from openai import AsyncOpenAI, BadRequestError, RateLimitError
 
 from app.config import ext
+from app.models.common import StageUsage
+from app.services import cost
 from app.services.intelligence import llm_router
 from app.services.intelligence.models import (
     ClassifyResult,
@@ -127,22 +129,45 @@ class LLMClassifier:
         sub_categories = data.get("sub_categories", [])[:5]
         summary = str(data.get("summary", ""))[:300]
 
+        usage_obj = response.usage
+        prompt_tokens = getattr(usage_obj, "prompt_tokens", 0) if usage_obj else 0
+        completion_tokens = getattr(usage_obj, "completion_tokens", 0) if usage_obj else 0
+        cached_tokens = 0
+        details = getattr(usage_obj, "prompt_tokens_details", None) if usage_obj else None
+        if details is not None:
+            cached_tokens = getattr(details, "cached_tokens", 0) or 0
+
         log.info(
             "llm_classify_complete",
             category=category.value,
             confidence=round(confidence, 2),
             sub_categories=sub_categories,
             model=self._model,
-            tokens_used=response.usage.total_tokens if response.usage else 0,
+            tokens_used=getattr(usage_obj, "total_tokens", 0) if usage_obj else 0,
         )
 
-        return ClassifyResult(
+        result = ClassifyResult(
             category=category,
             confidence=confidence,
             sub_categories=sub_categories,
             entities=entities,
             summary=summary,
         )
+        result.usage = StageUsage(
+            stage="classifier",
+            provider=self._provider,
+            model=self._model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cached_tokens=cached_tokens,
+            cost_usd=cost.chat_cost(
+                self._provider, self._model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cached_tokens=cached_tokens,
+            ),
+        )
+        return result
 
     async def _chat_with_rate_limit_retry(self, user_content: str):
         """Call chat.completions.create with 3-attempt exponential backoff on 429."""

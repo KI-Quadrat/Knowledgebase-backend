@@ -1,8 +1,10 @@
 import asyncio
 import functools
+from collections.abc import Iterable
 from urllib.parse import urlparse
 
 from app.config import ext
+from app.models.common import StageUsage
 from app.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -100,3 +102,131 @@ class AuditLogger:
             "word_count, duration_ms, error, request_id, api_key_hash) VALUES",
             [row],
         )
+
+    async def log_usage(
+        self,
+        entries: Iterable[StageUsage],
+        *,
+        endpoint: str,
+        request_id: str = "",
+        api_key_hash: str = "",
+        url: str = "",
+        municipality_id: str = "",
+        assistant_id: str = "",
+        assistant_type: str = "",
+        status: str = "success",
+    ) -> None:
+        """Write per-stage usage rows to ClickHouse ``usage_log``.
+
+        One row per StageUsage so a single ingest call produces ~4 rows
+        (classifier + contextual + funding + embedding). Failures are
+        swallowed — the audit sink is best-effort and a ClickHouse outage
+        must not break the request.
+
+        Schema is documented in ``USAGE_LOG_DDL`` below; the table is
+        created out-of-band (migration in ``scripts/`` or via the ClickHouse
+        operator) before this code runs.
+        """
+        if not self._client:
+            return
+        rows = [_usage_row(
+            entry,
+            endpoint=endpoint,
+            request_id=request_id,
+            api_key_hash=api_key_hash,
+            url=url,
+            municipality_id=municipality_id,
+            assistant_id=assistant_id,
+            assistant_type=assistant_type,
+            status=status,
+        ) for entry in entries if entry is not None]
+        if not rows:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._insert_usage, rows)
+        except Exception as exc:
+            log.warning("usage_log_failed", endpoint=endpoint, error=str(exc))
+
+    def _insert_usage(self, rows: list[dict]) -> None:
+        self._client.execute(  # type: ignore[union-attr]
+            "INSERT INTO usage_log "
+            "(endpoint, stage, provider, model, url, domain, "
+            "prompt_tokens, completion_tokens, cached_tokens, "
+            "embed_tokens, scrape_tokens, credits, pages, cost_usd, "
+            "municipality_id, assistant_id, assistant_type, "
+            "request_id, api_key_hash, status) VALUES",
+            rows,
+        )
+
+
+def _usage_row(
+    entry: StageUsage,
+    *,
+    endpoint: str,
+    request_id: str,
+    api_key_hash: str,
+    url: str,
+    municipality_id: str,
+    assistant_id: str,
+    assistant_type: str,
+    status: str,
+) -> dict:
+    domain = urlparse(url).netloc if url else ""
+    return {
+        "endpoint": endpoint,
+        "stage": entry.stage,
+        "provider": entry.provider,
+        "model": entry.model or "",
+        "url": url,
+        "domain": domain,
+        "prompt_tokens": int(entry.prompt_tokens or 0),
+        "completion_tokens": int(entry.completion_tokens or 0),
+        "cached_tokens": int(entry.cached_tokens or 0),
+        "embed_tokens": int(entry.embed_tokens or 0),
+        "scrape_tokens": int(entry.scrape_tokens or 0),
+        "credits": float(entry.credits or 0.0),
+        "pages": int(entry.pages or 0),
+        # ``cost_usd`` is Nullable in CH — None preserves the "rate unknown"
+        # signal we use to detect a missing entry in pricing.yaml.
+        "cost_usd": entry.cost_usd,
+        "municipality_id": municipality_id or "",
+        "assistant_id": assistant_id or "",
+        "assistant_type": assistant_type or "",
+        "request_id": request_id or "",
+        "api_key_hash": api_key_hash or "",
+        "status": status,
+    }
+
+
+# DDL for the ``usage_log`` table. Apply via:
+#   clickhouse-client --multiquery --query="$USAGE_LOG_DDL"
+# or your migration tool of choice. Kept here so the schema lives next to
+# the writer that depends on it.
+USAGE_LOG_DDL = """
+CREATE TABLE IF NOT EXISTS usage_log (
+    event_time          DateTime DEFAULT now(),
+    endpoint            LowCardinality(String),
+    stage               LowCardinality(String),
+    provider            LowCardinality(String),
+    model               LowCardinality(String),
+    url                 String,
+    domain              String,
+    prompt_tokens       UInt32,
+    completion_tokens   UInt32,
+    cached_tokens       UInt32,
+    embed_tokens        UInt32,
+    scrape_tokens       UInt32,
+    credits             Float64,
+    pages               UInt32,
+    cost_usd            Nullable(Float64),
+    municipality_id     String,
+    assistant_id        String,
+    assistant_type      String,
+    request_id          String,
+    api_key_hash        String,
+    status              LowCardinality(String)
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (event_time, endpoint, provider, model);
+"""

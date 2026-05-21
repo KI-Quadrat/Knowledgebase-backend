@@ -48,6 +48,7 @@ def client(mock_parser, mock_classifier):
     app.state.classifier = mock_classifier
     # Provide stubs for other services expected by existing routers
     app.state.scraping = MagicMock()
+    app.state.scraping.audit.log_usage = AsyncMock()
     app.state.sitemap_parser = MagicMock()
     with TestClient(app) as c:
         yield c
@@ -79,6 +80,29 @@ def test_parse_url_success(client, mock_parser):
         url="https://example.com/report.pdf",
         mime_type=None,
     )
+
+
+def test_parse_url_can_skip_classification(client, mock_parser, mock_classifier):
+    mock_parser.parse_from_url.return_value = ParseResult(
+        status=ParseStatus.SUCCESS,
+        document_type=DocumentType.PDF,
+        text="Parsed content from URL",
+        metadata=DocumentMetadata(page_count=2, word_count=4, language="en"),
+        pages_parsed=2,
+        pages_failed=0,
+    )
+
+    response = client.post("/api/v1/online/document-parse", json={
+        "url": "https://example.com/report.pdf",
+        "classify": False,
+    })
+
+    data = response.json()
+    assert response.status_code == 200
+    assert data["success"] is True
+    assert data["data"]["content_type"] == []
+    assert data["data"]["entities"] is None
+    mock_classifier.classify.assert_not_awaited()
 
 
 def test_parse_url_with_mime_type(client, mock_parser):
