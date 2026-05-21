@@ -3,7 +3,6 @@
 import time
 
 from app.services.embedding.bge_m3_client import EmbeddingError
-from app.services.embedding.bm25_encoder import BM25Encoder
 from app.services.embedding.qdrant_service import QdrantError, QdrantService
 from app.utils.logger import get_logger
 
@@ -76,19 +75,25 @@ class SearchResult:
 class SearchService:
     """Semantic and hybrid search with permission filtering.
 
-    - semantic: dense-only cosine search via OpenAI embeddings
-    - hybrid: dense (OpenAI) + sparse (BM25) with Reciprocal Rank Fusion (RRF)
+    - semantic: dense-only cosine search
+    - hybrid: dense + TEI sparse (sparse.ki2.at) with Reciprocal Rank Fusion (RRF)
 
-    When a ``fallback_embedder`` is provided (BGE-Gemma2 via LiteLLM),
-    the service automatically falls back to ``dense_bge_gemma2`` vectors
-    if the primary OpenAI embedding call fails.
+    Callers pick the dense vector via ``embedding_model`` — ``openai`` hits
+    ``dense_openai`` using the injected OpenAI embedder; ``bge_m3`` hits
+    ``dense_bge_m3`` using the injected TEI BGE-M3 embedder.
     """
 
-    def __init__(self, embedder, qdrant: QdrantService, fallback_embedder=None) -> None:
+    def __init__(
+        self,
+        embedder,
+        qdrant: QdrantService,
+        sparse_embedder=None,
+        bge_m3_embedder=None,
+    ) -> None:
         self._embedder = embedder
         self._qdrant = qdrant
-        self._fallback_embedder = fallback_embedder
-        self._bm25 = BM25Encoder()
+        self._sparse_embedder = sparse_embedder
+        self._bge_m3_embedder = bge_m3_embedder
 
     async def search(
         self,
@@ -103,7 +108,7 @@ class SearchService:
         top_k: int = 10,
         score_threshold: float = 0.5,
         search_mode: str = "semantic",
-        enable_fallback: bool = False,
+        embedding_model: str = "openai",
     ) -> SearchResult:
         collection = collection_name
         if not collection:
@@ -114,31 +119,31 @@ class SearchService:
         # 1. Build permission filter
         perm_filter = self._build_permission_filter(user_type, user_groups)
 
-        # 2. Embed the query (dense via OpenAI, optionally fallback to BGE-Gemma2)
+        # 2. Pick the dense embedder matching the collection's vector.
+        if embedding_model == "bge_m3":
+            if self._bge_m3_embedder is None:
+                raise SearchError(
+                    "embedding_model='bge_m3' requested but no BGE-M3 embedder is configured",
+                    code="EMBEDDING_MODEL_NOT_LOADED",
+                )
+            dense_embedder = self._bge_m3_embedder
+            dense_vector_name = "dense_bge_m3"
+        else:
+            dense_embedder = self._embedder
+            dense_vector_name = "dense_openai"
+
         embed_start = time.monotonic()
         use_fallback = enable_fallback and self._fallback_embedder is not None
         dense_vector_name = "dense_openai"
         embedding = None
 
         try:
-            embedding = await self._embedder.embed(query)
+            embedding = await dense_embedder.embed(query)
         except EmbeddingError as e:
-            if not use_fallback:
-                error_msg = str(e).lower()
-                if "not initialized" in error_msg:
-                    raise SearchError(str(e), code="EMBEDDING_MODEL_NOT_LOADED") from e
-                raise SearchError(str(e), code="EMBEDDING_FAILED") from e
-            log.warning("search_primary_embed_failed_using_fallback", error=str(e))
-
-        if embedding is None and use_fallback:
-            try:
-                embedding = await self._fallback_embedder.embed(query)
-                dense_vector_name = "dense_bge_gemma2"
-            except EmbeddingError as e:
-                raise SearchError(
-                    f"Both primary and fallback embedding failed: {e}",
-                    code="EMBEDDING_FAILED",
-                ) from e
+            error_msg = str(e).lower()
+            if "not initialized" in error_msg:
+                raise SearchError(str(e), code="EMBEDDING_MODEL_NOT_LOADED") from e
+            raise SearchError(str(e), code="EMBEDDING_FAILED") from e
 
         query_embedding_ms = int((time.monotonic() - embed_start) * 1000)
 
@@ -149,11 +154,19 @@ class SearchService:
         search_start = time.monotonic()
         try:
             if search_mode == "hybrid":
-                sparse_vector = self._bm25.encode(query)
+                if self._sparse_embedder is None:
+                    raise SearchError(
+                        "search_mode='hybrid' requested but no sparse embedder is configured",
+                        code="EMBEDDING_MODEL_NOT_LOADED",
+                    )
+                try:
+                    sparse = await self._sparse_embedder.encode(query)
+                except EmbeddingError as e:
+                    raise SearchError(f"Sparse embed failed: {e}", code="EMBEDDING_FAILED") from e
                 raw_results = await self._qdrant.hybrid_search(
                     collection=collection,
                     dense_vector=embedding.dense,
-                    sparse_vector=sparse_vector,
+                    sparse_vector=sparse.as_dict(),
                     filters=qdrant_filter,
                     top_k=top_k,
                     dense_vector_name=dense_vector_name,

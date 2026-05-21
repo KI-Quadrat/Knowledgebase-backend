@@ -173,10 +173,10 @@ class Crawl4AIClient:
             headers["Authorization"] = f"Bearer {self._api_token}"
 
         crawler_params: dict = {
-            "scan_full_page": True,
-            "wait_until": "networkidle",
+            "scan_full_page": False,
+            "wait_until": "domcontentloaded",
             "page_timeout": timeout * 1000,
-            "delay_before_return_html": 2.0,
+            "delay_before_return_html": 0.5,
             "magic": True,
             "remove_overlay_elements": True,
             "cache_mode": "bypass",

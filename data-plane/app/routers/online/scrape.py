@@ -49,39 +49,35 @@ def _validate_url(url: str) -> str | None:
 # PruningContentFilter aggressively removes tabular/label-value content (e.g.
 # Austrian government portals). Below either threshold we re-scrape in `raw`
 # mode to recover the payload.
-_THIN_WORD_THRESHOLD = 100
+_THIN_WORD_THRESHOLD = 20
 _THIN_RATIO_THRESHOLD = 0.005  # markdown_len / html_len
+_THIN_MIN_HTML_LEN = 1000
 
 
 def _is_thin_output(markdown: str | None, html: str | None) -> bool:
     """True when fit-mode markdown looks too sparse relative to the raw HTML.
 
-    Detection requires we have the raw HTML to compare against — without it
-    there's no reliable way to distinguish over-pruning from a genuinely
-    short page (Jina fallback, for example, returns no HTML), so we refuse
-    to retry there.
+    Requires the raw HTML to compare against — Jina fallback returns no HTML,
+    so thin-detection is skipped there.
 
-    With HTML in hand, two signals are considered; either tripping flags the
-    output as thin:
+    Both signals must trip to flag thinness (tightened from OR to AND after
+    the original heuristic fired too aggressively on normal short pages and
+    doubled scrape time):
 
-    - ``word_count < 100`` combined with ``len(html) > 1000`` — short
-      markdown from a non-trivial page almost always means the filter was
-      too aggressive.
-    - ``len(markdown) / len(html) < 0.005`` — catches heavy HTML pages
-      whose markdown is a thin sliver (labels/values stripped).
+    - ``word_count < 20`` on a page with ``len(html) > 1000``
+    - ``len(markdown) / len(html) < 0.005`` (markdown is a sliver of the DOM)
     """
     if not html:
         return False
     text = (markdown or "").strip()
     if not text:
         return True
-    word_count = len(text.split())
     html_len = len(html)
-    if word_count < _THIN_WORD_THRESHOLD and html_len > 1000:
-        return True
-    if html_len > 0 and (len(text) / html_len) < _THIN_RATIO_THRESHOLD:
-        return True
-    return False
+    if html_len <= _THIN_MIN_HTML_LEN:
+        return False
+    word_thin = len(text.split()) < _THIN_WORD_THRESHOLD
+    ratio_thin = (len(text) / html_len) < _THIN_RATIO_THRESHOLD
+    return word_thin and ratio_thin
 
 
 @router.post(

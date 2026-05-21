@@ -9,10 +9,11 @@ When a ``country`` code is provided, the system prompt constrains
 divisions for that country, preventing hallucinated region names.
 """
 
+import asyncio
 import json
 from datetime import datetime, timezone
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError, RateLimitError
 
 from app.config import ext
 from app.utils.logger import get_logger
@@ -111,6 +112,10 @@ or null for nullable fields.
 Respond ONLY with valid JSON matching this exact schema:
 {{
   "title": "<title of the funding program>",
+  "program_name": "<official program name, if distinct from the title — otherwise empty string>",
+  "processing_office": ["<names of the offices/departments that process applications. Multiple allowed. Empty list if unknown>"],
+  "contract_email": ["<contract/contact email addresses found in the document. Multiple allowed. Empty list if none>"],
+  "contract_phone": ["<contract/contact phone numbers found in the document. Multiple allowed. Empty list if none>"],
   "country_code": "<ISO 3166-1 alpha-2 country code, e.g. AT, DE, RO>",
   "state_or_province": ["<official states/provinces in english lowercase — see constraint above. Multiple allowed. Empty list if unknown>"],
   "city": ["<city names in english lowercase. Multiple allowed. Empty list if unknown>"],
@@ -189,19 +194,24 @@ class FundingExtractor:
         if not self._client:
             raise RuntimeError("Funding extractor not available (no OpenAI key)")
 
-        truncated = content[:6000] if len(content) > 6000 else content
+        cap = ext.funding_max_input_chars
+        if len(content) > cap:
+            log.info("funding_extract_truncated", chars_in=len(content), chars_kept=cap)
+        truncated = content[:cap]
         system_prompt = _build_system_prompt(country)
 
-        response = await self._client.chat.completions.create(
-            model=self._model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": truncated},
-            ],
-            temperature=0.0,
-            max_tokens=800,
-            response_format={"type": "json_object"},
-        )
+        try:
+            response = await self._chat_with_rate_limit_retry(system_prompt, truncated)
+        except BadRequestError as exc:
+            if "context_length_exceeded" not in str(exc).lower():
+                raise
+            half = truncated[: len(truncated) // 2]
+            log.warning(
+                "funding_extract_context_exceeded_retry",
+                chars_in=len(truncated),
+                chars_retry=len(half),
+            )
+            response = await self._chat_with_rate_limit_retry(system_prompt, half)
 
         raw = response.choices[0].message.content or "{}"
         data = json.loads(raw)
@@ -225,6 +235,10 @@ class FundingExtractor:
 
         result = {
             "title": str(data.get("title", "")),
+            "program_name": str(data.get("program_name", "")),
+            "processing_office": _as_list(data.get("processing_office", [])),
+            "contract_email": _as_list(data.get("contract_email", [])),
+            "contract_phone": _as_list(data.get("contract_phone", [])),
             "country_code": country_code,
             "state_or_province": states_raw,
             "city": [c.lower().strip() for c in _as_list(data.get("city", [])) if c.strip()],
@@ -253,10 +267,38 @@ class FundingExtractor:
 
         return result
 
+    async def _chat_with_rate_limit_retry(self, system_prompt: str, user_content: str):
+        """Call chat.completions.create with 3-attempt exponential backoff on 429."""
+        last_exc: RateLimitError | None = None
+        for attempt in range(3):
+            try:
+                return await self._client.chat.completions.create(
+                    model=self._model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_content},
+                    ],
+                    temperature=0.0,
+                    max_tokens=1000,
+                    response_format={"type": "json_object"},
+                )
+            except RateLimitError as exc:
+                last_exc = exc
+                if attempt < 2:
+                    wait = 2 ** attempt
+                    log.warning("funding_extract_rate_limit_retry", attempt=attempt + 1, wait_s=wait)
+                    await asyncio.sleep(wait)
+        assert last_exc is not None
+        raise last_exc
+
 
 def _as_list(val: object) -> list[str]:
     if isinstance(val, list):
-        return [str(v) for v in val][:20]
+        return [str(v) for v in val if str(v).strip()][:20]
+    # Defensive: wrap a non-empty scalar so we don't lose data when the LLM
+    # returns a bare string for an array-typed field.
+    if isinstance(val, str) and val.strip():
+        return [val.strip()]
     return []
 
 

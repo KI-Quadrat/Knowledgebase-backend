@@ -6,8 +6,8 @@ import uuid
 from collections.abc import Awaitable
 
 from app.config import settings
+from app.models.common import StageUsage, UsageSummary
 from app.services.embedding.bge_m3_client import EmbeddingError
-from app.services.embedding.bm25_encoder import BM25Encoder
 from app.services.embedding.qdrant_service import QdrantError, QdrantService
 from app.services.intelligence.chunker import Chunker
 from app.services.intelligence.classifier import Classifier
@@ -33,6 +33,7 @@ class IngestResult:
         entities_extracted: dict,
         embedding_time_ms: int,
         total_time_ms: int,
+        usage: UsageSummary | None = None,
     ):
         self.source_id = source_id
         self.chunks_created = chunks_created
@@ -42,16 +43,19 @@ class IngestResult:
         self.entities_extracted = entities_extracted
         self.embedding_time_ms = embedding_time_ms
         self.total_time_ms = total_time_ms
+        # Aggregated per-stage billing from this ingest call (classifier,
+        # contextual, funding, embedding, sparse). Routers surface it on
+        # the response envelope and persist it to ClickHouse usage_log.
+        self.usage = usage or UsageSummary()
 
 
 class IngestService:
     """Orchestrates the full ingest pipeline: chunk → classify → embed → store.
 
-    When a ``fallback_embedder`` is provided (BGE-Gemma2 via LiteLLM) and
-    ``fallback_dense_dim`` is passed to ``ingest()``, the service stores
-    multi-vector points with ``dense_openai`` + ``dense_bge_gemma2`` (and
-    optionally ``sparse`` for hybrid mode). If one embedder fails during
-    ingest, the point is still stored with the other's vector.
+    One dense vector per point, named after the selected embedder
+    (``dense_openai`` or ``dense_bge_m3``). When ``search_mode`` is
+    ``hybrid`` an additional ``sparse`` vector is produced by the injected
+    TEI sparse client (``sparse.ki2.at``).
     """
 
     def __init__(
@@ -61,15 +65,14 @@ class IngestService:
         embedder,
         qdrant: QdrantService,
         contextual_enricher=None,
-        fallback_embedder=None,
+        sparse_embedder=None,
     ) -> None:
         self._chunker = chunker
         self._classifier = classifier
         self._embedder = embedder
         self._qdrant = qdrant
         self._contextual_enricher = contextual_enricher
-        self._fallback_embedder = fallback_embedder
-        self._bm25 = BM25Encoder()
+        self._sparse_embedder = sparse_embedder
 
     async def ingest(
         self,
@@ -85,16 +88,25 @@ class IngestService:
         chunk_overlap: int | None = None,
         vector_size: int = 1536,
         search_mode: str = "semantic",
-        fallback_dense_dim: int | None = None,
         content_type: list[str] | None = None,
         entities: dict | None = None,
         deferred_metadata_task: Awaitable[dict] | None = None,
         progress_queue: asyncio.Queue | None = None,
+        primary_embedder=None,
+        primary_vector_name: str = "dense_openai",
     ) -> IngestResult:
         start = time.monotonic()
         collection = collection_name
         use_sparse = search_mode == "hybrid"
-        use_multi_vector = self._fallback_embedder is not None and fallback_dense_dim is not None
+        # Per-request override of the configured primary embedder (e.g. swap
+        # OpenAI for the TEI BGE-M3 client). Defaults to the service-wide
+        # embedder injected at startup.
+        embedder = primary_embedder or self._embedder
+
+        # Per-stage billing records collected as the pipeline runs; rolled
+        # up into the ``UsageSummary`` returned on ``IngestResult`` so the
+        # router can put it on the response and persist to ClickHouse.
+        usage_entries: list[StageUsage] = []
 
         async def _emit(phase: str, **payload) -> None:
             if progress_queue is not None:
@@ -107,14 +119,11 @@ class IngestService:
 
         # Ensure collection exists with correct vector config
         try:
-            multi_vec = {"dense_openai": vector_size}
-            if use_multi_vector:
-                multi_vec["dense_bge_gemma2"] = fallback_dense_dim
             await self._qdrant.create_collection(
                 name=collection,
                 sparse=use_sparse,
                 distance="Cosine",
-                multi_vector=multi_vec,
+                multi_vector={primary_vector_name: vector_size},
             )
         except QdrantError as e:
             raise IngestError(str(e), code="QDRANT_CONNECTION_FAILED") from e
@@ -139,10 +148,13 @@ class IngestService:
         # 1b. Contextual Retrieval — enrich each chunk with document-level context
         if use_contextual and self._contextual_enricher:
             try:
-                chunk_result.chunks = await self._contextual_enricher.enrich_chunks(
+                enriched_chunks, contextual_usage = await self._contextual_enricher.enrich_chunks(
                     document=content,
                     chunks=chunk_result.chunks,
                 )
+                chunk_result.chunks = enriched_chunks
+                if contextual_usage is not None:
+                    usage_entries.append(contextual_usage)
                 log.info("ingest_contextual_enriched", source_id=source_id, chunks=len(chunk_result.chunks))
                 await _emit("enriched", chunks=len(chunk_result.chunks))
             except Exception as e:
@@ -164,6 +176,8 @@ class IngestService:
 
             if classify_result:
                 classification = [classify_result.category.value] + classify_result.sub_categories
+                if classify_result.usage is not None:
+                    usage_entries.append(classify_result.usage)
             else:
                 classification = ["general"]
         entities_extracted = {
@@ -172,60 +186,62 @@ class IngestService:
             "amounts": len(classify_result.entities.amounts) if classify_result else 0,
         }
 
-        # 3. Embed all chunks — primary + fallback run in parallel so
-        # total embed latency is max(primary, fallback) instead of the sum.
+        # 3. Embed all chunks. Dense runs in parallel with sparse (when
+        # hybrid) so total embed latency is max(dense, sparse).
         embed_start = time.monotonic()
 
-        primary_task = asyncio.create_task(self._embedder.embed_batch(chunk_result.chunks))
-        fallback_task: asyncio.Task | None = None
-        if use_multi_vector:
-            fallback_task = asyncio.create_task(self._fallback_embedder.embed_batch(chunk_result.chunks))
+        dense_task = asyncio.create_task(embedder.embed_batch(chunk_result.chunks))
+        sparse_task: asyncio.Task | None = None
+        if use_sparse:
+            if self._sparse_embedder is None:
+                raise IngestError(
+                    "search_mode='hybrid' requested but no sparse embedder is configured",
+                    code="EMBEDDING_MODEL_NOT_LOADED",
+                )
+            sparse_task = asyncio.create_task(self._sparse_embedder.encode_batch(chunk_result.chunks))
 
-        openai_embeddings = None
-        primary_error: EmbeddingError | None = None
         try:
-            openai_embeddings = await primary_task
+            dense_embeddings = await dense_task
         except EmbeddingError as e:
-            primary_error = e
-            log.warning("ingest_primary_embed_failed", source_id=source_id, error=str(e))
-
-        fallback_embeddings = None
-        if fallback_task is not None:
-            try:
-                fallback_embeddings = await fallback_task
-            except EmbeddingError as e:
-                log.warning("ingest_fallback_embed_failed", source_id=source_id, error=str(e))
-
-        # If the only embedder failed and there's no fallback, surface the original error.
-        if not use_multi_vector and primary_error is not None:
-            error_msg = str(primary_error).lower()
+            error_msg = str(e).lower()
             if "oom" in error_msg or "memory" in error_msg:
-                raise IngestError(str(primary_error), code="EMBEDDING_OOM") from primary_error
+                raise IngestError(str(e), code="EMBEDDING_OOM") from e
             if "not initialized" in error_msg or "not loaded" in error_msg:
-                raise IngestError(str(primary_error), code="EMBEDDING_MODEL_NOT_LOADED") from primary_error
-            raise IngestError(str(primary_error), code="EMBEDDING_FAILED") from primary_error
+                raise IngestError(str(e), code="EMBEDDING_MODEL_NOT_LOADED") from e
+            raise IngestError(str(e), code="EMBEDDING_FAILED") from e
 
-        # At least one embedding source must succeed
-        if openai_embeddings is None and fallback_embeddings is None:
-            raise IngestError(
-                "Both primary and fallback embedding models failed",
-                code="EMBEDDING_FAILED",
-            )
+        sparse_embeddings: list | None = None
+        if sparse_task is not None:
+            try:
+                sparse_embeddings = await sparse_task
+            except EmbeddingError as e:
+                raise IngestError(f"Sparse embed failed: {e}", code="EMBEDDING_FAILED") from e
 
         embedding_time_ms = int((time.monotonic() - embed_start) * 1000)
+        # Each embed client stashes its per-call usage on ``last_usage``
+        # after embed_batch — pull both (dense + optional sparse) into the
+        # aggregate. ``isinstance`` gates out test stubs (MagicMock leaves
+        # ``last_usage`` as a non-StageUsage attribute).
+        dense_usage = getattr(embedder, "last_usage", None)
+        if isinstance(dense_usage, StageUsage):
+            usage_entries.append(dense_usage)
+        if sparse_embeddings is not None and self._sparse_embedder is not None:
+            sparse_usage = getattr(self._sparse_embedder, "last_usage", None)
+            if isinstance(sparse_usage, StageUsage):
+                usage_entries.append(sparse_usage)
         log.info(
             "ingest_embedded",
             source_id=source_id,
             chunks=len(chunk_result.chunks),
-            has_openai=openai_embeddings is not None,
-            has_bge_gemma2=fallback_embeddings is not None,
+            primary_vector=primary_vector_name,
+            has_sparse=sparse_embeddings is not None,
             duration_ms=embedding_time_ms,
         )
         await _emit(
             "embedded",
             chunks=len(chunk_result.chunks),
-            has_openai=openai_embeddings is not None,
-            has_bge_gemma2=fallback_embeddings is not None,
+            primary_vector=primary_vector_name,
+            has_sparse=sparse_embeddings is not None,
             duration_ms=embedding_time_ms,
         )
 
@@ -239,6 +255,13 @@ class IngestService:
                 log.warning("ingest_deferred_metadata_failed", source_id=source_id, error=str(e))
                 deferred_meta = None
             if deferred_meta:
+                # Pull the billing sentinel out before merging — it must not
+                # land in the stored Qdrant payload. ``__usage__`` is the
+                # constant key the funding extractor stashes its StageUsage
+                # under (see funding_extractor._KEY_USAGE).
+                funding_usage = deferred_meta.pop("__usage__", None)
+                if isinstance(funding_usage, StageUsage):
+                    usage_entries.append(funding_usage)
                 metadata = {**deferred_meta, **metadata}
                 await _emit("funding_extracted", fields=sorted(deferred_meta.keys()))
             else:
@@ -310,17 +333,12 @@ class IngestService:
                 "metadata": point_metadata,
             }
 
-            # Build vectors dict — always use dense_openai as the primary name
-            vectors: dict = {}
-
-            if openai_embeddings:
-                vectors["dense_openai"] = openai_embeddings[i].dense
-            if use_multi_vector and fallback_embeddings:
-                vectors["dense_bge_gemma2"] = fallback_embeddings[i].dense
-
-            # Include BM25 sparse vector for hybrid search mode
-            if use_sparse:
-                vectors["sparse"] = self._bm25.encode(chunk_text)
+            # Build vectors dict — one dense vector named after the selected
+            # embedder (dense_openai / dense_bge_m3) plus an optional TEI
+            # sparse vector when hybrid mode is on.
+            vectors: dict = {primary_vector_name: dense_embeddings[i].dense}
+            if use_sparse and sparse_embeddings is not None:
+                vectors["sparse"] = sparse_embeddings[i].as_dict()
 
             point = {
                 "id": str(uuid.uuid5(uuid.NAMESPACE_URL, chunk_id)),
@@ -366,4 +384,5 @@ class IngestService:
             entities_extracted=entities_extracted,
             embedding_time_ms=embedding_time_ms,
             total_time_ms=total_time_ms,
+            usage=UsageSummary.from_entries(usage_entries),
         )

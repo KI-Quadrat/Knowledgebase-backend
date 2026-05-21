@@ -47,6 +47,13 @@ class OnlineDeleteVectorsData(BaseModel):
     vectors_deleted: int = Field(..., description="Number of vectors removed from Qdrant")
 
 
+class OnlineDeleteVectorsATData(BaseModel):
+    """Result of deleting all vectors for a document on the AT Qdrant instance."""
+
+    source_id: str = Field(..., description="Document ID whose vectors were deleted")
+    vectors_deleted: int = Field(..., description="Number of vectors removed from Qdrant")
+
+
 class OnlineSparseEncodeRequest(BaseModel):
     """Encode arbitrary text into a BM25 sparse vector."""
 

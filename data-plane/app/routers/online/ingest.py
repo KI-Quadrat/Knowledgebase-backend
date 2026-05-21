@@ -8,10 +8,32 @@ from fastapi import APIRouter, Request
 
 from app.config import ext
 from app.models.common import ErrorCode, ResponseEnvelope
-from app.models.online.ingest import OnlineIngestData, OnlineIngestRequest
+from app.models.online.ingest import EmbeddingModel, OnlineIngestData, OnlineIngestRequest
 from app.routers._ingest_utils import INGEST_ERROR_CODE_MAP
 from app.services.ingest.ingest_service import IngestError
 from app.utils.logger import get_logger
+
+# Per-model defaults for vector dim + stored vector field name.
+#   openai → text-embedding-3-small (1536, "dense_openai")
+#   bge_m3 → BGE-M3 via TEI endpoint (1024, "dense_bge_m3")
+_EMBEDDING_MODEL_DEFAULTS: dict[EmbeddingModel, tuple[int, str]] = {
+    EmbeddingModel.openai: (1536, "dense_openai"),
+    EmbeddingModel.bge_m3: (1024, "dense_bge_m3"),
+}
+
+
+def _resolve_primary_embedder(app_state, model: EmbeddingModel):
+    """Return (embedder_override, default_dim, vector_name) for the selected model.
+
+    For the default ``openai`` path we return ``None`` so ``IngestService`` uses
+    the embedder it was constructed with (the one wired up in lifespan) — this
+    keeps the hot path unchanged and preserves backwards compatibility with
+    tests that inject a fake IngestService.embedder directly.
+    """
+    dim, vector_name = _EMBEDDING_MODEL_DEFAULTS[model]
+    if model == EmbeddingModel.bge_m3:
+        return app_state.tei_embedder_at, dim, vector_name
+    return None, dim, vector_name
 
 log = get_logger(__name__)
 
@@ -25,23 +47,22 @@ router = APIRouter(prefix="/api/v1/online", tags=["Online - Ingestion Pipeline"]
         "Takes web-scraped or URL-parsed text content and processes it through the ingestion pipeline:\n\n"
         "1. **Chunk** — Split content using `contextual` (default), `late_chunking`, `sentence`, or `fixed` strategy\n"
         "2. **Contextual Enrichment** — (when using `contextual` strategy) Prepend AI-generated context to each chunk via OpenAI, improving retrieval accuracy\n"
-        "3. **Embed** — Generate **multi-vector** dense embeddings via OpenAI `text-embedding-3-small` (1536-dim) "
-        "**and** BGE-multilingual-gemma2 via LiteLLM (fallback, configurable dim). "
-        "If one embedder fails, the point is still stored with the other's vector.\n"
+        "3. **Embed** — Generate a dense vector via the model chosen by `embedding_model`: "
+        "`openai` → `text-embedding-3-small` (1536-dim, stored as `dense_openai`); "
+        "`bge_m3` → BGE-M3 behind the TEI endpoint at `TEI_EMBED_URL_AT` (1024-dim, stored as `dense_bge_m3`).\n"
         "4. **Store** — Upsert vectors into the specified Qdrant `collection_name` with metadata\n\n"
         "**Content type is supplied by the caller.** The `content_type` field is **required** — "
         "obtain it upfront from `/online/scrape` or `/online/document-parse`, which now run the classifier "
         "and return `content_type` on their responses. Classification is no longer performed inside this endpoint. "
         "Content-type gating (e.g. skipping non-funding content when `assistant_type` is `\"funding\"`) "
         "is expected to be done by the caller before invoking ingest.\n\n"
-        "**Multi-vector architecture:**\n"
-        "Every point stores two dense vectors: `dense_openai` (primary) and `dense_bge_gemma2` (fallback). "
-        "During search, OpenAI is tried first; if it is unavailable, `dense_bge_gemma2` is used automatically.\n\n"
+        "**Vector layout:**\n"
+        "Each point carries exactly one dense vector — `dense_openai` or `dense_bge_m3` depending on "
+        "the chosen `embedding_model`. A collection is pinned to the model it was first ingested with.\n\n"
         "**Vector modes** (via `vector_config.search_mode`):\n"
-        "- `semantic` (default) — stores `dense_openai` + `dense_bge_gemma2` cosine vectors. "
-        "Best for pure semantic similarity search.\n"
-        "- `hybrid` — stores `dense_openai` + `dense_bge_gemma2` + `sparse` (BM25) vectors. "
-        "Enables combined semantic + lexical search.\n\n"
+        "- `semantic` (default) — dense cosine vector only.\n"
+        "- `hybrid` — dense + `sparse` vector from the TEI sparse endpoint at `SPARSE_EMBED_URL_AT` "
+        "(sparse.ki2.at). Enables combined semantic + lexical search.\n\n"
         "The collection is **auto-created** if it does not exist, using the specified vector size and search mode.\n\n"
         "**Funding metadata extraction:** When `assistant_type` is `\"funding\"`, "
         "an additional OpenAI call extracts structured funding metadata (`country_code`, `state_or_province`, `city`, "
@@ -90,6 +111,10 @@ async def ingest_online(body: OnlineIngestRequest, request: Request) -> Response
 
     chunking = body.chunking
     vcfg = body.vector_config
+    primary_embedder, default_dim, primary_vector_name = _resolve_primary_embedder(
+        request.app.state, body.embedding_model
+    )
+    vector_size = vcfg.vector_size if (vcfg and vcfg.vector_size is not None) else default_dim
     # Request-supplied metadata wins over anything the funding extractor produces,
     # so build the request-side dict here and let the service merge deferred
     # funding fields under it.
@@ -113,12 +138,13 @@ async def ingest_online(body: OnlineIngestRequest, request: Request) -> Response
             chunking_strategy=chunking.strategy if chunking else "contextual",
             max_chunk_size=chunking.max_chunk_size if chunking else None,
             chunk_overlap=chunking.overlap if chunking else None,
-            vector_size=vcfg.vector_size if vcfg else 1536,
+            vector_size=vector_size,
             search_mode=vcfg.search_mode.value if vcfg else "semantic",
-            fallback_dense_dim=ext.bge_gemma2_dense_dim if (vcfg and vcfg.enable_fallback) else None,
             content_type=body.content_type,
             entities=body.entities.model_dump() if body.entities else None,
             deferred_metadata_task=funding_task,
+            primary_embedder=primary_embedder,
+            primary_vector_name=primary_vector_name,
         )
     except IngestError as e:
         if funding_task is not None and not funding_task.done():

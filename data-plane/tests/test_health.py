@@ -172,9 +172,15 @@ def test_model_health_uses_shared_env_api_key_behavior(client, monkeypatch):
         _model="text-embedding-3-small",
         embed=AsyncMock(return_value=object()),
     )
-    app.state.bge_gemma2_embedder = MagicMock(
-        _model="bge-multilingual-gemma2",
+    app.state.tei_embedder_at = MagicMock(
+        _api_key="tei-key",
+        _model="BAAI/bge-m3",
         embed=AsyncMock(return_value=object()),
+    )
+    app.state.sparse_embedder = MagicMock(
+        _api_key="sparse-key",
+        _model="BAAI/bge-m3",
+        encode=AsyncMock(return_value=object()),
     )
     app.state.classifier = MagicMock(
         _llm=MagicMock(_client=object(), _model="gpt-4o-mini")
@@ -221,9 +227,15 @@ def test_model_health_returns_model_statuses(client, monkeypatch):
         _model="text-embedding-3-small",
         embed=AsyncMock(return_value=object()),
     )
-    app.state.bge_gemma2_embedder = MagicMock(
-        _model="bge-multilingual-gemma2",
+    app.state.tei_embedder_at = MagicMock(
+        _api_key="tei-key",
+        _model="BAAI/bge-m3",
         embed=AsyncMock(return_value=object()),
+    )
+    app.state.sparse_embedder = MagicMock(
+        _api_key="sparse-key",
+        _model="BAAI/bge-m3",
+        encode=AsyncMock(return_value=object()),
     )
     app.state.classifier = MagicMock(
         _llm=MagicMock(_client=object(), _model="gpt-4o-mini")
@@ -249,13 +261,14 @@ def test_model_health_returns_model_statuses(client, monkeypatch):
     assert response.status_code == 200
     data = response.json()
     assert data["healthy"] is True
-    assert len(data["models"]) == 9
+    assert len(data["models"]) == 10
     assert {item["component"] for item in data["models"]} == {
         "scraper_crawl4ai",
         "scraper_jina_reader",
         "local_embedding",
-        "online_embedding_primary",
-        "online_embedding_fallback",
+        "online_embedding_openai",
+        "online_embedding_bge_m3",
+        "online_embedding_sparse",
         "content_classifier",
         "contextual_enricher",
         "funding_extractor",
@@ -288,9 +301,15 @@ def test_model_health_reports_unhealthy_components(client, monkeypatch):
         _model="text-embedding-3-small",
         embed=AsyncMock(side_effect=RuntimeError("embedding failed")),
     )
-    app.state.bge_gemma2_embedder = MagicMock(
-        _model="bge-multilingual-gemma2",
+    app.state.tei_embedder_at = MagicMock(
+        _api_key="tei-key",
+        _model="BAAI/bge-m3",
         embed=AsyncMock(return_value=object()),
+    )
+    app.state.sparse_embedder = MagicMock(
+        _api_key="sparse-key",
+        _model="BAAI/bge-m3",
+        encode=AsyncMock(return_value=object()),
     )
     app.state.classifier = MagicMock(
         _llm=MagicMock(_client=object(), _model="gpt-4o-mini")
@@ -319,8 +338,8 @@ def test_model_health_reports_unhealthy_components(client, monkeypatch):
     by_component = {item["component"]: item for item in data["models"]}
     assert by_component["scraper_crawl4ai"]["healthy"] is False
     assert by_component["scraper_jina_reader"]["healthy"] is False
-    assert by_component["online_embedding_primary"]["healthy"] is False
-    assert "embedding failed" in by_component["online_embedding_primary"]["detail"]
+    assert by_component["online_embedding_openai"]["healthy"] is False
+    assert "embedding failed" in by_component["online_embedding_openai"]["detail"]
     assert by_component["content_classifier"]["healthy"] is False
     assert by_component["contextual_enricher"]["healthy"] is False
     assert by_component["funding_extractor"]["configured"] is False

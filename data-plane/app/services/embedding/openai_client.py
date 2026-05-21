@@ -46,7 +46,30 @@ class OpenAIEmbedClient:
             raise EmbeddingError("OpenAI embed client not initialized")
         if not self._api_key:
             raise EmbeddingError("OPENAI_API_KEY not configured")
+        if not texts:
+            return []
 
+        # OpenAI accepts up to 2048 inputs (~300K tokens) per request; keep
+        # individual requests bounded by splitting into windows. 0 disables.
+        max_batch = ext.openai_embed_max_batch or len(texts)
+        start = time.monotonic()
+        results: list[EmbeddingResult] = []
+        for offset in range(0, len(texts), max_batch):
+            window = texts[offset : offset + max_batch]
+            results.extend(await self._embed_window(window))
+        duration = int((time.monotonic() - start) * 1000)
+
+        log.info(
+            "openai_embed_complete",
+            model=self._model,
+            count=len(texts),
+            duration_ms=duration,
+            windows=(len(texts) + max_batch - 1) // max_batch,
+        )
+        return results
+
+    async def _embed_window(self, texts: list[str]) -> list[EmbeddingResult]:
+        """POST a single ≤max_batch window to OpenAI and parse the response."""
         start = time.monotonic()
         try:
             resp = await self._client.post(
@@ -71,13 +94,7 @@ class OpenAIEmbedClient:
 
         embeddings = sorted(data.get("data", []), key=lambda x: x["index"])
 
-        results = []
-        for item in embeddings:
-            results.append(EmbeddingResult(
-                dense=item["embedding"],
-                sparse=None,
-                duration_ms=duration,
-            ))
-
-        log.info("openai_embed_complete", model=self._model, count=len(texts), duration_ms=duration)
-        return results
+        return [
+            EmbeddingResult(dense=item["embedding"], sparse=None, duration_ms=duration)
+            for item in embeddings
+        ]

@@ -182,11 +182,14 @@ class TestIsThinOutput:
         md = "Ausführlicher Inhalt. " * 200
         assert _is_thin_output(md, "<html>" + "x" * 2000 + "</html>") is False
 
-    def test_ratio_signal_catches_heavy_html_thin_markdown(self):
-        # 200 words clears the word threshold, but ratio < 0.005 vs huge HTML.
+    def test_ratio_alone_does_not_trip(self):
+        # Ratio-alone no longer trips thinness — both word-count AND ratio
+        # signals must fire (the old OR-logic doubled scrape time on normal
+        # short pages). 200 words clears the word threshold even against
+        # massive HTML.
         md = "Wort " * 200
         html = "<html>" + "x" * 500_000 + "</html>"
-        assert _is_thin_output(md, html) is True
+        assert _is_thin_output(md, html) is False
 
     def test_missing_html_suppresses_detection(self):
         # Without HTML we refuse to retry — no reliable signal.

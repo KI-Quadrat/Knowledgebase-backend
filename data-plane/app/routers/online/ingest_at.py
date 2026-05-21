@@ -1,40 +1,47 @@
 """POST /api/v1/online/ingest/at — AT funding-assistant ingest.
 
 Dedicated endpoint for the Austrian funding-assistant pipeline. Runs on a
-separate Qdrant instance (``app.state.qdrant_at``) whose collections are
-pre-created with the legacy single-unnamed-vector schema::
+separate Qdrant instance (``app.state.qdrant_at``) whose target collection is
+pre-created with the legacy single-unnamed-vector schema sized for the TEI
+embedding model behind ``TEI_EMBED_URL_AT``::
 
-    {"vectors": {"size": 1536, "distance": "Cosine"}}
+    {"vectors": {"size": 1024, "distance": "Cosine"}}
 
-— no sparse, no multi-vector — with ``metadata.region`` and
-``metadata.source_url`` indexed as keyword fields. Because of that schema
-mismatch with the rest of the platform, this endpoint drives the ingest
-directly instead of reusing :class:`IngestService`.
+— no sparse, no multi-vector — with ``metadata.source_url`` indexed as a
+keyword field. Because of that schema mismatch with the rest of the platform,
+this endpoint drives the ingest directly instead of reusing
+:class:`IngestService`.
 
 Behaviour
 ---------
 - Country is implicit — every request is treated as AT.
 - Assistant type is implicit — the funding extractor always runs, so callers
   do not supply ``assistant_type``.
-- Province selection precedence:
-  1. ``body.state_or_province`` (explicit request override) — accepts either
-     English lowercase (``"lower austria"``) or the German collection name
-     (``"Niederösterreich"``).
-  2. Funding-extractor output.
-  3. Fallback: fan out to all nine Austrian province collections.
-- Idempotency: strict-mode collections block filtering on unindexed keys, so
-  ``metadata.source_id`` cannot be used to delete old chunks. The flow
-  deletes by the indexed ``metadata.source_url`` field before upserting.
+- Target collection: ``body.collection_name`` (required). Auto-created with
+  the AT legacy schema (single unnamed 1024-dim cosine vector, keyword
+  indexes on ``metadata.source_id`` and ``metadata.source_url``) on first
+  use. Existing collections are reused; a dim mismatch fails fast with
+  ``QDRANT_COLLECTION_NOT_FOUND``.
+- ``state_or_province``: override wins over the extractor; both are stored on
+  every point as ``metadata.state_or_province`` (english lowercase) for
+  search-time filtering. No collection routing.
+- Embeddings: TEI OpenAI-compatible endpoint (``TEI_EMBED_URL_AT``) with
+  bearer auth. Dense-only, 1024-dim.
+- Extra extracted metadata (``program_name``, ``processing_office``,
+  ``contract_email``, ``contract_phone``, and the full funding-extractor
+  output) lands on every point under ``metadata.*``.
+- Idempotency: prior points for the same document are deleted via the
+  indexed ``metadata.source_id`` field before the fresh upsert — a repeat
+  ingest of the same ``source_id`` fully replaces the stored chunks.
 """
 
-import asyncio
 import hashlib
 import time
 
 from fastapi import APIRouter, Request
 
-from app.config import settings
 from app.models.common import ErrorCode, ResponseEnvelope
+from app.models.online.ingest import EmbeddingModel
 from app.models.online.ingest_at import OnlineIngestATData, OnlineIngestATRequest
 from app.services.embedding.bge_m3_client import EmbeddingError
 from app.services.embedding.qdrant_service import QdrantError
@@ -44,70 +51,19 @@ log = get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/online", tags=["Online - Ingestion Pipeline (AT)"])
 
-
-# English-lowercase (as emitted by the funding extractor) → German collection name.
-PROVINCE_TO_COLLECTION_AT: dict[str, str] = {
-    "burgenland": "Burgenland",
-    "carinthia": "Kärnten",
-    "lower austria": "Niederösterreich",
-    "upper austria": "Oberösterreich",
-    "salzburg": "Salzburg",
-    "styria": "Steiermark",
-    "tyrol": "Tirol",
-    "vorarlberg": "Vorarlberg",
-    "vienna": "Wien",
-}
-
-ALL_AT_COLLECTIONS: list[str] = list(PROVINCE_TO_COLLECTION_AT.values())
-
 _AT_COUNTRY = "AT"
 _AT_ASSISTANT_TYPE = "funding"
-# Sentinel stored in metadata.region when a document fans out to every
-# Austrian province (nationwide funding). Must match the value the search
-# side filters on.
-_REGION_ALL = "alle"
 
-
-def _resolve_collection(name: str) -> str | None:
-    if not name:
-        return None
-    lower = name.strip().lower()
-    if lower in PROVINCE_TO_COLLECTION_AT:
-        return PROVINCE_TO_COLLECTION_AT[lower]
-    for collection in ALL_AT_COLLECTIONS:
-        if collection.lower() == lower:
-            return collection
-    return None
-
-
-def _normalize_provinces(names: list[str] | None) -> list[str]:
-    """Map a mixed list of province names to their German collection forms.
-
-    Dedupes, preserves stable order, and drops anything that doesn't resolve
-    to one of the nine AT province collections.
-    """
-    if not names:
-        return []
-    seen: set[str] = set()
-    out: list[str] = []
-    for raw in names:
-        resolved = _resolve_collection(raw)
-        if resolved and resolved not in seen:
-            seen.add(resolved)
-            out.append(resolved)
-    return sorted(out)
-
-
-def _select_collections(
-    override_resolved: list[str],
-    extracted_resolved: list[str],
-) -> list[str]:
-    """Pick target collections from the already-resolved province lists."""
-    if override_resolved:
-        return list(override_resolved)
-    if extracted_resolved:
-        return list(extracted_resolved)
-    return list(ALL_AT_COLLECTIONS)
+# Chunking tuned for German-language funding pages (gv.at / municipal sites).
+# Those pages organize information into short sections — Fristen,
+# Eligibility, Förderhöhe, Kontakt — and ~1000 chars usually captures one
+# section whole. German averages ~5 chars/token → ~200 tokens per chunk,
+# which sits comfortably inside BGE-M3's high-quality zone (100–512 tokens).
+# Contextual enrichment adds ~150–300 chars of prefix, so the final embed
+# length lands ~260 tokens — still ideal. Overlap of 150 catches single
+# facts (deadlines, amounts) that straddle paragraph breaks.
+_AT_DEFAULT_CHUNK_SIZE = 1000
+_AT_DEFAULT_CHUNK_OVERLAP = 150
 
 
 async def _safe_extract_funding(
@@ -120,31 +76,69 @@ async def _safe_extract_funding(
         return {}
 
 
-def _point_id(source_id: str, chunk_index: int, collection: str) -> int:
-    """Deterministic 64-bit unsigned integer ID for a chunk in a given collection.
+def _point_id(source_id: str, chunk_index: int) -> int:
+    """Deterministic 64-bit unsigned integer ID for a chunk.
 
-    The existing AT collections use integer point IDs (the data already carries
-    small sequential values like ``474``). We derive ours from the low 64 bits
-    of ``sha256(collection|source_id|chunk_index)``:
-
-    - Stable across runs → repeated ingest overwrites in place (idempotent).
-    - Per-collection salt → the same chunk in different province collections
-      gets different IDs, which is irrelevant for correctness but prevents any
-      cross-collection coincidence from looking like a duplicate.
-    - 64-bit values are astronomically unlikely to collide with the existing
-      small sequential IDs already present in the collections.
+    The AT collection uses integer point IDs. We derive ours from the low 64
+    bits of ``sha256(source_id|chunk_index)`` so repeat ingests overwrite in
+    place and the same chunk always lands on the same ID.
     """
-    key = f"{collection}|{source_id}|{chunk_index}".encode()
+    key = f"{source_id}|{chunk_index}".encode()
     digest = hashlib.sha256(key).digest()
     return int.from_bytes(digest[:8], "big")
 
 
 _KNOWN_METADATA_KEYS = {
-    "source_url",
+    "source_id", "source_url",
     "content_type", "language", "title", "source_type",
     "uploaded_by", "assistant_id", "municipality_id", "department",
-    "assistant_type", "region",
+    "assistant_type",
 }
+
+
+# German / English → canonical English-lowercase form. The canonical forms
+# match funding_extractor.PROVINCES_BY_COUNTRY["AT"] exactly so overrides and
+# extractor output produce the same stored metadata.state_or_province value
+# regardless of caller input casing or language.
+_AT_PROVINCE_ALIASES: dict[str, str] = {
+    # English (canonical)
+    "burgenland": "burgenland",
+    "carinthia": "carinthia",
+    "lower austria": "lower austria",
+    "upper austria": "upper austria",
+    "salzburg": "salzburg",
+    "styria": "styria",
+    "tyrol": "tyrol",
+    "vorarlberg": "vorarlberg",
+    "vienna": "vienna",
+    # German
+    "kärnten": "carinthia",
+    "niederösterreich": "lower austria",
+    "oberösterreich": "upper austria",
+    "steiermark": "styria",
+    "tirol": "tyrol",
+    "wien": "vienna",
+}
+
+
+def _normalize_provinces(names: list[str] | None) -> list[str]:
+    """Canonicalize AT province names to the same English-lowercase form the
+    funding extractor emits.
+
+    Accepts German or English input, any casing. Unknown values are dropped so
+    the stored ``metadata.state_or_province`` is always a subset of the nine
+    official AT provinces — search-time filters stay consistent across ingests.
+    """
+    if not names:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in names:
+        canonical = _AT_PROVINCE_ALIASES.get((raw or "").strip().lower())
+        if canonical and canonical not in seen:
+            seen.add(canonical)
+            out.append(canonical)
+    return out
 
 
 def _build_point(
@@ -156,22 +150,13 @@ def _build_point(
     source_url: str,
     content_type: list[str],
     language: str,
-    collection: str,
-    region: list[str],
     metadata: dict,
     entities: dict | None,
 ) -> dict:
-    """Build a single Qdrant point in the AT collection's unnamed-vector schema.
-
-    ``chunk_id``, ``source_id``, and ``chunk_index`` are intentionally not
-    written to the payload: idempotency uses the indexed ``metadata.source_url``
-    filter, and re-ingest overwrites rely on the deterministic integer point
-    ID derived from ``(collection, source_id, chunk_index)`` — there's no
-    reader that consumes those fields off the payload.
-    """
+    """Build a single Qdrant point in the AT collection's unnamed-vector schema."""
     point_metadata: dict = {
+        "source_id": source_id,
         "source_url": source_url,
-        "region": region,
         "content_type": content_type,
         "language": language,
         "title": metadata.get("title", ""),
@@ -204,23 +189,24 @@ def _build_point(
     }
 
     return {
-        "id": _point_id(source_id, chunk_index, collection),
+        "id": _point_id(source_id, chunk_index),
         "vector": embedding,
         "payload": payload,
     }
 
 
-async def _delete_existing_by_source_url(qdrant, collection: str, source_url: str) -> None:
-    """Best-effort delete of prior points for this source_url. Swallows errors.
+async def _delete_existing_by_source_id(qdrant, collection: str, source_id: str) -> None:
+    """Best-effort delete of prior points for this source_id. Swallows errors.
 
-    ``metadata.source_url`` is indexed on the AT collections, so delete-by-filter
-    is permitted under strict-mode. ``metadata.source_id`` is *not* indexed, so
-    it cannot be used here.
+    ``metadata.source_id`` is indexed on the AT collections, so delete-by-filter
+    is permitted under strict-mode. This clears every prior chunk for the
+    document before the fresh upsert, guaranteeing a repeat ingest fully
+    replaces stored content (handles chunk-count changes between ingests).
     """
     try:
         await qdrant.delete_by_filter(
             collection,
-            {"must": [{"key": "metadata.source_url", "match": {"value": source_url}}]},
+            {"must": [{"key": "metadata.source_id", "match": {"value": source_id}}]},
         )
     except QdrantError as e:
         log.warning("ingest_online_at_delete_skipped", collection=collection, error=str(e))
@@ -228,31 +214,42 @@ async def _delete_existing_by_source_url(qdrant, collection: str, source_url: st
 
 @router.post(
     "/ingest/at",
-    summary="Ingest funding content into the AT per-province collections",
+    summary="Ingest funding content into a single AT Qdrant collection",
     description=(
         "AT funding-assistant ingest. The country (AT) and assistant type "
         "(funding) are implicit — do not pass them in the body.\n\n"
-        "**Flow:** chunk → optional contextual enrichment → OpenAI embed "
-        "(1536-dim, cosine) → upsert to each target province collection on "
-        "the AT Qdrant instance.\n\n"
-        "**Province selection:**\n"
-        "1. `state_or_province` override (German or English lowercase forms).\n"
-        "2. Funding extractor's `state_or_province` output.\n"
-        "3. All nine province collections as the nationwide fallback: "
-        "`Burgenland`, `Kärnten`, `Niederösterreich`, `Oberösterreich`, "
-        "`Salzburg`, `Steiermark`, `Tirol`, `Vorarlberg`, `Wien`.\n\n"
-        "**Idempotency:** prior points for the same `url` are deleted via the "
-        "indexed `metadata.source_url` field before upsert. Point IDs are a "
-        "deterministic uuid5 over `source_id`+chunk index, so repeat ingests "
-        "overwrite in place.\n\n"
+        "**Flow:** chunk → optional contextual enrichment → embed "
+        "(model picked by `embedding_model`) → upsert to `body.collection_name` "
+        "on the AT Qdrant instance. The collection is auto-created on first use "
+        "with the AT legacy schema (single unnamed cosine vector at the "
+        "embedder's dim + keyword indexes on `metadata.source_id` / "
+        "`metadata.source_url`); a dim mismatch with the chosen model fails "
+        "fast with `QDRANT_COLLECTION_NOT_FOUND`.\n\n"
+        "**Metadata:** the funding extractor runs unconditionally and its "
+        "output (title, program_name, processing_office, contract_email, "
+        "contract_phone, state_or_province, funding_type, status, …) is "
+        "merged into `metadata.*` on every point. `state_or_province` in the "
+        "request body overrides the extractor's choice for the stored "
+        "metadata only — there is no per-province collection routing.\n\n"
+        "**Idempotency:** prior points for the same `source_id` are deleted via "
+        "the indexed `metadata.source_id` field before upsert — a repeat ingest "
+        "fully replaces stored chunks, correctly handling cases where the new "
+        "content produces a different chunk count.\n\n"
+        "**Embedding:** picked by `embedding_model`. `bge_m3` (default) uses "
+        "the TEI server at `TEI_EMBED_URL_AT` (OpenAI-compatible, bearer-auth "
+        "via `TEI_EMBED_API_KEY_AT`, 1024-dim, stored in the AT collection's "
+        "single unnamed vector slot). `openai` uses `text-embedding-3-small` "
+        "(1536-dim) and requires a fresh collection sized to that dim.\n\n"
         "**Qdrant target:** uses `QDRANT_URL_AT` / `QDRANT_PORT_AT` / `QDRANT_API_KEY_AT` "
-        "when set, falling back to the default Qdrant endpoint otherwise.\n\n"
+        "when set, falling back to the default Qdrant endpoint otherwise. "
+        "`QDRANT_PORT_AT` has no default — leave it unset when the port is "
+        "already embedded in `QDRANT_URL_AT`.\n\n"
         "**Optional X-API-Key header** — required only when `DP_ONLINE_API_KEYS` is configured.\n\n"
         "**Error codes:** `VALIDATION_EMPTY_CONTENT`, `EMBEDDING_MODEL_NOT_LOADED`, "
         "`EMBEDDING_FAILED`, `EMBEDDING_OOM`, `QDRANT_CONNECTION_FAILED`, "
         "`QDRANT_COLLECTION_NOT_FOUND`, `QDRANT_UPSERT_FAILED`, `QDRANT_DISK_FULL`."
     ),
-    response_description="Ingestion result with the province collections written to and timing info.",
+    response_description="Ingestion result with the collection written to and timing info.",
 )
 async def ingest_online_at(
     body: OnlineIngestATRequest,
@@ -273,13 +270,24 @@ async def ingest_online_at(
         "ingest_online_at_received",
         source_id=body.source_id,
         url=body.url,
+        collection=body.collection_name,
     )
 
     chunker = request.app.state.chunker
     contextual_enricher = request.app.state.contextual_enricher
-    openai_embedder = request.app.state.openai_embedder
     qdrant = request.app.state.qdrant_at
     extractor = request.app.state.funding_extractor
+
+    # Embedder selection — bge_m3 (default) hits the TEI endpoint (1024-dim);
+    # openai uses text-embedding-3-small (1536-dim). The AT collection is
+    # auto-created at the matching dim below, so switching models requires a
+    # fresh collection name.
+    if body.embedding_model == EmbeddingModel.openai:
+        embedder = request.app.state.openai_embedder
+        dense_dim = 1536
+    else:
+        embedder = request.app.state.tei_embedder_at
+        dense_dim = 1024
 
     # ── 1. Funding extraction (once) ──
     extracted = await _safe_extract_funding(
@@ -289,29 +297,7 @@ async def ingest_online_at(
         source_id=body.source_id,
     )
 
-    # ── 2. Target collections ──
-    # Normalize both override and extractor output to the German collection
-    # names so the stored metadata.state_or_province matches the collections
-    # written, regardless of what casing/language the caller provided.
-    override_raw = body.state_or_province or []
-    extracted_raw = extracted.get("state_or_province", []) if extracted else []
-    override_resolved = _normalize_provinces(override_raw)
-    extracted_resolved = _normalize_provinces(extracted_raw)
-    target_collections = _select_collections(
-        override_resolved=override_resolved,
-        extracted_resolved=extracted_resolved,
-    )
-    log.info(
-        "ingest_online_at_fanout",
-        source_id=body.source_id,
-        collections=target_collections,
-        extracted_raw=extracted_raw,
-        extracted_resolved=extracted_resolved,
-        override_raw=override_raw,
-        override_resolved=override_resolved,
-    )
-
-    # ── 3. Chunk (+ optional contextual enrichment) ──
+    # ── 2. Chunk (+ optional contextual enrichment) ──
     chunking = body.chunking
     strategy = chunking.strategy if chunking else "contextual"
     use_contextual = strategy == "contextual"
@@ -320,8 +306,8 @@ async def ingest_online_at(
     chunk_result = chunker.chunk(
         text=body.content,
         strategy=base_strategy,
-        max_chunk_size=chunking.max_chunk_size if chunking else settings.default_chunk_size,
-        overlap=(chunking.overlap if chunking and chunking.overlap is not None else settings.default_chunk_overlap),
+        max_chunk_size=chunking.max_chunk_size if chunking else _AT_DEFAULT_CHUNK_SIZE,
+        overlap=(chunking.overlap if chunking and chunking.overlap is not None else _AT_DEFAULT_CHUNK_OVERLAP),
     )
     if not chunk_result.chunks:
         return ResponseEnvelope(
@@ -338,10 +324,10 @@ async def ingest_online_at(
         except Exception as e:
             log.warning("ingest_online_at_contextual_failed", source_id=body.source_id, error=str(e))
 
-    # ── 4. Embed once via OpenAI (unnamed 1536-dim cosine vector) ──
+    # ── 3. Embed once via selected model (unnamed cosine vector) ──
     embed_start = time.monotonic()
     try:
-        embeddings = await openai_embedder.embed_batch(chunks)
+        embeddings = await embedder.embed_batch(chunks)
     except EmbeddingError as e:
         msg = str(e).lower()
         if "oom" in msg or "memory" in msg:
@@ -359,52 +345,65 @@ async def ingest_online_at(
         )
     embedding_time_ms = int((time.monotonic() - embed_start) * 1000)
 
-    # ── 5. Build per-collection points ──
+    # ── 4. Build metadata ──
     base_metadata = body.metadata.model_dump()
     base_metadata["source_url"] = body.url
     base_metadata["assistant_type"] = _AT_ASSISTANT_TYPE
+    if body.source_name:
+        base_metadata["source_name"] = body.source_name
     # Funding-extractor output merged under request metadata so request wins.
     merged_metadata = {**extracted, **base_metadata} if extracted else base_metadata
-    # Always store state_or_province in the German collection-name form so it
-    # matches the target collections written (consistent across override vs.
-    # extractor paths, and across mixed English/German caller input).
-    stored_states = override_resolved or extracted_resolved or list(target_collections)
-    merged_metadata["state_or_province"] = stored_states
+
+    # state_or_province: request override > extractor output. Lowercase, deduped.
+    override_states = _normalize_provinces(body.state_or_province)
+    extracted_states = _normalize_provinces(extracted.get("state_or_province") if extracted else None)
+    merged_metadata["state_or_province"] = override_states or extracted_states
+
+    # Fall back program_name to title when the extractor didn't find a
+    # distinct program name — search-time ranking relies on this field.
+    if not merged_metadata.get("program_name"):
+        merged_metadata["program_name"] = merged_metadata.get("title", "")
 
     entities = body.entities.model_dump() if body.entities else None
     language = body.language or "de"
 
-    # When fan-out covers every Austrian province (nationwide funding), mark
-    # each point with the ["alle"] sentinel instead of the specific German
-    # collection name. Otherwise every point gets a single-element array
-    # naming the collection it lives in.
-    is_nationwide = set(target_collections) == set(ALL_AT_COLLECTIONS)
+    # ── 5. Build + upsert points (single collection) ──
+    collection = body.collection_name
+    try:
+        await qdrant.ensure_at_collection(collection, dense_dim=dense_dim)
+    except QdrantError as e:
+        msg = str(e).lower()
+        if "connection" in msg:
+            code = ErrorCode.QDRANT_CONNECTION_FAILED
+        else:
+            code = ErrorCode.QDRANT_COLLECTION_NOT_FOUND
+        log.error("ingest_online_at_ensure_collection_failed", collection=collection, error=str(e))
+        return ResponseEnvelope(
+            success=False,
+            error=code,
+            detail=str(e),
+            request_id=request_id,
+        )
 
-    async def _upsert_one(collection: str) -> int:
-        await _delete_existing_by_source_url(qdrant, collection, body.url)
+    await _delete_existing_by_source_id(qdrant, collection, body.source_id)
 
-        region_value = [_REGION_ALL] if is_nationwide else [collection]
-
-        points = [
-            _build_point(
-                chunk_text=chunk_text,
-                chunk_index=i,
-                embedding=embeddings[i].dense,
-                source_id=body.source_id,
-                source_url=body.url,
-                content_type=body.content_type,
-                language=language,
-                collection=collection,
-                region=region_value,
-                metadata=merged_metadata,
-                entities=entities,
-            )
-            for i, chunk_text in enumerate(chunks)
-        ]
-        return await qdrant.upsert_points(collection, points)
+    points = [
+        _build_point(
+            chunk_text=chunk_text,
+            chunk_index=i,
+            embedding=embeddings[i].dense,
+            source_id=body.source_id,
+            source_url=body.url,
+            content_type=body.content_type,
+            language=language,
+            metadata=merged_metadata,
+            entities=entities,
+        )
+        for i, chunk_text in enumerate(chunks)
+    ]
 
     try:
-        per_collection_counts = await asyncio.gather(*(_upsert_one(c) for c in target_collections))
+        vectors_stored = await qdrant.upsert_points(collection, points)
     except QdrantError as e:
         msg = str(e).lower()
         if "disk" in msg or "full" in msg:
@@ -423,14 +422,13 @@ async def ingest_online_at(
             request_id=request_id,
         )
 
-    total_vectors = sum(per_collection_counts)
     total_ms = int((time.monotonic() - started) * 1000)
     log.info(
         "ingest_online_at_complete",
         source_id=body.source_id,
         chunks=len(chunks),
-        collections=target_collections,
-        vectors_stored=total_vectors,
+        collection=collection,
+        vectors_stored=vectors_stored,
         total_ms=total_ms,
     )
 
@@ -439,8 +437,8 @@ async def ingest_online_at(
         data=OnlineIngestATData(
             source_id=body.source_id,
             chunks_created=len(chunks),
-            vectors_stored=total_vectors,
-            collections_written=target_collections,
+            vectors_stored=vectors_stored,
+            collection_name=collection,
             content_type=body.content_type,
             embedding_time_ms=embedding_time_ms,
             total_time_ms=total_ms,

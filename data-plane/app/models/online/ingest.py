@@ -12,6 +12,19 @@ class SearchMode(str, Enum):
     hybrid = "hybrid"
 
 
+class EmbeddingModel(str, Enum):
+    """Which primary embedder to use for this ingest.
+
+    - ``openai`` — OpenAI ``text-embedding-3-small`` (1536-dim). Stored as
+      ``dense_openai`` in Qdrant.
+    - ``bge_m3`` — BGE-M3 served behind the TEI OpenAI-compatible endpoint
+      at ``TEI_EMBED_URL_AT`` (1024-dim). Stored as ``dense_bge_m3``.
+    """
+
+    openai = "openai"
+    bge_m3 = "bge_m3"
+
+
 class OnlineChunkingConfig(BaseModel):
     """Configuration for text chunking during ingestion."""
 
@@ -23,9 +36,8 @@ class OnlineChunkingConfig(BaseModel):
 class OnlineVectorConfig(BaseModel):
     """Configuration for vector storage in Qdrant."""
 
-    vector_size: int = Field(1536, ge=64, le=4096, description="Dimensionality of the OpenAI dense embedding vector. Default: 1536.")
-    search_mode: SearchMode = Field(SearchMode.semantic, description="'semantic' — dense cosine vectors only. 'hybrid' — dense + sparse (BM25) vectors for combined semantic + lexical search.")
-    enable_fallback: bool = Field(False, description="When true, stores an additional dense_bge_gemma2 vector via LiteLLM alongside dense_openai. Enables automatic fallback to BGE-Gemma2 during search when OpenAI is unavailable. The fallback vector dimension is configured server-side via BGE_GEMMA2_DENSE_DIM.")
+    vector_size: int | None = Field(None, ge=64, le=4096, description="Dimensionality of the dense embedding vector. When omitted, derived from `embedding_model` (1536 for openai, 1024 for bge_m3).")
+    search_mode: SearchMode = Field(SearchMode.semantic, description="'semantic' — dense cosine vector only. 'hybrid' — dense + sparse vector from the TEI sparse endpoint at `SPARSE_EMBED_URL_AT` (sparse.ki2.at) for combined semantic + lexical search.")
 
 
 class OnlineIngestMetadata(BaseModel):
@@ -51,21 +63,18 @@ class OnlineIngestRequest(BaseModel):
     """Request to ingest web-scraped content into the vector database.
 
     Takes scraped/parsed text and runs:
-    chunks -> classifies -> embeds (OpenAI, optionally + BGE-Gemma2) -> stores in Qdrant.
+    chunks -> classifies -> embeds -> stores in Qdrant.
 
-    When ``vector_config.enable_fallback`` is true, every point gets **multi-vector**
-    embeddings: ``dense_openai`` (primary) and ``dense_bge_gemma2`` (fallback via
-    LiteLLM). During search, OpenAI is tried first; if unavailable,
-    ``dense_bge_gemma2`` is used automatically.
-
-    When ``enable_fallback`` is false (default), only a single ``dense`` vector
-    (OpenAI) is stored — same as the original behavior.
+    One dense vector per point, named after the chosen ``embedding_model``:
+    ``dense_openai`` (1536) or ``dense_bge_m3`` (1024). A collection is
+    pinned to the model it was first ingested with.
 
     Existing vectors for the same source_id are automatically replaced (upsert).
 
     **Vector modes:**
-    - `semantic` (default) — stores dense cosine vectors only.
-    - `hybrid` — stores dense + ``sparse`` (BM25) vectors for combined semantic + lexical search.
+    - `semantic` (default) — dense cosine vector only.
+    - `hybrid` — dense + ``sparse`` vector from the TEI sparse endpoint at
+      ``SPARSE_EMBED_URL_AT`` for combined semantic + lexical search.
     """
 
     collection_name: str = Field(..., description="Qdrant collection name to store vectors in")
@@ -78,6 +87,17 @@ class OnlineIngestRequest(BaseModel):
     assistant_type: str | None = Field(None, description="Type of assistant processing this content (e.g. 'municipal', 'internal', 'public'). Stored in Qdrant point metadata for filtering during search.")
     country: str | None = Field(None, description="ISO 3166-1 alpha-2 country code (e.g. 'AT', 'DE', 'RO'). Required when assistant_type is 'funding'. Used by the funding extractor to constrain state_or_province to the official list for that country, preventing hallucinated region names.")
     state_or_province: list[str] | None = Field(None, description="Optional override for the funding `state_or_province` metadata field. When omitted, the funding extractor detects and normalizes the value automatically. When provided as a non-empty list, the values are stored in Qdrant verbatim (no LLM modification, no lowercasing, no validation) — overriding anything the extractor produced.")
+    embedding_model: EmbeddingModel = Field(
+        EmbeddingModel.openai,
+        description=(
+            "Primary embedder for this ingest. `openai` (default) uses "
+            "`text-embedding-3-small` (1536-dim, stored as `dense_openai`). "
+            "`bge_m3` uses BGE-M3 via the TEI endpoint at `TEI_EMBED_URL_AT` "
+            "(1024-dim, stored as `dense_bge_m3`). A collection is tied to "
+            "the model it was first ingested with — mixing models in one "
+            "collection is not supported."
+        ),
+    )
     metadata: OnlineIngestMetadata = Field(..., description="Document metadata stored alongside vectors")
 
     @model_validator(mode="after")

@@ -95,7 +95,7 @@ def test_stream_emits_progress_then_completed(client, mock_ingest):
     progress_events = [
         {"phase": "started", "source_id": "doc_stream_1"},
         {"phase": "chunked", "chunks": 3},
-        {"phase": "embedded", "chunks": 3, "has_openai": True, "has_bge_gemma2": False, "duration_ms": 42},
+        {"phase": "embedded", "chunks": 3, "primary_vector": "dense_openai", "has_sparse": False, "duration_ms": 42},
         {"phase": "stored", "vectors": 3, "collection": "test-coll"},
     ]
     result = IngestResult(

@@ -26,8 +26,8 @@ Update the knowledgebase using online URLs and cloud services.
 - Scrape web pages via Crawl4AI (default) or the Jina Reader API — selectable per request
 - Parse documents from any public URL — uses LlamaParse (cloud)
 - All online endpoints live under `/api/v1/online/`
-- **AT funding assistant** has a dedicated endpoint — `POST /api/v1/online/ingest/at` — that writes to a separate Qdrant instance (`QDRANT_URL_AT` + `QDRANT_PORT_AT` + `QDRANT_API_KEY_AT`) with per-province collections. See the endpoint docs below for province fan-out semantics.
-- Requires: `CRAWL4AI_URL`, `LLAMA_CLOUD_API_KEY`, `OPENAI_API_KEY`; optional `JINA_API_KEY` to enable the Jina backend; `QDRANT_URL_AT` / `QDRANT_PORT_AT` (default 443) / `QDRANT_API_KEY_AT` for the AT pipeline
+- **AT funding assistant** has a dedicated endpoint — `POST /api/v1/online/ingest/at` — that writes to a separate Qdrant instance (`QDRANT_URL_AT` + `QDRANT_PORT_AT` + `QDRANT_API_KEY_AT`) using a caller-supplied single collection. Dense embeddings come from a self-hosted TEI server (`TEI_EMBED_URL_AT`) at 1024 dim. See the endpoint docs below.
+- Requires: `CRAWL4AI_URL`, `LLAMA_CLOUD_API_KEY`, `OPENAI_API_KEY`; optional `JINA_API_KEY` to enable the Jina backend; `QDRANT_URL_AT` / `QDRANT_PORT_AT` (optional — leave unset when the port is embedded in `QDRANT_URL_AT`) / `QDRANT_API_KEY_AT` / `TEI_EMBED_URL_AT` / `TEI_EMBED_API_KEY_AT` for the AT pipeline
 
 ### 2. Local Mode — Fully Offline Document Processing
 Process documents entirely locally without any third-party APIs.
@@ -1093,7 +1093,7 @@ When `country` is provided in the request body (e.g. `"AT"`), the extractor cons
 
 ## `POST /api/v1/online/ingest/at`
 
-Dedicated ingest for the **Austrian funding assistant**. Runs the same pipeline (chunk → contextual enrichment → embed → store) but targets a separate Qdrant instance with **per-province collections**: `Burgenland`, `Kärnten`, `Niederösterreich`, `Oberösterreich`, `Salzburg`, `Steiermark`, `Tirol`, `Vorarlberg`, `Wien`.
+Dedicated ingest for the **Austrian funding assistant**. Runs the pipeline (chunk → contextual enrichment → embed → store) against a single caller-supplied collection on a separate Qdrant instance.
 
 The country (`AT`) and assistant type (`funding`) are **implicit** — don't send them in the body.
 
@@ -1101,32 +1101,36 @@ The country (`AT`) and assistant type (`funding`) are **implicit** — don't sen
 
 | Aspect | `/online/ingest` | `/online/ingest/at` |
 |---|---|---|
-| Qdrant target | `QDRANT_URL` (host:port combined) | `QDRANT_URL_AT` + `QDRANT_PORT_AT` + `QDRANT_API_KEY_AT` (URL and port split, matching the upstream qdrant-client pattern; port defaults to **443** for HTTPS). Falls back to `QDRANT_URL` / `QDRANT_API_KEY` when `QDRANT_URL_AT` is unset. |
-| Collection schema | Named multi-vector (`dense_openai`, `dense_bge_gemma2`, optional `sparse`) | Single unnamed 1536-dim cosine vector (legacy schema) |
-| Collection(s) per request | One (from `collection_name`) | 1–9 (fan-out over Austrian provinces) |
+| Qdrant target | `QDRANT_URL` (host:port combined) | `QDRANT_URL_AT` + `QDRANT_PORT_AT` + `QDRANT_API_KEY_AT` (URL and port split, matching the upstream qdrant-client pattern; `QDRANT_PORT_AT` has no default — leave it unset when the port is already embedded in `QDRANT_URL_AT`, including the implicit 443 for `https://` URLs). Falls back to `QDRANT_URL` / `QDRANT_API_KEY` when `QDRANT_URL_AT` is unset. |
+| Embedding model | OpenAI (`text-embedding-3-small`, 1536 dim) | Self-hosted TEI at `TEI_EMBED_URL_AT` (OpenAI-compatible `/v1/embeddings`, bearer `TEI_EMBED_API_KEY_AT`), **1024 dim** |
+| Collection schema | Named multi-vector (`dense_openai`, `dense_bge_gemma2`, optional `sparse`) | Single unnamed **1024-dim** cosine vector (legacy schema) |
+| Collection(s) per request | One (from `collection_name`) | One (from `collection_name`) |
 | Point ID | `uuid5` string | Deterministic 64-bit integer |
-| `country` / `collection_name` / `assistant_type` / `vector_config` | Required | **Not accepted** — implicit |
+| `country` / `assistant_type` / `vector_config` | Required | **Not accepted** — implicit |
 
-### Province selection
+### Funding-extractor metadata
 
-1. **Override** — `state_or_province` in the request body. Accepts either the English lowercase form (`"lower austria"`, `"vienna"`) or the German collection name (`"Niederösterreich"`, `"Wien"`). Both are normalized to the German name before selection.
-2. **Funding extractor** — if no override is supplied, the extractor reads the content and returns the provinces the funding applies to.
-3. **Fallback** — if both are empty, the content fans out to **all nine** province collections (nationwide funding).
+The OpenAI-based funding extractor runs unconditionally on every request and its output is merged into `metadata.*` on every stored point:
 
-### `metadata.region` on stored points
+- `title`, `program_name` (falls back to `title` when the extractor doesn't find a distinct program name)
+- `processing_office` (list) — a funding doc may route through more than one office
+- `contract_email` (list), `contract_phone` (list) — a funding doc may list multiple contacts
+- `state_or_province` (list, english lowercase), `city` (list)
+- `target_group`, `funding_type`, `status`, `funding_amount`
+- `thematic_focus`, `eligibility_criteria`, `legal_basis`, `funding_provider`
+- `reference_number`, `start_date`, `end_date`, `scraped_at`, `country_code`
 
-Every point carries an array-valued `metadata.region`:
+Request-body fields take precedence — values present in `body.metadata` overwrite the extractor's output on the point.
 
-| Selection outcome | Value written |
-|---|---|
-| One or more specific provinces | `["<collection name>"]` on each point in that collection |
-| All nine (nationwide) | `["alle"]` on every point across every collection |
+### `state_or_province`
+
+`body.state_or_province` overrides the extractor's value for the stored `metadata.state_or_province` only. There is no collection routing — the target collection always comes from `body.collection_name`. Normalized to lowercase + deduped before storage.
 
 ### Idempotency
 
-Before upserting, the endpoint deletes prior points for the same `url` via `metadata.source_url` (which is indexed on the AT collections — `metadata.source_id` is not, and strict-mode Qdrant blocks unindexed filtering). Point IDs are deterministic over `(collection, source_id, chunk_index)`, so re-ingesting the same document overwrites in place.
+Before upserting, the endpoint deletes prior points for the same `source_id` via the indexed `metadata.source_id` filter. This fully clears the document's existing chunks before writing the fresh ones — re-ingesting the same `source_id` replaces the stored content, even if the chunk count changes between ingests. Point IDs are deterministic over `(source_id, chunk_index)`.
 
-### Request (extractor-driven selection)
+### Request
 
 ```bash
 curl -X POST "https://your-domain/api/v1/online/ingest/at" \
@@ -1134,6 +1138,7 @@ curl -X POST "https://your-domain/api/v1/online/ingest/at" \
   -H "X-API-Key: your-api-key" \
   -d '{
     "source_id": "web_salzburg_sport_001",
+    "collection_name": "foerder_at",
     "url": "https://www.salzburg.gv.at/sport-foerderung",
     "content": "Sportförderung Salzburg ...",
     "content_type": ["funding", "sport"],
@@ -1147,25 +1152,6 @@ curl -X POST "https://your-domain/api/v1/online/ingest/at" \
   }'
 ```
 
-### Request (explicit province override)
-
-```bash
-curl -X POST "https://your-domain/api/v1/online/ingest/at" \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your-api-key" \
-  -d '{
-    "source_id": "web_umwelt_vie_noe_001",
-    "url": "https://example.at/umweltfoerderung",
-    "content": "Umweltförderung für Niederösterreich und Wien ...",
-    "content_type": ["funding", "environment"],
-    "state_or_province": ["lower austria", "vienna"],
-    "metadata": {
-      "assistant_id": "asst_foerder_at_01",
-      "municipality_id": "at-federal"
-    }
-  }'
-```
-
 ### Response
 
 ```json
@@ -1175,7 +1161,7 @@ curl -X POST "https://your-domain/api/v1/online/ingest/at" \
     "source_id": "web_salzburg_sport_001",
     "chunks_created": 12,
     "vectors_stored": 12,
-    "collections_written": ["Salzburg"],
+    "collection_name": "foerder_at",
     "content_type": ["funding", "sport"],
     "embedding_time_ms": 480,
     "total_time_ms": 1320
@@ -1184,34 +1170,34 @@ curl -X POST "https://your-domain/api/v1/online/ingest/at" \
 }
 ```
 
-For a nationwide fan-out, `collections_written` lists all nine German province names and `vectors_stored` is `chunks_created × 9`.
-
 ### Request fields
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `source_id` | string | Yes | — | Unique document ID. Keys the `metadata.source_url` delete-before-upsert. |
+| `collection_name` | string | Yes | — | Target collection on the AT Qdrant instance. **Auto-created** with the AT legacy schema (single unnamed 1024-dim cosine vector + keyword indexes on `metadata.source_id` / `metadata.source_url`) on first use. If the collection already exists with a different vector dim, the ingest fails with `QDRANT_COLLECTION_NOT_FOUND`. |
 | `url` | string | Yes | — | Source URL (stored as `metadata.source_url`). |
+| `source_name` | string | No | `null` | Human-readable label for the source (e.g. `"Land Salzburg — Sportförderung"`). Stored verbatim as `metadata.source_name` when supplied; the field is omitted from stored metadata when null/empty. |
 | `content` | string | Yes | — | Parsed/scraped text. Must not be whitespace-only. |
 | `content_type` | string[] | Yes | — | Categories from upstream `/scrape` or `/document-parse`. |
 | `language` | string | No | `"de"` | ISO 639-1 code. |
-| `state_or_province` | string[] | No | `null` | Explicit province override (German or English lowercase). |
+| `state_or_province` | string[] | No | `null` | Override for stored `metadata.state_or_province` (english lowercase). |
 | `entities` | object | No | `null` | Structured entities from upstream scrape/parse. |
 | `metadata` | object | Yes | — | Same shape as `/online/ingest` metadata. At least one of `assistant_id` / `municipality_id` required. |
-| `chunking` | object | No | `null` | Override chunking strategy / max size / overlap. |
+| `chunking` | object | No | `null` | Override chunking strategy / max size / overlap. When omitted, the endpoint uses AT-specific defaults tuned for German funding pages: `max_chunk_size=1000`, `overlap=150`, `strategy="contextual"`. |
 
-No `country`, `collection_name`, `assistant_type`, or `vector_config` fields — they're fixed by the endpoint.
+No `country`, `assistant_type`, or `vector_config` fields — they're fixed by the endpoint.
 
 ### Response fields
 
 | Field | Type | Description |
 |---|---|---|
 | `source_id` | string | Echoed from the request. |
-| `chunks_created` | int | Chunks produced from the content (single count, same for every collection). |
-| `vectors_stored` | int | Total vectors upserted across every collection written. |
-| `collections_written` | string[] | German collection names that received the ingest. |
+| `chunks_created` | int | Chunks produced from the content. |
+| `vectors_stored` | int | Vectors upserted into the target collection. |
+| `collection_name` | string | Echoed from the request. |
 | `content_type` | string[] | Echoed from the request. |
-| `embedding_time_ms` | int | OpenAI embedding call duration. |
+| `embedding_time_ms` | int | TEI embedding call duration. |
 | `total_time_ms` | int | End-to-end pipeline time. |
 
 ### Error codes

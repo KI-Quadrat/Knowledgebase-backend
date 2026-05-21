@@ -9,6 +9,7 @@ __pycache__/
 .env.*
 .env.original
 !.env.example
+.gitattributes
 
 # Distribution / packaging
 .Python

@@ -67,7 +67,7 @@ def _citizen_request(**overrides):
     return base
 
 
-def _make_search_result(items=None, perm_filter=None):
+def _make_search_result(items=None, perm_filter=None, search_mode="semantic"):
     items = items or []
     perm_filter = perm_filter or PermissionFilter(
         visibility=["public", "internal"],
@@ -80,6 +80,7 @@ def _make_search_result(items=None, perm_filter=None):
         query_embedding_ms=15,
         search_ms=22,
         permission_filter=perm_filter,
+        search_mode=search_mode,
     )
 
 
@@ -91,12 +92,12 @@ def test_search_employee_success(client, mock_search):
             chunk_text="Die Förderung für Solaranlagen beträgt bis zu EUR 5.000...",
             score=0.92,
             source_path="//server/bauamt/foerderungen/solar_2025.pdf",
-            classification="funding",
+            classification=["funding"],
             entity_amounts=["EUR 5.000"],
             entity_deadlines=["2025-06-30"],
             title="Solarförderung 2025",
             municipality_id="wiener-neudorf",
-            department="bauamt",
+            department=["bauamt"],
             source_type="smb",
         ),
     ]
@@ -114,7 +115,7 @@ def test_search_employee_success(client, mock_search):
     result = data["data"]["results"][0]
     assert result["chunk_id"] == "doc_abc123_chunk_07"
     assert result["score"] == 0.92
-    assert result["classification"] == "funding"
+    assert result["content_type"] == ["funding"]
     assert "EUR 5.000" in result["entities"]["amounts"]
     assert result["metadata"]["title"] == "Solarförderung 2025"
 
@@ -134,7 +135,7 @@ def test_search_citizen_success(client, mock_search):
                 chunk_text="Öffnungszeiten: Mo-Fr 8-16 Uhr",
                 score=0.85,
                 source_path="//server/public/kontakt.txt",
-                classification="contact",
+                classification=["contact"],
                 entity_amounts=[],
                 entity_deadlines=[],
                 title="Kontaktseite",
@@ -161,7 +162,7 @@ def test_search_with_classification_filter(client, mock_search):
     mock_search.search.return_value = _make_search_result()
 
     response = client.post("/api/v1/search", json=_employee_request(
-        filters={"classification": ["funding", "policy"]},
+        filters={"content_type": ["funding", "policy"]},
     ))
     data = response.json()
     assert data["success"] is True
