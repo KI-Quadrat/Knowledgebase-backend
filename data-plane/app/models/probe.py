@@ -37,7 +37,6 @@ class ProbeProvider(str, Enum):
     deepinfra = "deepinfra"
     tei_dense = "tei_dense"
     tei_sparse = "tei_sparse"
-    crawl4ai = "crawl4ai"
 
 
 class UseCredsFrom(str, Enum):
@@ -59,7 +58,6 @@ class UseCredsFrom(str, Enum):
     deepinfra = "deepinfra"
     tei_dense = "tei_dense"
     tei_sparse = "tei_sparse"
-    crawl4ai = "crawl4ai"
 
 
 class ProbeProviderRequest(BaseModel):

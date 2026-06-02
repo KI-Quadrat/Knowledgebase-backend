@@ -9,7 +9,7 @@ Covers the parsers we added on top of provider responses:
 import pytest
 
 from app.models.common import StageUsage, UsageSummary
-from app.services.scraping.crawl4ai_client import (
+from app.services.scraping.scraper_client import (
     _extract_firecrawl_credits,
     _extract_jina_tokens,
 )

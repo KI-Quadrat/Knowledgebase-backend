@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.models.common import ACL
 
@@ -7,8 +7,18 @@ class LocalChunkingConfig(BaseModel):
     """Configuration for text chunking during ingestion."""
 
     strategy: str = Field("late_chunking", description="Chunking strategy: 'late_chunking' (paragraph-aware, default), 'sentence' (sentence boundaries), or 'fixed' (character count)")
-    max_chunk_size: int = Field(512, ge=64, le=4096, description="Maximum chunk size in characters")
-    overlap: int = Field(50, ge=0, le=512, description="Overlap between consecutive chunks in characters")
+    max_chunk_size: int = Field(1200, ge=64, le=4096, description="Maximum chunk size in characters. Values below 1200 are silently clamped to 1200.")
+    overlap: int = Field(150, ge=0, le=512, description="Overlap between consecutive chunks in characters. Values below 150 are silently clamped to 150.")
+
+    @field_validator("max_chunk_size", mode="after")
+    @classmethod
+    def _enforce_min_chunk_size(cls, v: int) -> int:
+        return max(v, 1200)
+
+    @field_validator("overlap", mode="after")
+    @classmethod
+    def _enforce_min_overlap(cls, v: int) -> int:
+        return max(v, 150)
 
 
 class LocalIngestMetadata(BaseModel):
@@ -69,8 +79,8 @@ class LocalIngestRequest(BaseModel):
                     },
                     "chunking": {
                         "strategy": "late_chunking",
-                        "max_chunk_size": 512,
-                        "overlap": 50,
+                        "max_chunk_size": 1200,
+                        "overlap": 150,
                     },
                 }
             ]

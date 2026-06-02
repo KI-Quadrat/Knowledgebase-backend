@@ -66,8 +66,8 @@ class Chunker:
         self,
         text: str,
         strategy: str = "late_chunking",
-        max_chunk_size: int = 512,
-        overlap: int = 50,
+        max_chunk_size: int = 1200,
+        overlap: int = 150,
     ) -> ChunkResult:
         if not text or not text.strip():
             return ChunkResult(chunks=[], total_chunks=0, strategy=strategy, avg_chunk_size=0)
