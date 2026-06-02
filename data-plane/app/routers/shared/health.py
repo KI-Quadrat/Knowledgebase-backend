@@ -84,7 +84,7 @@ async def _probe_openai_chat_model() -> tuple[bool, str | None]:
 
 
 async def _probe_jina_reader(scraping_svc: object) -> tuple[bool, str | None]:
-    crawl_client = getattr(scraping_svc, "crawl4ai", None)
+    crawl_client = getattr(scraping_svc, "scraper_client", None)
     http_client = getattr(crawl_client, "_client", None)
     jina_key = getattr(crawl_client, "_jina_key", "")
     jina_url = getattr(crawl_client, "_jina_url", "")
@@ -145,10 +145,10 @@ async def ready(request: Request) -> ReadyResponse:
 
     services = ServiceStatus()
 
-    # Crawl4AI
+    # Scraper client (Jina / Firecrawl / httpx)
     scraping_svc = getattr(request.app.state, "scraping", None)
     if scraping_svc:
-        services.crawl4ai = getattr(scraping_svc, "is_ready", False)
+        services.scraper = getattr(scraping_svc, "is_ready", False)
 
     # Qdrant
     qdrant = getattr(request.app.state, "qdrant", None)
@@ -215,7 +215,7 @@ async def ready(request: Request) -> ReadyResponse:
             services.redis = False
 
     all_ready = all([
-        services.crawl4ai,
+        services.scraper,
         services.qdrant,
         services.bge_m3,
         services.parser,
@@ -470,7 +470,7 @@ async def _probe_openai_embeddings_item() -> ModelHealthItem:
 
 async def _probe_jina_item(request: Request) -> ModelHealthItem:
     scraping_svc = getattr(request.app.state, "scraping", None)
-    crawl_client = getattr(scraping_svc, "crawl4ai", None)
+    crawl_client = getattr(scraping_svc, "scraper_client", None)
     http_client = getattr(crawl_client, "_client", None)
     jina_key = getattr(crawl_client, "_jina_key", "")
     jina_url = getattr(crawl_client, "_jina_url", "")
@@ -756,19 +756,6 @@ async def _probe_state_service(
     )
 
 
-async def _probe_crawl4ai_item(request: Request) -> ModelHealthItem:
-    scraping_svc = getattr(request.app.state, "scraping", None)
-    crawl4ai_client = getattr(scraping_svc, "crawl4ai", None)
-    return await _probe_state_service(
-        component="crawl4ai",
-        task="javascript-rendered web scraping",
-        provider="crawl4ai",
-        model="crawl4ai",
-        category="scraper",
-        svc=crawl4ai_client,
-    )
-
-
 async def _probe_tei_embed_at_item(request: Request) -> ModelHealthItem:
     tei = getattr(request.app.state, "tei_embedder_at", None)
     return await _probe_state_service(
@@ -938,7 +925,6 @@ async def model_health(request: Request, force: bool = False) -> ModelHealthResp
     items.append(await _probe_tei_sparse_at_item(request))
 
     # ── Scrapers / parser ────────────────────────────────────────────
-    items.append(await _probe_crawl4ai_item(request))
     items.append(await _probe_jina_item(request))
     if ext.firecrawl_api_key:
         items.append(await _probe_firecrawl_item())

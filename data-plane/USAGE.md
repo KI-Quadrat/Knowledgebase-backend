@@ -15,10 +15,9 @@ Counts come from the provider's own response, never an estimate.
 
 | Provider | Stage(s) | Field captured | Where parsed |
 |---|---|---|---|
-| **Jina Reader** | `scraper` | `meta.usage.tokens` (top level) or `data.usage.tokens` | `crawl4ai_client._extract_jina_tokens` |
-| **Firecrawl /v2/scrape** | `scraper` | `data.metadata.creditsUsed` / `creditsUsed` / `credits_used` | `crawl4ai_client._extract_firecrawl_credits` |
-| **Firecrawl /v2/map** | `links_map` | same as above; falls back to `len(visited)` when absent | `crawl4ai_client._map_with_firecrawl` |
-| **Crawl4AI** | `scraper` | none — self-hosted | hard-coded `cost_usd=0.0` |
+| **Jina Reader** | `scraper` | `meta.usage.tokens` (top level) or `data.usage.tokens` | `scraper_client._extract_jina_tokens` |
+| **Firecrawl /v2/scrape** | `scraper` | `data.metadata.creditsUsed` / `creditsUsed` / `credits_used` | `scraper_client._extract_firecrawl_credits` |
+| **Firecrawl /v2/map** | `links_map` | same as above; falls back to `len(visited)` when absent | `scraper_client._map_with_firecrawl` |
 | **Raw httpx fallback** | `scraper` | none | hard-coded `cost_usd=0.0` |
 | **OpenAI chat** (classifier, contextual, funding) | `classifier` / `contextual` / `funding` | `usage.prompt_tokens`, `usage.completion_tokens`, `usage.prompt_tokens_details.cached_tokens` | `llm_classifier`, `contextual`, `funding_extractor` |
 | **OpenAI embeddings** | `embedding` | `usage.total_tokens` (falls back to `prompt_tokens`) | `embedding/openai_client.py` |
@@ -44,7 +43,7 @@ StageUsage(
     stage,              # "scraper" | "classifier" | "contextual" | "funding"
                         # | "embedding" | "sparse_embedding" | "inner_img"
                         # | "inner_docs" | "parse" | "links_map"
-    provider,           # "jina" | "firecrawl" | "crawl4ai" | "openai" | ...
+    provider,           # "jina" | "firecrawl" | "openai" | ...
     model,              # "gpt-4o-mini", "text-embedding-3-small", or None
     prompt_tokens,      # chat input
     completion_tokens,  # chat output
@@ -92,8 +91,8 @@ What gets included:
 
 What gets dropped:
 - Entire `by_stage` entries are dropped when `cost_usd == 0` AND all count
-  fields are zero. Self-hosted (`bge_m3`, `tei_sparse`, `crawl4ai`,
-  `httpx`) and `cache` provider entries land here. Entries with
+  fields are zero. Self-hosted (`bge_m3`, `tei_sparse`, `httpx`)
+  and `cache` provider entries land here. Entries with
   `cost_usd is None` (rate unset) are **kept** — that's the signal you're
   paying for something we can't price.
 - `total_credits` and `total_pages` are dropped when zero; `total_tokens`
@@ -175,7 +174,7 @@ cost_usd = pages × per_page
 | Value | Meaning |
 |---|---|
 | **a number** | Rate found in `pricing.yaml`; this is the computed dollar amount. |
-| **`0.0`** | Provider not present in `pricing.yaml` at all — treated as self-hosted (BGE-M3, TEI sparse, Crawl4AI, httpx, cache, Qdrant, Redis). |
+| **`0.0`** | Provider not present in `pricing.yaml` at all — treated as self-hosted (BGE-M3, TEI sparse, httpx, cache, Qdrant, Redis). |
 | **`null`** | Provider is listed but the rate field is `null` (plan-dependent). Raw count is still recorded. |
 
 The `null` case is the operator alarm — see §6.
@@ -357,7 +356,7 @@ A few rules worth internalizing:
 | Pricing table | `pricing.yaml` |
 | Cost math | `app/services/cost.py` |
 | `StageUsage`/`UsageSummary` models | `app/models/common.py` |
-| Scrape parsers | `app/services/scraping/crawl4ai_client.py` |
+| Scrape parsers | `app/services/scraping/scraper_client.py` |
 | Classifier usage | `app/services/intelligence/llm_classifier.py` |
 | Contextual usage (per-window aggregation) | `app/services/intelligence/contextual.py` |
 | Funding extractor usage | `app/services/intelligence/funding_extractor.py` |

@@ -537,7 +537,7 @@ class TestEndpoint:
 
     def test_default_chunking_uses_at_specific_constants(self):
         """When body.chunking is omitted, the router must pass the AT-specific
-        defaults (1000 / 150) to the chunker — not the global 512 / 50."""
+        defaults (1200 / 150) to the chunker — not smaller global values."""
         handles = _install()
 
         real_chunk = handles["chunker"].chunk
@@ -553,12 +553,12 @@ class TestEndpoint:
             r = c.post("/api/v1/online/ingest/at", json=BASE_PAYLOAD)
 
         assert r.status_code == 200, r.text
-        assert captured.get("max_chunk_size") == _AT_DEFAULT_CHUNK_SIZE == 1000
+        assert captured.get("max_chunk_size") == _AT_DEFAULT_CHUNK_SIZE == 1200
         assert captured.get("overlap") == _AT_DEFAULT_CHUNK_OVERLAP == 150
         assert captured.get("strategy") == "recursive"  # contextual uses recursive as base
 
-    def test_body_chunking_overrides_at_defaults(self):
-        """Explicit body.chunking still wins over the AT defaults."""
+    def test_body_chunking_is_clamped_to_at_minimums(self):
+        """Explicit body.chunking may raise the max, but values below the floor are clamped."""
         handles = _install()
 
         real_chunk = handles["chunker"].chunk
@@ -575,8 +575,8 @@ class TestEndpoint:
             r = c.post("/api/v1/online/ingest/at", json=payload)
 
         assert r.status_code == 200, r.text
-        assert captured.get("max_chunk_size") == 256
-        assert captured.get("overlap") == 32
+        assert captured.get("max_chunk_size") == 1200
+        assert captured.get("overlap") == 150
 
     def test_response_metadata_counts(self):
         _install()

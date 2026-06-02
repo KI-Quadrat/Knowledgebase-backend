@@ -30,13 +30,18 @@ class OnlineChunkingConfig(BaseModel):
     """Configuration for text chunking during ingestion."""
 
     strategy: str = Field("contextual", description="Chunking strategy: 'contextual' (recursive splitter + AI context prepended, default), 'recursive' (recursive character text splitter), 'late_chunking' (paragraph-aware), 'sentence' (sentence boundaries), or 'fixed' (character count)")
-    max_chunk_size: int = Field(1200, le=4096, description="Maximum chunk size in characters. Values below 1000 are silently clamped to 1000 (the per-chunk minimum produces too many tiny chunks otherwise and inflates the contextual-enrichment bill); the upper bound is whatever the caller provides up to 4096.")
-    overlap: int = Field(50, ge=0, le=512, description="Overlap between consecutive chunks in characters")
+    max_chunk_size: int = Field(1200, le=4096, description="Maximum chunk size in characters. Values below 1200 are silently clamped to 1200; the upper bound is whatever the caller provides up to 4096.")
+    overlap: int = Field(150, ge=0, le=512, description="Overlap between consecutive chunks in characters. Values below 150 are silently clamped to 150.")
 
     @field_validator("max_chunk_size", mode="after")
     @classmethod
     def _enforce_min_chunk_size(cls, v: int) -> int:
-        return max(v, 1000)
+        return max(v, 1200)
+
+    @field_validator("overlap", mode="after")
+    @classmethod
+    def _enforce_min_overlap(cls, v: int) -> int:
+        return max(v, 150)
 
 
 class OnlineVectorConfig(BaseModel):
@@ -133,6 +138,7 @@ class OnlineIngestRequest(BaseModel):
                     },
                     "vector_config": {
                         "search_mode": "semantic",
+                        "enable_fallback": True,
                     },
                 }
             ]

@@ -30,7 +30,7 @@ class StageUsage(BaseModel):
     """
 
     stage: str = Field(..., description="Pipeline stage: 'scraper', 'classifier', 'contextual', 'funding', 'embedding', 'inner_docs', 'inner_img', 'links_map'")
-    provider: str = Field(..., description="Billing provider: 'jina', 'firecrawl', 'crawl4ai', 'httpx', 'openai', 'bge_m3', 'tei_sparse', 'llamaparse', or any OpenAI-compatible provider name from llm_router")
+    provider: str = Field(..., description="Billing provider: 'jina', 'firecrawl', 'httpx', 'openai', 'bge_m3', 'tei_sparse', 'llamaparse', or any OpenAI-compatible provider name from llm_router")
     model: str | None = Field(None, description="Model identifier (e.g. 'gpt-4o-mini', 'text-embedding-3-small'). Null for non-LLM providers.")
     prompt_tokens: int = Field(0, description="Chat prompt tokens — OpenAI chat calls.")
     completion_tokens: int = Field(0, description="Chat completion tokens — OpenAI chat calls.")
@@ -45,7 +45,7 @@ class StageUsage(BaseModel):
     def _slim_dump(self, handler):
         """Drop zero-valued count fields when serializing.
 
-        Self-hosted stages (BGE-M3, TEI sparse, Crawl4AI) have every count
+        Self-hosted stages (BGE-M3, TEI sparse, raw httpx) have every count
         field at zero — rendering them all bloats responses without adding
         information. The Python object keeps the full field set so summing
         / aggregation still works; only the JSON / dict output is slim.

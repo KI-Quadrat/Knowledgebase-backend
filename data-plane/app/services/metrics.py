@@ -34,17 +34,6 @@ SCRAPER_RATE_LIMIT_WAITS_TOTAL = Counter(
     ["domain"],
 )
 
-CRAWL4AI_REQUESTS_TOTAL = Counter(
-    "dp_crawl4ai_requests_total",
-    "Total requests sent to Crawl4AI",
-    ["status"],
-)
-
-CRAWL4AI_REQUEST_DURATION_SECONDS = Histogram(
-    "dp_crawl4ai_request_duration_seconds",
-    "Crawl4AI request duration in seconds",
-)
-
 # ── Parse metrics ─────────────────────────────────────
 PARSE_REQUESTS_TOTAL = Counter(
     "dp_parse_requests_total",
@@ -139,11 +128,6 @@ def mark_cache_miss() -> None:
 
 def mark_rate_limit_wait(domain: str) -> None:
     SCRAPER_RATE_LIMIT_WAITS_TOTAL.labels(domain=domain or "unknown").inc()
-
-
-def mark_crawl4ai(status: str, duration_seconds: float) -> None:
-    CRAWL4AI_REQUESTS_TOTAL.labels(status=status).inc()
-    CRAWL4AI_REQUEST_DURATION_SECONDS.observe(max(duration_seconds, 0.0))
 
 
 def render_metrics() -> tuple[bytes, str]:

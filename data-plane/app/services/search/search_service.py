@@ -133,6 +133,10 @@ class SearchService:
             dense_vector_name = "dense_openai"
 
         embed_start = time.monotonic()
+        use_fallback = enable_fallback and self._fallback_embedder is not None
+        dense_vector_name = "dense_openai"
+        embedding = None
+
         try:
             embedding = await dense_embedder.embed(query)
         except EmbeddingError as e:

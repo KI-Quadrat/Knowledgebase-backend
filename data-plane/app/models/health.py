@@ -58,7 +58,7 @@ class ServiceStatus(BaseModel):
     tei_embedder_at: bool = Field(False, description="Configured TEI BGE-M3 embedding endpoint reachable")
     sparse_embedder: bool = Field(False, description="Configured TEI sparse embedding endpoint reachable")
     parser: bool = Field(False, description="Document parser available (LlamaParse or Unstructured)")
-    crawl4ai: bool = Field(False, description="Crawl4AI web scraping service available")
+    scraper: bool = Field(False, description="Scraper client initialized (Jina / Firecrawl / httpx backends)")
     ldap: bool = Field(False, description="LDAP/Active Directory server reachable")
     redis: bool = Field(False, description="Redis cache reachable")
 
@@ -121,7 +121,7 @@ class ReadyResponse(BaseModel):
                         "tei_embedder_at": True,
                         "sparse_embedder": True,
                         "parser": True,
-                        "crawl4ai": True,
+                        "scraper": True,
                         "ldap": True,
                         "redis": True,
                     },

@@ -18,7 +18,7 @@ from app.services.parsing.models import (
     ParseStatus,
 )
 from app.routers.online.scrape import _is_thin_output
-from app.services.scraping.crawl4ai_client import _extract_jina_images, _extract_jina_links
+from app.services.scraping.scraper_client import _extract_jina_images, _extract_jina_links
 from app.services.scraping.scraper_service import (
     DiscoveredDocument,
     PageMetadata,

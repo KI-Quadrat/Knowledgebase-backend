@@ -25,6 +25,7 @@ from app.routers.shared import classify, collections, health, metrics, probe, se
 from app.services.discovery.discovery_service import DiscoveryService
 from app.services.discovery.r2_client import R2Client
 from app.services.discovery.smb_client import SMBClient
+from app.services.embedding.bge_gemma2_client import BGEGemma2Client
 from app.services.embedding.bge_m3_client import BGEM3Client
 from app.services.embedding.openai_client import OpenAIEmbedClient
 from app.services.embedding.tei_client_at import TEIEmbedClientAT
@@ -284,6 +285,16 @@ tags_metadata = [
         "nine AT province collections (`Burgenland`, `Kärnten`, `Niederösterreich`, `Oberösterreich`, "
         "`Salzburg`, `Steiermark`, `Tirol`, `Vorarlberg`, `Wien`).\n\n"
         "**Optional X-API-Key header** when API-key auth is configured.",
+    },
+    {
+        "name": "Online - Ingestion Pipeline (AT)",
+        "description": "Dedicated ingest for the Austrian funding assistant (`POST /api/v1/online/ingest/at`). "
+        "Runs against a separate Qdrant instance (configured via `QDRANT_URL_AT` / `QDRANT_PORT_AT` / `QDRANT_API_KEY_AT`) "
+        "with per-province collections: `Burgenland`, `Kärnten`, `Niederösterreich`, `Oberösterreich`, "
+        "`Salzburg`, `Steiermark`, `Tirol`, `Vorarlberg`, `Wien`.\n\n"
+        "Country (AT) and assistant type (funding) are implicit. The funding extractor's "
+        "`state_or_province` output selects target collections; an empty list fans out to all nine. "
+        "Callers can override by supplying `state_or_province` (German or English lowercase forms).",
     },
     {
         "name": "Content Intelligence",
