@@ -3,7 +3,7 @@
 Capacity ceilings for the **online endpoints** (`/api/v1/online/*`), end-to-end
 scrape → parse → classify → ingest. Numbers are derived from the code as it
 stands, not measured. Anything that depends on an external provider's tier
-(OpenAI quota, TEI server hardware, Crawl4AI host) is marked with a caveat.
+(OpenAI quota, TEI server hardware, Jina/Firecrawl plans) is marked with a caveat.
 
 All file:line references are relative to `data-plane/`.
 
@@ -64,9 +64,8 @@ fallback. The active per-request backend is chosen by the request body's
 | Component | Concurrency in our code | External cap | File:line |
 |---|---|---|---|
 | **Per-domain rate limit** | sliding window, Redis-backed, 10 req / 60 s | — | `rate_limiter.py:27-28`; `config.py:101-102` |
-| **Jina Reader (default)** | no in-process semaphore | depends on your Jina plan — see 3.1.1 | `config.py:60-61` |
-| **Crawl4AI (`/md`)** | no in-process semaphore | depends on your Crawl4AI host's CPU/Chromium pool | `config.py:55-57` |
-| **Firecrawl (`/v2/scrape`)** | no in-process semaphore | depends on your Firecrawl plan — see 3.1.1 | `config.py:71-74` |
+| **Jina Reader (default)** | no in-process semaphore | depends on your Jina plan — see 3.1.1 | `config.py` |
+| **Firecrawl (`/v2/scrape`)** | no in-process semaphore | depends on your Firecrawl plan — see 3.1.1 | `config.py` |
 | **Raw httpx (fallback)** | no semaphore | target site's own limits | `scrape.py:379-399` |
 | **Scrape cache (Redis)** | — | cache hit returns before rate limiter | `config.py:23`; `scraper_service.py:240-252` |
 
@@ -111,19 +110,12 @@ limits batch jobs. `/batch/scrape` accepts many URLs per request (no
 published hard cap); we don't expose a batch endpoint in our router
 today, but the Firecrawl client method exists if added.
 
-**Crawl4AI** — self-hosted in this codebase (`crawl4ai:11235`). No
-provider RPM; limits are whatever Chromium pool size + CPU/RAM your
-deployment can sustain. `POST /md` is single-URL; `POST /crawl` accepts
-a `urls` array (we currently always send one root URL — see
-`crawl4ai_client.py:345-356`).
-
 **Practical aggregate ceiling** (above the 10-RPM-per-origin floor):
 
 | Backend | Aggregate scrape cap (default tier assumptions) |
 |---|---|
 | Jina Paid (default) | min(500 RPM, 50 concurrent in-flight) |
 | Firecrawl Standard | 500 RPM for `/scrape`; 50 RPM if you switch to `/batch/scrape` |
-| Crawl4AI self-host | whatever your Chromium concurrency permits |
 
 ### 3.2 Document parsing
 

@@ -23,11 +23,11 @@ http://localhost:8000/api/v1
 
 ### 1. Online Mode — Knowledgebase from Web Content
 Update the knowledgebase using online URLs and cloud services.
-- Scrape web pages via the Jina Reader API (default) or the Crawl4AI `POST /md` endpoint — selectable per request
+- Scrape web pages via the Jina Reader API (default) or Firecrawl `POST /v2/scrape` — selectable per request
 - Parse documents from any public URL — uses LlamaParse (cloud)
 - All online endpoints live under `/api/v1/online/`
 - **AT funding assistant** has a dedicated endpoint — `POST /api/v1/online/ingest/at` — that writes to a separate Qdrant instance (`QDRANT_URL_AT` + `QDRANT_PORT_AT` + `QDRANT_API_KEY_AT`) using a caller-supplied single collection. Dense embeddings come from a self-hosted TEI server (`TEI_EMBED_URL_AT`) at 1024 dim. See the endpoint docs below.
-- Requires: `JINA_API_KEY` (default scraper), `LLAMA_CLOUD_API_KEY`, `OPENAI_API_KEY`; `CRAWL4AI_URL` + `CRAWL4AI_API_TOKEN` for the Crawl4AI fallback path; `QDRANT_URL_AT` / `QDRANT_PORT_AT` (optional — leave unset when the port is embedded in `QDRANT_URL_AT`) / `QDRANT_API_KEY_AT` / `TEI_EMBED_URL_AT` / `TEI_EMBED_API_KEY_AT` for the AT pipeline
+- Requires: `JINA_API_KEY` (default scraper), `LLAMA_CLOUD_API_KEY`, `OPENAI_API_KEY`; `FIRECRAWL_API_KEY` for the Firecrawl fallback path; `QDRANT_URL_AT` / `QDRANT_PORT_AT` (optional — leave unset when the port is embedded in `QDRANT_URL_AT`) / `QDRANT_API_KEY_AT` / `TEI_EMBED_URL_AT` / `TEI_EMBED_API_KEY_AT` for the AT pipeline
 
 ### 2. Local Mode — Fully Offline Document Processing
 Process documents entirely locally without any third-party APIs.
@@ -135,7 +135,7 @@ Readiness check. Returns minimal response without auth, full response with HMAC 
     "openai_embedder": true,
     "bge_gemma2": true,
     "parser": true,
-    "crawl4ai": true,
+    "scraper": true,
     "ldap": false,
     "redis": true
   },
@@ -147,7 +147,7 @@ Readiness check. Returns minimal response without auth, full response with HMAC 
 }
 ```
 
-Core services required for `ready: true`: **qdrant**, **bge_m3**, **parser**, **crawl4ai**. The **openai_embedder** and **bge_gemma2** statuses are informational — at least one must be healthy for online ingest/search to work.
+Core services required for `ready: true`: **qdrant**, **bge_m3**, **parser**, **scraper**. The **openai_embedder** and **bge_gemma2** statuses are informational — at least one must be healthy for online ingest/search to work.
 
 ---
 
@@ -495,7 +495,7 @@ curl -X GET "https://your-domain/api/v1/online/available_collections" \
 
 ## `POST /api/v1/online/scrape`
 
-Scrape a single webpage using the **Jina Reader API** (default) or the **Crawl4AI `POST /md`** endpoint.
+Scrape a single webpage using the **Jina Reader API** (default) or **Firecrawl `POST /v2/scrape`**.
 Backend is selectable per request via the `scraper` field. Results are cached in Redis.
 
 **Request:**
@@ -515,11 +515,11 @@ curl -X POST "https://your-domain/api/v1/online/scrape" \
 }
 ```
 
-**Request body (force the Crawl4AI `/md` backend):**
+**Request body (force the Firecrawl backend):**
 ```json
 {
   "url": "https://www.wiener-neudorf.gv.at/foerderungen",
-  "scraper": "crawl4ai"
+  "scraper": "firecrawl"
 }
 ```
 
@@ -528,8 +528,8 @@ curl -X POST "https://your-domain/api/v1/online/scrape" \
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `url` | string | Yes | — | Full URL to scrape (must start with `http://` or `https://`) |
-| `scraper` | string | No | `jina` | Preferred backend: `jina` (Jina Reader, default) or `crawl4ai` (Crawl4AI `POST /md`). The non-selected backend (and raw httpx) remain as automatic fallbacks if the primary fails. |
-| `markdown_type` | string | No | `fit` | `fit` (main content only), `raw` (full page), or `citations` (currently degrades to `raw` — Crawl4AI `/md` does not expose a citations filter) |
+| `scraper` | string | No | `jina` | Preferred backend: `jina` (Jina Reader, default) or `firecrawl` (Firecrawl `POST /v2/scrape`). The non-selected backend (and raw httpx) remain as automatic fallbacks if the primary fails. (`crawl4ai` is accepted as a deprecated alias for `jina`.) |
+| `markdown_type` | string | No | `fit` | `fit` (main content only), `raw` (full page), or `citations` (currently degrades to `raw` — no backend exposes a dedicated citations filter) |
 | `exclude_tags` | string[] | No | `null` | CSS selectors / tag names to drop before extraction |
 | `css_selector` | string | No | `null` | CSS selector to scope extraction to a specific element |
 | `inner_img` | bool | No | `false` | Extract and OCR-parse images linked on the page |
@@ -682,10 +682,10 @@ curl -X POST "https://your-domain/api/v1/online/crawl" \
 ```
 
 `scraper_used` reports the backend that produced the BFS discovery:
-- `"crawl4ai"` — server-side BFS via Crawl4AI's `/crawl` endpoint
+- `"firecrawl"` — single-shot URL map via Firecrawl's `/v2/map`
 - `"jina"` — per-URL Chromium fan-out
-- `"httpx"` — raw HTTP fetches (default; also reported when a `crawl4ai`
-  request falls back to the Python BFS after the deep-crawl call fails)
+- `"httpx"` — raw HTTP fetches (default; also reported when a `firecrawl`
+  request falls back to the Python BFS after the map call fails)
 
 Falls back to the requested `scraper` value when every BFS hit was a legacy
 cache entry without a recorded backend. `null` for `method="sitemap"` (no
@@ -709,7 +709,7 @@ scraping involved) or when no pages were discovered at all.
 | `method` | string | Yes | — | `sitemap` or `crawl` |
 | `max_depth` | int | No | 3 | Max link-following depth (1-5) |
 | `max_urls` | int | No | 500 | Max URLs to return (1-5000) |
-| `scraper` | string | No | `httpx` | Backend during BFS discovery. `httpx` (default) — raw HTTP fetches, fast and free. `crawl4ai` — server-side BFS via Crawl4AI's `POST /crawl` with `BFSDeepCrawlStrategy` (one round trip; falls back to httpx BFS on failure). `jina` — per-URL Chromium fan-out, expensive (one Jina call per URL); only pick when the link graph is JS-injected. Ignored when `method="sitemap"`. |
+| `scraper` | string | No | `httpx` | Backend during BFS discovery. `httpx` (default) — raw HTTP fetches, fast and free. `firecrawl` — single-shot URL map via Firecrawl's `POST /v2/map` (one round trip; falls back to httpx BFS on failure). `jina` — per-URL Chromium fan-out, expensive (one Jina call per URL); only pick when the link graph is JS-injected. (`crawl4ai` is accepted as a deprecated alias for `httpx`.) Ignored when `method="sitemap"`. |
 
 ### Error codes
 `VALIDATION_URL_INVALID`, `CRAWL_SITEMAP_NOT_FOUND`
@@ -1920,7 +1920,7 @@ curl -X PUT "https://your-domain/api/v1/local/vectors/update-acl" \
 
 | Method | Endpoint | Purpose | Auth |
 |--------|----------|---------|------|
-| POST | `/api/v1/online/scrape` | Scrape webpage (Jina default; Crawl4AI `/md` fallback) | HMAC + API Key |
+| POST | `/api/v1/online/scrape` | Scrape webpage (Jina default; Firecrawl fallback) | HMAC + API Key |
 | POST | `/api/v1/online/crawl` | Discover URLs from site/sitemap | HMAC + API Key |
 | POST | `/api/v1/online/document-parse` | Parse document from URL | HMAC + API Key |
 | POST | `/api/v1/online/document-parse/upload` | Parse uploaded file | HMAC + API Key |

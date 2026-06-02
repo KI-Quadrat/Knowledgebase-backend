@@ -1,5 +1,5 @@
 """
-POST /api/v1/online/scrape — Scrape a single webpage (Crawl4AI or Jina Reader)
+POST /api/v1/online/scrape — Scrape a single webpage (Jina Reader / Firecrawl / httpx)
 POST /api/v1/online/crawl  — Discover URLs from site/sitemap
 """
 
@@ -48,10 +48,10 @@ def _validate_url(url: str) -> str | None:
     return None
 
 
-# Thin-output detection: tuned for the pattern where Crawl4AI's
-# PruningContentFilter aggressively removes tabular/label-value content (e.g.
-# Austrian government portals). When BOTH thresholds trip we re-scrape in
-# `raw` mode to recover the payload (see ``_is_thin_output`` for the AND).
+# Thin-output detection: tuned for the pattern where fit-mode extraction
+# aggressively removes tabular/label-value content (e.g. Austrian government
+# portals). When BOTH thresholds trip we re-scrape in `raw` mode to recover
+# the payload (see ``_is_thin_output`` for the AND).
 _THIN_WORD_THRESHOLD = 20
 _THIN_RATIO_THRESHOLD = 0.005  # markdown_len / html_len
 _THIN_MIN_HTML_LEN = 1000
@@ -87,35 +87,31 @@ def _is_thin_output(markdown: str | None, html: str | None) -> bool:
     "/scrape",
     summary="Scrape a single webpage",
     description=(
-        "Scrape a webpage using the **Jina Reader API** (default) or **Crawl4AI** "
+        "Scrape a webpage using the **Jina Reader API** (default) or **Firecrawl** "
         "and return the extracted content as clean Markdown. Backend is selectable per request via "
         "the `scraper` field (default `jina`). Results are cached in Redis.\n\n"
         "---\n\n"
         "## How content extraction works\n\n"
         "The scraper processes content in multiple stages:\n\n"
         "1. **Page fetch** — Jina Reader fetches the page through its hosted Chromium engine "
-        "(`X-Engine: browser`) with images suppressed (`X-Retain-Images: none`). The Crawl4AI fallback "
-        "calls `POST /md`, which runs Crawl4AI's headless browser server-side and returns Markdown directly. "
+        "(`X-Engine: browser`) with images suppressed (`X-Retain-Images: none`). The Firecrawl fallback "
+        "calls `POST /v2/scrape`, which runs a headless browser server-side and returns Markdown (and HTML) directly. "
         "A default noise-strip list covering OneTrust, Cookiebot, Osano, Quantcast, TrustArc, Termly, Klaro, "
         "Usercentrics, Didomi, Axeptio, Sourcepoint, and common cookie-banner classes is merged into "
-        "`exclude_tags` automatically — applied on the Jina branch (via `X-Remove-Selector`) and on the "
-        "raw httpx fallback (via BeautifulSoup `decompose`). The Crawl4AI `/md` branch does not accept "
-        "selector overrides, so the merged list is ignored there.\n"
+        "`exclude_tags` automatically — applied on the Jina branch (via `X-Remove-Selector`), the Firecrawl "
+        "branch (via `excludeTags`), and the raw httpx fallback (via BeautifulSoup `decompose`).\n"
         "2. **Markdown extraction** — controlled by `markdown_type`:\n"
-        "   - `fit` (default) — Jina returns Chromium-engine markdown; Crawl4AI fallback uses `/md` `f=fit`. "
-        "On the Crawl4AI branch, if `f=fit` returns suspiciously short markdown (fewer than ~20 words — the "
-        "PruningContentFilter sometimes strips tabular/label-value pages too aggressively), the client "
-        "auto-retries once with `f=raw` and returns the richer output. This is a per-request retry inside "
-        "the Crawl4AI client and is separate from the router-level retry that fires on the httpx fallback "
+        "   - `fit` (default) — Jina returns Chromium-engine markdown; the Firecrawl fallback sets "
+        "`onlyMainContent=true`. If the fit-mode markdown looks suspiciously short relative to the raw HTML, "
+        "the router retries once in `raw` mode and returns the richer output "
         "(which compares markdown length against raw HTML).\n"
-        "   - `raw` — full page Markdown including headers/nav/footer (Jina default engine; Crawl4AI `/md` `f=raw`).\n"
-        "   - `citations` — full content with citation links preserved (best-effort: the Crawl4AI `/md` "
-        "endpoint does not expose a citations filter, so this currently degrades to `raw` on every backend).\n"
+        "   - `raw` — full page Markdown including headers/nav/footer (Jina default engine; Firecrawl `onlyMainContent=false`).\n"
+        "   - `citations` — full content with citation links preserved (best-effort: no backend exposes a "
+        "dedicated citations filter, so this currently degrades to `raw`).\n"
         "3. **Tag exclusion** — if `exclude_tags` is set, those selectors are honored on the Jina branch "
-        "(`X-Remove-Selector`) and the httpx fallback (BeautifulSoup `decompose`). The Crawl4AI `/md` "
-        "endpoint does not accept selector overrides, so per-tag exclusion is skipped on that branch.\n"
-        "4. **Scoping** — if `css_selector` is set, extraction is scoped on Jina (`X-Target-Selector`) "
-        "and httpx (pre-filter). The Crawl4AI `/md` branch ignores it (server-side defaults only).\n"
+        "(`X-Remove-Selector`), the Firecrawl branch (`excludeTags`), and the httpx fallback (BeautifulSoup `decompose`).\n"
+        "4. **Scoping** — if `css_selector` is set, extraction is scoped on Jina (`X-Target-Selector`), "
+        "Firecrawl (`includeTags`), and httpx (pre-filter).\n"
         "5. **HTML noise removal (httpx fallback only)** — additional strip list: "
         "`nav`, `header`, `footer`, `.navbar`, `.sidebar`, `.cookie-banner`, `.ad`, `script`, `style`, "
         "`[role=banner]`, `[role=navigation]`, `[role=contentinfo]`, and more.\n"
@@ -129,16 +125,17 @@ def _is_thin_output(markdown: str | None, html: str | None) -> bool:
         "| `markdown_type` | string | Optional | `fit` | `fit` = main content only. `raw` = full page. "
         "`citations` = full content with citation links (best-effort; currently degrades to `raw`). |\n"
         "| `exclude_tags` | string[] | Optional | `null` | CSS selectors / tag names to drop before extraction "
-        "(e.g. `['nav','footer','.sidebar']`). Honored on Jina + httpx; ignored by Crawl4AI `/md`. |\n"
+        "(e.g. `['nav','footer','.sidebar']`). Honored on Jina, Firecrawl, and httpx. |\n"
         "| `css_selector` | string | Optional | `null` | CSS selector to scope extraction to a specific element "
-        "(e.g. `'main'` or `'article.content'`). Honored on Jina + httpx; ignored by Crawl4AI `/md`. |\n"
+        "(e.g. `'main'` or `'article.content'`). Honored on Jina, Firecrawl, and httpx. |\n"
         "| `inner_img` | boolean | Optional | `false` | Extract and OCR-parse images found on the page "
         "(returns alt text, URL, and extracted text content via LlamaParse) |\n"
         "| `inner_docs` | boolean | Optional | `false` | Extract and parse documents (PDF, DOCX, XLSX, PPTX, etc.) "
         "linked on the page using the document parsing backend |\n"
-        "| `scraper` | string | Optional | `jina` | Preferred scraping backend: `jina` (default), "
-        "`crawl4ai`, or `firecrawl` (when configured). The other backends and raw httpx remain as "
-        "automatic fallbacks if the primary fails. The default can be overridden globally by deployment configuration. |\n"
+        "| `scraper` | string | Optional | `jina` | Preferred scraping backend: `jina` (default) "
+        "or `firecrawl` (when configured). The other backend and raw httpx remain as "
+        "automatic fallbacks if the primary fails. (`crawl4ai` is a deprecated alias for `jina`.) "
+        "The default can be overridden globally by deployment configuration. |\n"
         "| `links_summary` | boolean | Optional | `false` | If true, adds a `links_summary.urls` list "
         "to the response — deduped http/https page links extracted from the **raw** page HTML "
         "(so nav/footer links filtered by `markdown_type='fit'` aren't missed). "
@@ -170,9 +167,9 @@ def _is_thin_output(markdown: str | None, html: str | None) -> bool:
         "```json\n"
         "{ \"url\": \"https://example.com\", \"markdown_type\": \"raw\" }\n"
         "```\n\n"
-        "**Force the Crawl4AI `/md` backend as primary:**\n"
+        "**Force the Firecrawl backend as primary:**\n"
         "```json\n"
-        "{ \"url\": \"https://example.com/article\", \"scraper\": \"crawl4ai\" }\n"
+        "{ \"url\": \"https://example.com/article\", \"scraper\": \"firecrawl\" }\n"
         "```\n\n"
         "**Skip classification to reduce latency/cost:**\n"
         "```json\n"
@@ -183,10 +180,10 @@ def _is_thin_output(markdown: str | None, html: str | None) -> bool:
         "- `markdown_type: \"fit\"` (default) usually produces the cleanest content. For pages with good "
         "semantic HTML (`<main>`, `<article>`), this is all you need.\n"
         "- For sites with site-specific noise blocks, add them to `exclude_tags` "
-        "(CSS selectors — e.g. `[\".cookie-banner\", \".breadcrumb\", \"#comments\"]`). Note these are "
-        "honored on Jina and httpx but not on the Crawl4AI `/md` branch.\n"
+        "(CSS selectors — e.g. `[\".cookie-banner\", \".breadcrumb\", \"#comments\"]`). These are "
+        "honored on Jina, Firecrawl, and httpx.\n"
         "- Use `css_selector` when the page has one clear main container (e.g. `\"main\"`, `\"article.post\"`, "
-        "`\"#content\"`). Same backend caveat applies.\n"
+        "`\"#content\"`).\n"
         "- If noise still leaks through, `/online/ingest` with `chunking.strategy = \"contextual\"` helps the "
         "retrieval system suppress noisy chunks.\n\n"
         "---\n\n"
@@ -196,17 +193,17 @@ def _is_thin_output(markdown: str | None, html: str | None) -> bool:
         "stay best-effort regardless of which backend you choose.\n\n"
         "| `scraper` | Order tried |\n"
         "|---|---|\n"
-        "| `jina` (default) | Jina Reader → Crawl4AI `/md` → Raw httpx |\n"
-        "| `crawl4ai` | Crawl4AI `/md` → Jina Reader → Raw httpx |\n\n"
-        "| Field | Jina Reader | Crawl4AI `/md` | Raw httpx |\n"
+        "| `jina` (default) | Jina Reader → Firecrawl → Raw httpx |\n"
+        "| `firecrawl` | Firecrawl → Jina Reader → Raw httpx |\n\n"
+        "| Field | Jina Reader | Firecrawl | Raw httpx |\n"
         "|---|---|---|---|\n"
-        "| `markdown_type=\"fit\"` | `X-Engine: browser` + `X-Retain-Images: none` | `f=fit` filter | built-in noise strip |\n"
-        "| `markdown_type=\"raw\"` / `\"citations\"` | default engine (citations → same as raw) | `f=raw` filter | default |\n"
-        "| `exclude_tags` | header `X-Remove-Selector` | not supported (server-side defaults) | BeautifulSoup `decompose()` |\n"
-        "| `css_selector` | header `X-Target-Selector` | not supported (server-side defaults) | pre-filter in `clean_html` |\n\n"
+        "| `markdown_type=\"fit\"` | `X-Engine: browser` + `X-Retain-Images: none` | `onlyMainContent=true` | built-in noise strip |\n"
+        "| `markdown_type=\"raw\"` / `\"citations\"` | default engine (citations → same as raw) | `onlyMainContent=false` | default |\n"
+        "| `exclude_tags` | header `X-Remove-Selector` | `excludeTags` | BeautifulSoup `decompose()` |\n"
+        "| `css_selector` | header `X-Target-Selector` | `includeTags` | pre-filter in `clean_html` |\n\n"
         "Backend characteristics:\n"
         "1. **Jina Reader API** — Chromium-engine Markdown extraction (default)\n"
-        "2. **Crawl4AI `/md`** — server-side rendered Markdown\n"
+        "2. **Firecrawl `/v2/scrape`** — server-side rendered Markdown + HTML\n"
         "3. **Raw httpx** — basic HTTP fetch, HTML-to-Markdown conversion (no JavaScript)\n\n"
         "---\n\n"
         "## Supported document types (for `inner_docs`)\n\n"
@@ -261,15 +258,14 @@ async def scrape(body: ScrapeRequest, request: Request) -> ResponseEnvelope[Scra
             request_id=request_id,
         )
 
-    # Crawl4AI's PruningContentFilter (active in `fit` mode) sometimes eats
-    # pages whose main payload is short label/value pairs (government portals,
-    # tabular data). If the fit-mode markdown looks suspiciously sparse
-    # relative to the raw HTML we just fetched, re-run the scrape once in
-    # `raw` mode before any downstream enrichment / parsing. Skipped when the
-    # caller explicitly opted out of fit (raw / citations already bypass the
-    # filter) or when the HTML is missing (no reliable signal for thinness).
-    # Status is guaranteed SUCCESS here — the non-success early return above
-    # already short-circuits.
+    # Fit-mode extraction sometimes eats pages whose main payload is short
+    # label/value pairs (government portals, tabular data). If the fit-mode
+    # markdown looks suspiciously sparse relative to the raw HTML we just
+    # fetched, re-run the scrape once in `raw` mode before any downstream
+    # enrichment / parsing. Skipped when the caller explicitly opted out of fit
+    # (raw / citations already bypass the filter) or when the HTML is missing
+    # (no reliable signal for thinness). Status is guaranteed SUCCESS here —
+    # the non-success early return above already short-circuits.
     if (
         options.markdown_type == "fit"
         and _is_thin_output(result.markdown, result.html)
@@ -304,7 +300,7 @@ async def scrape(body: ScrapeRequest, request: Request) -> ResponseEnvelope[Scra
         body.url,
         content,
         html=result.html,
-        client=scraper.crawl4ai._client,
+        client=scraper.scraper_client._client,
     )
 
     # ── Parse inner images if requested ──
@@ -483,7 +479,7 @@ def _build_links_summary(
         "`scraper` field below. | Sites without sitemaps or when you want to enumerate linked documents |\n\n"
         "---\n\n"
         "## BFS backends (`method=\"crawl\"` only)\n\n"
-        "The `scraper` field controls **how** the BFS runs. All three return the same response shape — "
+        "The `scraper` field controls **how** the BFS runs. They all return the same response shape — "
         "they only differ in cost, speed, and whether JavaScript is rendered.\n\n"
         "| `scraper` | How it works | Cost / speed | When to pick it |\n"
         "|---|---|---|---|\n"
@@ -491,12 +487,6 @@ def _build_links_summary(
         "(no headless browser, no JS). Links extracted from the served HTML. | Cheapest — no third-party "
         "calls, no Chromium, ~10–100× faster than the browser backends for the same crawl. | Default. "
         "Sufficient for sites with **server-rendered nav menus** (most municipality / government portals). |\n"
-        "| `crawl4ai` | One round-trip to Crawl4AI's `POST /crawl` with `BFSDeepCrawlStrategy`. The "
-        "Crawl4AI server runs the BFS itself, and returns the visited URL set + per-page link map in "
-        "a single response. **Falls back to the Python BFS over httpx if the deep-crawl call fails** "
-        "(server unsupported, timeout, etc.) — the response then reports `scraper_used: \"httpx\"`. | "
-        "Heavier (server-side Chromium per page), but a single HTTP round-trip from the data-plane. | "
-        "Deep / large crawls where you want server-side concurrency, filter chains, or relevance pruning. |\n"
         "| `jina` | In-process Python BFS, but each URL is fetched through Jina Reader's hosted Chromium "
         "engine. **One Jina call per discovered URL.** | Most expensive — burns Jina API quota on every "
         "page and pays Chromium latency per fetch. | Niche: only when a site's nav links are JS-injected "
@@ -515,15 +505,16 @@ def _build_links_summary(
         "| `method` | string | Required | — | `sitemap` or `crawl` |\n"
         "| `max_depth` | integer | Optional | `3` | Maximum link-following depth for crawl method (1–5) |\n"
         "| `max_urls` | integer | Optional | `500` | Maximum number of URLs to return (1–5000) |\n"
-        "| `scraper` | string | Optional | `httpx` | BFS backend — `httpx` (default), `crawl4ai` "
-        "(server-side BFS), `jina` (per-URL Chromium fan-out), or `firecrawl` (single-shot `/v2/map`). "
+        "| `scraper` | string | Optional | `httpx` | BFS backend — `httpx` (default), "
+        "`jina` (per-URL Chromium fan-out), or `firecrawl` (single-shot `/v2/map`). "
+        "(`crawl4ai` is a deprecated alias for `httpx`.) "
         "See the *BFS backends* table above. Ignored when `method=\"sitemap\"`. |\n\n"
         "---\n\n"
         "## Response\n\n"
         "Returns `CrawlData` with `urls`, `total_urls`, `method_used`, and `scraper_used`. "
         "`scraper_used` reports the backend that actually produced the BFS results: `\"httpx\"`, "
-        "`\"crawl4ai\"`, `\"jina\"`, or `\"firecrawl\"`. It is `null` for `method=\"sitemap\"` "
-        "(no scraping involved). When a `crawl4ai` or `firecrawl` request falls back to the Python "
+        "`\"jina\"`, or `\"firecrawl\"`. It is `null` for `method=\"sitemap\"` "
+        "(no scraping involved). When a `firecrawl` request falls back to the Python "
         "BFS, `scraper_used` reports `\"httpx\"` — the actual backend that produced the results, "
         "not the originally requested one.\n\n"
         "---\n\n"

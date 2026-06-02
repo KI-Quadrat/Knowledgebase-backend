@@ -1,7 +1,7 @@
 """Special-case enrichment for transparenzportal.gv.at.
 
 Transparenzportal pages hide chart data inside `<div class="t-chartDataDiv hidden">`
-blocks that Crawl4AI's markdown pipeline drops (the element is hidden and contains
+blocks that the markdown pipeline drops (the element is hidden and contains
 no rendered text). We fetch the raw HTML ourselves, extract the year/value rows,
 and inject them into the scraped markdown just before the
 "Auszahlungssummen in 100.000" line that the table belongs to.
@@ -76,7 +76,7 @@ async def fetch_chart_data(
 ) -> str | None:
     """Fetch raw HTML and return chart rows as 'YYYY: X.XX' lines, or None.
 
-    Uses the provided httpx client when given (reuses the Crawl4AIClient pool);
+    Uses the provided httpx client when given (reuses the ScraperClient pool);
     otherwise creates a short-lived client.
     """
     try:
@@ -139,9 +139,9 @@ async def enrich_if_applicable(
 ) -> str:
     """Entry point: no-op unless URL is transparenzportal and chart data is present.
 
-    First tries to extract the chart div from `html` (e.g. Crawl4AI's response HTML)
+    First tries to extract the chart div from `html` (e.g. the backend's response HTML)
     to avoid an extra request. Falls back to a fresh GET when the hidden div was
-    stripped by Crawl4AI's cleaned_html pipeline or when no HTML was provided.
+    stripped by the backend's cleaning pipeline or when no HTML was provided.
     """
     if not is_transparenzportal(url):
         return markdown

@@ -109,8 +109,8 @@ def test_ingest_with_chunking_config(client, mock_ingest):
     call_kwargs = mock_ingest.ingest.call_args.kwargs
     assert call_kwargs["collection_name"] == "wiener-neudorf"
     assert call_kwargs["chunking_strategy"] == "sentence"
-    assert call_kwargs["max_chunk_size"] == 256
-    assert call_kwargs["chunk_overlap"] == 25
+    assert call_kwargs["max_chunk_size"] == 1200
+    assert call_kwargs["chunk_overlap"] == 150
 
 
 def test_ingest_empty_content(client):

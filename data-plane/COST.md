@@ -6,8 +6,8 @@ Per-URL cost surfaces for the **online ingestion path** (`POST /api/v1/online/sc
 
 All file:line references are relative to `data-plane/`. Provider list prices
 shown are as of **May 2026** and change frequently — always reconcile against
-your invoice. Self-hosted services (Qdrant, Redis, the TEI dense/sparse servers,
-the local Crawl4AI host) are **not billed externally** and are therefore
+your invoice. Self-hosted services (Qdrant, Redis, the TEI dense/sparse servers)
+are **not billed externally** and are therefore
 **excluded from the cost tables** — their cost is whatever hardware/colo
 already pays for them.
 
@@ -20,9 +20,8 @@ The defaults that ship today (post `monolith-dev` branch, commit `59bfbdd`):
 | Stage | Currently using | Notes |
 |---|---|---|
 | **Scrape (primary)** | Jina Reader (`https://eu-r-beta.jina.ai`) | `DEFAULT_SCRAPER=jina` (`config.py:70`); EU endpoint for data residency |
-| **Scrape (crawl/BFS)** | httpx | `DEFAULT_CRAWLER=httpx` (`config.py:76`); free, no JS |
-| **Scrape (fallback)** | Crawl4AI self-hosted | `crawl4ai:11235` (`config.py:64`) |
-| **Scrape (opt-in)** | Firecrawl | only when `scraper="firecrawl"` (`config.py:91-92`) |
+| **Scrape (crawl/BFS)** | httpx | `DEFAULT_CRAWLER=httpx`; free, no JS |
+| **Scrape (fallback / opt-in)** | Firecrawl | automatic fallback after Jina; also opt-in primary via `scraper="firecrawl"` |
 | **Classifier** | OpenAI **gpt-4o-mini** (`DP_CLASSIFIER_MODEL=gpt-4o-mini`) | always-on after scrape (`config.py:139`) |
 | **Chunking strategy** | `contextual` (default) | `routers/online/ingest.py` request schema |
 | **Contextual enrichment** | OpenAI **gpt-4.1-nano** (`DP_CONTEXTUAL_MODEL=gpt-4.1-nano`), batched 32 chunks/call, **strict `json_schema`** | `contextual.py:181-209`; see §5.3 |
@@ -48,18 +47,17 @@ the unit the provider bills on — multiply by your volume to estimate spend.
 
 | # | Service | Provider | Default-on? | Billing unit | Where called |
 |---|---|---|---|---|---|
-| 1 | Web scrape (primary) | **Jina Reader** | ✅ yes | per request (token-metered) | `config.py:79`; `services/scraping/jina_client.py` |
-| 2 | Web scrape (optional) | **Firecrawl** | ❌ opt-in (`scraper="firecrawl"`) | per request (plan tier) | `config.py:91-92`; `services/scraping/firecrawl_client.py` |
-| 3 | Web scrape (fallback) | Crawl4AI | ❌ self-hosted | — | `config.py:64-65` |
-| 4 | Content classifier | **OpenAI gpt-4o-mini** | ✅ yes (always runs post-scrape) | per token (in + out) | `services/intelligence/llm_classifier.py`; `routers/online/scrape.py:631-654` |
-| 5 | Contextual chunk enrich | **OpenAI gpt-4.1-nano** | ✅ yes (default `chunking.strategy="contextual"`) | per token (in + out, cached input 75% off) | `services/intelligence/contextual.py:150-209`; batch cap `config.py:148` |
-| 6 | Funding metadata extract | **OpenAI gpt-4.1-nano** | ❌ only when `assistant_type="funding"` | per token (in + out) | `services/intelligence/funding_extractor.py` |
-| 7 | Dense embedding (default) | **BGE-M3 via self-hosted TEI** | ✅ yes | self-hosted | `config.py:172`; `services/embedding/tei_client_at.py` |
-| 8 | Dense embedding (alt) | **OpenAI text-embedding-3-small** | ❌ opt-in (`embedding_model="openai"`) | per token | `services/embedding/openai_client.py:13-14`; batch cap `config.py:143` |
-| 9 | Sparse embedding (hybrid) | **TEI sparse self-hosted** | ❌ opt-in (`search_mode="hybrid"`) | self-hosted | `config.py:186`; `services/embedding/tei_sparse_client_at.py` |
-| 10 | Inner-document OCR/parse | **LlamaParse Cloud** | ❌ only when `inner_img=true` or `inner_docs=true` | per page | `config.py:95-96`; `services/parsing/parsers/llama_parser.py` |
-| 11 | Vector DB upsert | Qdrant | ✅ yes — **self-hosted** | — | `config.py:105-120` |
-| 12 | Cache + rate-limit state | Redis | ✅ yes — **self-hosted** | — | `config.py:123` |
+| 1 | Web scrape (primary) | **Jina Reader** | ✅ yes | per request (token-metered) | `config.py`; `services/scraping/scraper_client.py` |
+| 2 | Web scrape (fallback / opt-in) | **Firecrawl** | ❌ fallback after Jina; opt-in via `scraper="firecrawl"` | per request (plan tier) | `config.py`; `services/scraping/scraper_client.py` |
+| 3 | Content classifier | **OpenAI gpt-4o-mini** | ✅ yes (always runs post-scrape) | per token (in + out) | `services/intelligence/llm_classifier.py`; `routers/online/scrape.py` |
+| 4 | Contextual chunk enrich | **OpenAI gpt-4.1-nano** | ✅ yes (default `chunking.strategy="contextual"`) | per token (in + out, cached input 75% off) | `services/intelligence/contextual.py:150-209`; batch cap `config.py:148` |
+| 5 | Funding metadata extract | **OpenAI gpt-4.1-nano** | ❌ only when `assistant_type="funding"` | per token (in + out) | `services/intelligence/funding_extractor.py` |
+| 6 | Dense embedding (default) | **BGE-M3 via self-hosted TEI** | ✅ yes | self-hosted | `config.py:172`; `services/embedding/tei_client_at.py` |
+| 7 | Dense embedding (alt) | **OpenAI text-embedding-3-small** | ❌ opt-in (`embedding_model="openai"`) | per token | `services/embedding/openai_client.py:13-14`; batch cap `config.py:143` |
+| 8 | Sparse embedding (hybrid) | **TEI sparse self-hosted** | ❌ opt-in (`search_mode="hybrid"`) | self-hosted | `config.py:186`; `services/embedding/tei_sparse_client_at.py` |
+| 9 | Inner-document OCR/parse | **LlamaParse Cloud** | ❌ only when `inner_img=true` or `inner_docs=true` | per page | `config.py:95-96`; `services/parsing/parsers/llama_parser.py` |
+| 10 | Vector DB upsert | Qdrant | ✅ yes — **self-hosted** | — | `config.py:105-120` |
+| 11 | Cache + rate-limit state | Redis | ✅ yes — **self-hosted** | — | `config.py:123` |
 
 ---
 
@@ -412,12 +410,11 @@ or the §5.3 10× fallback returns.
 | Backend | Cost / page (typical) | Best for |
 |---|---|---|
 | **Jina Reader** (default) | ~$0.002–0.005 | JS-heavy pages; reliable markdown |
-| **Firecrawl** | per-plan tier | bulk discovery (`/v2/map`) |
-| **Crawl4AI** (self-hosted) | $0 | high volume + tolerant of own host load |
+| **Firecrawl** | per-plan tier | bulk discovery (`/v2/map`); automatic fallback after Jina |
 | **Raw httpx** (final fallback) | $0 | static HTML; no JS rendering needed |
 
-Setting `DP_DEFAULT_SCRAPER=crawl4ai` (or routing specific domains there)
-trades external $ for local CPU.
+Setting `DP_DEFAULT_SCRAPER=firecrawl` makes Firecrawl the primary backend;
+otherwise it is used automatically when the Jina primary fails.
 
 ---
 
@@ -512,7 +509,6 @@ changes only the scrape line — classifier (gpt-4o-mini) + contextual
 | **Firecrawl** — free tier | $0 (≤500 lifetime, then ≤1,000/mo free) | ~$0.02 | ~$0.16 | ~$0.78 | Only OpenAI stages billed |
 | **Firecrawl** — Hobby plan | ~$0.0053/page amortized ($16/mo ÷ 3k credits) | ~$0.07 | ~$0.69 | ~$3.43 | Basic scrape = 1 credit; enabling JSON+enhanced mode jumps to 9 credits/page (~$0.048/page) |
 | **Firecrawl** — Standard plan | ~$0.00083/page amortized ($83/mo ÷ 100k credits) | ~$0.02 | ~$0.24 | ~$1.20 | Most cost-effective at this volume if you also use other Firecrawl features |
-| **Crawl4AI** (self-hosted) | $0 (your host) | ~$0.02 | ~$0.16 | ~$0.78 | Only OpenAI stages billed; CPU/Chromium cost is yours |
 | **Raw httpx** (final fallback) | $0 | ~$0.02 | ~$0.16 | ~$0.78 | Static HTML only — no JS rendering |
 
 The Firecrawl plan tiers are *monthly subscriptions*, so the "amortized
@@ -555,7 +551,7 @@ mode and the total falls to ~$5.58.
 
 ## 7. What this doc deliberately omits
 
-- **Qdrant, Redis, TEI dense, TEI sparse, Crawl4AI** — self-hosted, no
+- **Qdrant, Redis, TEI dense, TEI sparse** — self-hosted, no
   external invoice. Capacity planning for these lives in `THROUGHPUT.md`.
 - **Egress / ingress bandwidth** — usually rolled into the host bill, not
   per-URL.

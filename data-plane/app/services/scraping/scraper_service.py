@@ -6,13 +6,12 @@ from urllib.parse import urljoin, urlparse
 
 from pydantic import BaseModel, Field
 
-from app.config import ext
 from app.models.common import StageUsage, UsageSummary
 from app.services.audit import AuditLogger
 from app.services.cache import ContentCache
 from app.services.metrics import mark_cache_hit, mark_cache_miss, set_active_jobs
 from app.services.rate_limiter import DomainRateLimiter
-from app.services.scraping.crawl4ai_client import Crawl4AIClient
+from app.services.scraping.scraper_client import ScraperClient
 from app.services.scraping.document_discovery import DiscoveredDoc, discover_documents, split_documents_and_links
 from app.utils.content import count_words, extract_links, extract_metadata
 from app.utils.logger import get_logger
@@ -134,12 +133,12 @@ class ScrapeResult(BaseModel):
     discovered_documents: list[DiscoveredDocument] = Field(default_factory=list)
     discovered_links: list[str] = Field(default_factory=list)
     # Image URLs reported by the backend (only populated when Jina is the
-    # active scraper — Crawl4AI / httpx leave this empty because the rendered
+    # active scraper — Firecrawl / httpx leave this empty because the rendered
     # HTML is available downstream and ``discover_images`` works there).
     discovered_images: list[str] = Field(default_factory=list)
     error: str | None = None
     duration_ms: int | None = None
-    # Backend that actually produced the result: ``crawl4ai``, ``jina``, or
+    # Backend that actually produced the result: ``jina``, ``firecrawl``, or
     # ``httpx`` (final fallback). ``None`` on failed scrapes.
     scraper_used: str | None = None
     # Per-scrape billing record (tokens for Jina, credits for Firecrawl, $0
@@ -156,51 +155,21 @@ class ScraperService:
     def __init__(self) -> None:
         self.cache = ContentCache()
         self.rate_limiter = DomainRateLimiter()
-        self.crawl4ai = Crawl4AIClient()
+        self.scraper_client = ScraperClient()
         self.audit = AuditLogger()
         self._active_jobs = 0
         self._jobs_lock = threading.Lock()
-        self._jina_domains: set[str] = {
-            d.strip().lower().lstrip(".")
-            for d in ext.jina_default_domains.split(",")
-            if d.strip()
-        }
-
-    def _route_scraper(self, url: str, requested: str) -> str:
-        """Pick the actual scraper backend for a URL.
-
-        - Caller chose ``"jina"`` (now the default) → respected.
-        - Caller explicitly opted into ``"crawl4ai"`` AND the URL's domain
-          (or any parent domain) is in ``JINA_DEFAULT_DOMAINS`` → routed back
-          to Jina (the override list flags domains where Crawl4AI is known
-          to misbehave).
-        - Otherwise → caller's value (``"crawl4ai"``).
-        """
-        if requested != "crawl4ai":
-            return requested
-        if not self._jina_domains:
-            return requested
-        domain = urlparse(url).netloc.lower()
-        if domain.startswith("www."):
-            domain = domain[4:]
-        if not domain:
-            return requested
-        if domain in self._jina_domains:
-            return "jina"
-        if any(domain.endswith("." + d) for d in self._jina_domains):
-            return "jina"
-        return requested
 
     async def startup(self) -> None:
         log.info("scraper_starting")
-        await self.crawl4ai.start()
+        await self.scraper_client.start()
         await self.cache.start()
         await self.rate_limiter.start()
         await self.audit.start()
         log.info("scraper_started")
 
     async def shutdown(self) -> None:
-        await self.crawl4ai.close()
+        await self.scraper_client.close()
         await self.cache.close()
         await self.rate_limiter.close()
         await self.audit.close()
@@ -208,7 +177,7 @@ class ScraperService:
 
     @property
     def is_ready(self) -> bool:
-        return self.crawl4ai._client is not None
+        return self.scraper_client._client is not None
 
     @property
     def active_jobs(self) -> int:
@@ -270,18 +239,9 @@ class ScraperService:
 
             await self.rate_limiter.acquire(url)
 
-            scraper_choice = self._route_scraper(url, options.scraper)
-            if scraper_choice != options.scraper:
-                log.info(
-                    "scraper_routed",
-                    url=url,
-                    requested=options.scraper,
-                    routed_to=scraper_choice,
-                )
-
             exclude_tags = _merge_cookie_selectors(options.exclude_tags)
 
-            crawl_result = await self.crawl4ai.crawl(
+            crawl_result = await self.scraper_client.crawl(
                 url,
                 js_render=options.js_render,
                 wait_for=options.wait_for,
@@ -291,7 +251,7 @@ class ScraperService:
                 exclude_tags=exclude_tags,
                 with_links_summary=options.with_links_summary,
                 inner_img=options.inner_img,
-                scraper=scraper_choice,
+                scraper=options.scraper,
             )
 
             if not crawl_result.success:
@@ -348,7 +308,7 @@ class ScraperService:
             elif options.extract_links and crawl_result.links:
                 _, discovered_links = split_documents_and_links(crawl_result.links, found_on=url)
 
-            # Backend-reported images (Jina path). Empty for crawl4ai/httpx —
+            # Backend-reported images (Jina path). Empty for firecrawl/httpx —
             # the router runs ``discover_images`` against the rendered HTML
             # for those backends, so we don't need to populate it here.
             discovered_images: list[str] = list(crawl_result.images)
@@ -430,39 +390,22 @@ class ScraperService:
         """Breadth-first URL discovery.
 
         Backend behavior by ``scraper`` value:
-        - ``crawl4ai`` — one server-side ``POST /crawl`` with
-          ``BFSDeepCrawlStrategy``. The Crawl4AI server runs the BFS itself
-          and returns the visited URL set + per-page link map in one round
-          trip. Falls back to the Python BFS over httpx if the deep-crawl
-          call fails (server unsupported, timeout, etc).
+        - ``firecrawl`` — one ``POST /v2/map`` call that returns the site's
+          URL list in a single round trip. Falls back to the Python BFS over
+          httpx if the map call fails (not configured, timeout, etc).
         - ``jina`` — Python BFS, each URL fetched via Jina's Chromium
           engine. Use only when the link graph is JS-injected.
         - ``httpx`` (**default**) — Python BFS with cheap raw HTTP fetches.
-          Sufficient for sites with server-rendered nav.
+          Sufficient for sites with server-rendered nav. The legacy
+          ``crawl4ai`` value is treated as ``httpx`` here.
 
         Returns ``(pages, documents, scraper_used, usage)``. ``scraper_used``
         prefers the first non-None backend actually reported across the
         BFS, and falls back to the caller's requested ``scraper`` when
         every result was a legacy cache entry without a recorded backend.
         ``usage`` aggregates per-page scraper usage (Python BFS path) or
-        the single API call usage (Crawl4AI deep crawl / Firecrawl map).
+        the single API call usage (Firecrawl map).
         """
-        if scraper == "crawl4ai":
-            ok, pages, docs = await self._deep_crawl_via_crawl4ai(
-                root_url,
-                max_depth=max_depth,
-                max_pages=max_pages,
-                same_domain_only=same_domain_only,
-                on_progress=on_progress,
-            )
-            if ok:
-                # Crawl4AI is self-hosted — single zero-cost entry.
-                usage = UsageSummary.from_entries([
-                    StageUsage(stage="scraper", provider="crawl4ai", cost_usd=0.0)
-                ])
-                return pages, docs, "crawl4ai", usage
-            log.info("deep_crawl_falling_back_to_python_bfs", url=root_url)
-
         if scraper == "firecrawl":
             ok, pages, docs, fc_usage = await self._deep_crawl_via_firecrawl(
                 root_url,
@@ -484,54 +427,6 @@ class ScraperService:
             scraper="httpx" if scraper in {"crawl4ai", "firecrawl"} else scraper,
         )
 
-    async def _deep_crawl_via_crawl4ai(
-        self,
-        root_url: str,
-        *,
-        max_depth: int,
-        max_pages: int,
-        same_domain_only: bool,
-        on_progress: Callable[[int, int, str], None] | None,
-    ) -> tuple[bool, list[str], list[DiscoveredDocument]]:
-        """Server-side BFS via ``Crawl4AIClient.deep_crawl``."""
-        ok, visited, links, error = await self.crawl4ai.deep_crawl(
-            root_url,
-            max_depth=max_depth,
-            max_pages=max_pages,
-            same_domain_only=same_domain_only,
-        )
-        if not ok:
-            log.warning("deep_crawl_failed", url=root_url, error=error)
-            return False, [], []
-
-        # Resolve relative hrefs against the root, then split into docs vs
-        # pages. Client-side same-domain filter as a safety net — the server
-        # honors ``include_external`` but builds vary; this guarantees the
-        # caller's contract regardless.
-        root_domain = urlparse(root_url).netloc.lower()
-        absolute_links: list[str] = []
-        for link in links:
-            href = link.get("href")
-            if not href:
-                continue
-            absolute = urljoin(root_url, href)
-            if same_domain_only and urlparse(absolute).netloc.lower() != root_domain:
-                continue
-            absolute_links.append(absolute)
-        raw_docs, _page_links = split_documents_and_links(absolute_links, found_on=root_url)
-        discovered_docs = [
-            DiscoveredDocument(
-                url=d.url,
-                type=d.type,
-                link_text=d.link_text,
-                found_on=d.found_on,
-            )
-            for d in raw_docs
-        ]
-        if on_progress:
-            on_progress(len(visited), max_pages, root_url)
-        return True, visited, discovered_docs
-
     async def _deep_crawl_via_firecrawl(
         self,
         root_url: str,
@@ -540,15 +435,15 @@ class ScraperService:
         same_domain_only: bool,
         on_progress: Callable[[int, int, str], None] | None,
     ) -> tuple[bool, list[str], list[DiscoveredDocument], "StageUsage | None"]:
-        """URL discovery via ``Crawl4AIClient._map_with_firecrawl``.
+        """URL discovery via ``ScraperClient._map_with_firecrawl``.
 
         Firecrawl's ``/v2/map`` endpoint is single-shot — no depth control,
         so ``max_depth`` is ignored. The flat URL list is then partitioned
         into pages and documents via ``split_documents_and_links``, matching
-        the contract of ``_deep_crawl_via_crawl4ai``. Returns the per-call
-        ``StageUsage`` so the router can surface Firecrawl credit billing.
+        the page/document contract the Python BFS path produces. Returns the
+        per-call ``StageUsage`` so the router can surface Firecrawl credit billing.
         """
-        ok, visited, links, error, usage = await self.crawl4ai._map_with_firecrawl(
+        ok, visited, links, error, usage = await self.scraper_client._map_with_firecrawl(
             root_url,
             max_pages=max_pages,
             same_domain_only=same_domain_only,
@@ -579,8 +474,8 @@ class ScraperService:
             for d in raw_docs
         ]
         # ``visited`` from the map endpoint is the combined URL set; strip
-        # the document URLs so the page list mirrors what crawl4ai's
-        # deep-crawl path returns.
+        # the document URLs so the page list mirrors what the Python BFS
+        # path returns.
         doc_urls = {d.url for d in raw_docs}
         page_only = [u for u in visited if u not in doc_urls] or page_links
         if on_progress:
