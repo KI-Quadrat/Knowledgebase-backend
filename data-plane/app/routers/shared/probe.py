@@ -79,7 +79,6 @@ _CREDS_ENV_ATTR: dict[UseCredsFrom, str] = {
     UseCredsFrom.deepinfra: "deepinfra_api_key",
     UseCredsFrom.tei_dense: "tei_embed_api_key_at",
     UseCredsFrom.tei_sparse: "sparse_embed_api_key_at",
-    UseCredsFrom.crawl4ai: "crawl4ai_api_token",
 }
 
 _MAX_ERROR_BODY_BYTES = 4096
@@ -442,27 +441,6 @@ async def _preset_tei_sparse(body: ProbeProviderRequest) -> ProbeResponse:
     )
 
 
-async def _preset_crawl4ai(body: ProbeProviderRequest) -> ProbeResponse:
-    base = ext.crawl4ai_url.rstrip("/")
-    headers: dict[str, str] = {}
-    auth_indicator: str | None = None
-    if ext.crawl4ai_api_token:
-        headers["Authorization"] = f"Bearer {ext.crawl4ai_api_token}"
-        auth_indicator = _bearer_indicator("crawl4ai_api_token")
-    return await _execute_http_probe(
-        method="GET",
-        url=base + "/health",
-        headers=headers,
-        json_body=None,
-        text_body=None,
-        timeout=10.0,
-        auth_indicator=auth_indicator,
-        provider_label="crawl4ai",
-        model=None,
-        base_url=base,
-    )
-
-
 def _not_configured(provider_label: str, detail: str) -> ProbeResponse:
     return ProbeResponse(
         status_code=None,
@@ -486,7 +464,6 @@ _PRESET_HANDLERS = {
     ProbeProvider.llamaparse: _preset_llamaparse,
     ProbeProvider.tei_dense: _preset_tei_dense,
     ProbeProvider.tei_sparse: _preset_tei_sparse,
-    ProbeProvider.crawl4ai: _preset_crawl4ai,
 }
 
 

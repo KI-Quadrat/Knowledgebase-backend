@@ -32,11 +32,11 @@ class ScrapeRequest(BaseModel):
         description=(
             "Which Markdown variant to return. "
             "`fit` = main content only (Jina Chromium browser-engine markdown by default; "
-            "Crawl4AI `/md` `f=fit` filter on the fallback path). "
+            "Firecrawl `onlyMainContent` on the fallback path). "
             "`raw` = full page including headers/nav/footer. "
             "`citations` = full content with citation links preserved (best-effort; "
-            "the current Crawl4AI `/md` endpoint does not expose a citations filter, "
-            "so this degrades to `raw` on every backend)."
+            "no backend exposes a dedicated citations filter, so this currently "
+            "degrades to `raw`)."
         ),
     )
     exclude_tags: list[str] | None = Field(
@@ -57,10 +57,11 @@ class ScrapeRequest(BaseModel):
         default_factory=_default_scraper,
         description=(
             "Preferred scraping backend (default `jina`, configurable server-side). "
-            "`jina` uses the Jina Reader API (Chromium engine). `crawl4ai` "
-            "uses the Crawl4AI `POST /md` endpoint. `firecrawl` uses "
-            "Firecrawl's `POST /v2/scrape` (when configured). The other backends "
-            "(and raw httpx) remain as automatic fallbacks if the selected one fails."
+            "`jina` uses the Jina Reader API (Chromium engine). `firecrawl` uses "
+            "Firecrawl's `POST /v2/scrape` (when configured). The other backend "
+            "(and raw httpx) remain as automatic fallbacks if the selected one fails. "
+            "`crawl4ai` is a deprecated alias retained for backward compatibility — "
+            "it now behaves exactly like `jina`."
         ),
     )
     links_summary: bool = Field(
@@ -103,7 +104,6 @@ class ScrapeRequest(BaseModel):
                     "css_selector": "main",
                 },
                 {"url": "https://www.example.gv.at/foerderungen", "inner_img": True, "inner_docs": True},
-                {"url": "https://www.example.gv.at/foerderungen", "scraper": "crawl4ai"},
                 {"url": "https://www.example.gv.at/foerderungen", "scraper": "firecrawl"},
                 {"url": "https://www.example.gv.at/foerderungen", "links_summary": True},
                 {"url": "https://www.example.gv.at/foerderungen", "classify": False},
@@ -163,7 +163,7 @@ class ScrapeData(BaseModel):
     inner_images: list[InnerImageData] | None = Field(None, description="Parsed images found on the page (only when inner_img=true)")
     inner_documents: list[InnerDocData] | None = Field(None, description="Parsed documents linked on the page (only when inner_docs=true)")
     links_summary: LinksSummary | None = Field(None, description="Deduped URL lists grouped by kind (only when links_summary=true)")
-    scraper_used: str | None = Field(None, description="Backend that produced the content: 'crawl4ai', 'jina', 'firecrawl', or 'httpx' (final fallback). Null on failure or cache hits with no recorded backend.")
+    scraper_used: str | None = Field(None, description="Backend that produced the content: 'jina', 'firecrawl', or 'httpx' (final fallback). Null on failure or cache hits with no recorded backend.")
     usage: UsageSummary | None = Field(
         None,
         description=(
@@ -171,7 +171,7 @@ class ScrapeData(BaseModel):
             "entry per external call (`scraper`, `classifier`, optional "
             "`inner_img` / `inner_docs`). For Jina the scraper entry "
             "reports ``scrape_tokens`` from ``meta.usage.tokens``; for "
-            "Firecrawl it reports ``credits``; Crawl4AI and httpx are "
+            "Firecrawl it reports ``credits``; raw httpx is "
             "self-hosted so ``cost_usd`` is 0. Cache hits report a "
             "``cache`` provider with 0 cost."
         ),
@@ -192,13 +192,13 @@ class CrawlRequest(BaseModel):
             "Default `httpx`, configurable server-side.\n"
             "- `httpx` — raw HTTP fetches, no JS rendering. Fast and free; "
             "sufficient for sites with server-rendered nav menus (most muni/gov portals).\n"
-            "- `crawl4ai` — server-side BFS via Crawl4AI. Use for deep/large crawls. "
-            "Falls back to the Python BFS over httpx if the deep-crawl call fails.\n"
             "- `jina` — per-URL Python BFS through Jina's hosted Chromium engine. "
             "Expensive — only pick this when the link graph is genuinely JS-injected and "
             "httpx misses links.\n"
             "- `firecrawl` — single-shot URL map via Firecrawl (when configured). Falls "
-            "back to the Python BFS over httpx if the map call fails."
+            "back to the Python BFS over httpx if the map call fails.\n"
+            "- `crawl4ai` — deprecated alias retained for backward compatibility; "
+            "behaves like `httpx`."
         ),
     )
 
@@ -207,7 +207,6 @@ class CrawlRequest(BaseModel):
             "examples": [
                 {"url": "https://www.example.gv.at/sitemap.xml", "method": "sitemap", "max_urls": 500},
                 {"url": "https://www.example.gv.at", "method": "crawl", "max_depth": 3, "max_urls": 100},
-                {"url": "https://www.example.gv.at", "method": "crawl", "scraper": "crawl4ai"},
                 {"url": "https://www.example.gv.at", "method": "crawl", "scraper": "jina"},
                 {"url": "https://www.example.gv.at", "method": "crawl", "scraper": "firecrawl"},
             ]
@@ -233,15 +232,14 @@ class CrawlData(BaseModel):
     scraper_used: str | None = Field(
         None,
         description=(
-            "Backend that produced the BFS discovery: 'crawl4ai' (server-side "
-            "BFS via Crawl4AI's `/crawl` endpoint), 'jina' (per-URL Chromium), "
+            "Backend that produced the BFS discovery: 'jina' (per-URL Chromium), "
             "'firecrawl' (single-shot `/v2/map`), or 'httpx' (raw HTTP — the "
-            "new default for /crawl). When the requested 'crawl4ai' or "
-            "'firecrawl' call fails, the service falls back to a Python BFS "
-            "over httpx and reports 'httpx' here. Falls back to the requested "
-            "`scraper` value when every BFS hit was a legacy cache entry "
-            "without a recorded backend. Null for `method='sitemap'` (no "
-            "scraping involved) or when no pages were discovered at all."
+            "default for /crawl). When the requested 'firecrawl' call fails, the "
+            "service falls back to a Python BFS over httpx and reports 'httpx' "
+            "here. Falls back to the requested `scraper` value when every BFS hit "
+            "was a legacy cache entry without a recorded backend. Null for "
+            "`method='sitemap'` (no scraping involved) or when no pages were "
+            "discovered at all."
         ),
     )
     usage: UsageSummary | None = Field(
@@ -249,8 +247,8 @@ class CrawlData(BaseModel):
         description=(
             "Aggregated scrape usage across the BFS. The Python BFS path "
             "sums per-page Jina tokens / Firecrawl credits / $0 entries "
-            "into a single ``scraper`` row; the Crawl4AI server-side BFS "
-            "and Firecrawl ``/v2/map`` paths report one row for the single "
-            "API call. Null for `method='sitemap'` (no scraping involved)."
+            "into a single ``scraper`` row; the Firecrawl ``/v2/map`` path "
+            "reports one row for the single API call. Null for "
+            "`method='sitemap'` (no scraping involved)."
         ),
     )

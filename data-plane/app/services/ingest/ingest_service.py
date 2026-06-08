@@ -15,6 +15,9 @@ from app.utils.logger import get_logger
 
 log = get_logger(__name__)
 
+MIN_CHUNK_SIZE = 1200
+MIN_CHUNK_OVERLAP = 150
+
 
 class IngestError(Exception):
     def __init__(self, message: str, code: str = "EMBEDDING_FAILED"):
@@ -131,12 +134,20 @@ class IngestService:
         # 1. Chunk
         use_contextual = chunking_strategy == "contextual"
         base_strategy = "recursive" if use_contextual else chunking_strategy
+        effective_chunk_size = max(
+            max_chunk_size if max_chunk_size is not None else settings.default_chunk_size,
+            MIN_CHUNK_SIZE,
+        )
+        effective_chunk_overlap = max(
+            chunk_overlap if chunk_overlap is not None else settings.default_chunk_overlap,
+            MIN_CHUNK_OVERLAP,
+        )
 
         chunk_result = self._chunker.chunk(
             text=content,
             strategy=base_strategy,
-            max_chunk_size=max_chunk_size or settings.default_chunk_size,
-            overlap=chunk_overlap if chunk_overlap is not None else settings.default_chunk_overlap,
+            max_chunk_size=effective_chunk_size,
+            overlap=effective_chunk_overlap,
         )
 
         if not chunk_result.chunks:

@@ -63,7 +63,7 @@ _AT_ASSISTANT_TYPE = "funding"
 # Contextual enrichment adds ~150–300 chars of prefix, so the final embed
 # length lands ~260 tokens — still ideal. Overlap of 150 catches single
 # facts (deadlines, amounts) that straddle paragraph breaks.
-_AT_DEFAULT_CHUNK_SIZE = 1000
+_AT_DEFAULT_CHUNK_SIZE = 1200
 _AT_DEFAULT_CHUNK_OVERLAP = 150
 
 

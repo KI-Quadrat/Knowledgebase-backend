@@ -37,8 +37,8 @@ class Settings(BaseSettings):
     max_file_size_mb: int = 50
 
     # Ingest
-    default_chunk_size: int = 512
-    default_chunk_overlap: int = 50
+    default_chunk_size: int = 1200
+    default_chunk_overlap: int = 150
 
     # Search
     default_top_k: int = 10
@@ -63,34 +63,25 @@ class ExternalSettings(BaseSettings):
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
-    # Crawl4AI
-    crawl4ai_url: str = "http://crawl4ai:11235"
-    crawl4ai_api_token: str = ""
-
     # Default scraping backend used when the request body omits ``scraper``.
-    # Must be one of ``"jina"`` or ``"crawl4ai"`` — invalid values fall back to
+    # Must be one of ``"jina"`` or ``"firecrawl"`` — invalid values fall back to
     # ``"jina"`` at the request-model layer.
     default_scraper: str = "jina"
 
     # Default crawler backend used when ``/crawl`` requests with
     # ``method="crawl"`` omit ``scraper``. Valid values: ``"httpx"``,
-    # ``"crawl4ai"``, ``"jina"``, ``"firecrawl"``. Invalid values fall back
-    # to ``"httpx"`` at the request-model layer.
+    # ``"jina"``, ``"firecrawl"``. Invalid values fall back to ``"httpx"`` at
+    # the request-model layer.
     default_crawler: str = "httpx"
 
-    # Jina Reader (now the default backend; Crawl4AI /md is the fallback).
+    # Jina Reader (the default backend; Firecrawl and raw httpx are the
+    # automatic fallbacks).
     jina_api_url: str = "https://eu-r-beta.jina.ai"
     jina_api_key: str = ""
-    # Comma-separated list of domains where requests with scraper="crawl4ai"
-    # are forced back to Jina (overrides the caller's explicit choice for
-    # known-bad domains). Subdomains match by suffix — listing "stadt-wien.at"
-    # routes both "stadt-wien.at" and "www.stadt-wien.at". Empty disables the
-    # override; the default backend (Jina) is unaffected by this list.
-    jina_default_domains: str = ""
 
-    # Firecrawl (optional third backend — opt-in via ``scraper="firecrawl"``).
-    # Point ``firecrawl_api_url`` at a self-hosted EU instance for data
-    # residency; the managed cloud has no EU region.
+    # Firecrawl (automatic fallback after Jina, and an opt-in primary via
+    # ``scraper="firecrawl"``). Point ``firecrawl_api_url`` at a self-hosted EU
+    # instance for data residency; the managed cloud has no EU region.
     firecrawl_api_url: str = "https://api.firecrawl.dev"
     firecrawl_api_key: str = ""
 

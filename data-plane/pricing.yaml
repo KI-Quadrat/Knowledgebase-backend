@@ -15,7 +15,7 @@
 # null in API responses and ClickHouse rows, while the raw token / credit /
 # page count is still recorded. Set the field to switch on cost computation.
 #
-# Self-hosted providers (crawl4ai, httpx, bge_m3, tei_sparse, qdrant, redis)
+# Self-hosted providers (httpx, bge_m3, tei_sparse, qdrant, redis)
 # are intentionally omitted; cost.py returns 0.0 for any provider absent
 # from this table.
 #
