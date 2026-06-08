@@ -11,6 +11,13 @@ from app.utils.logger import get_logger
 
 log = get_logger(__name__)
 
+DEFAULT_PAYLOAD_INDEX_FIELDS = (
+    "metadata.source_id",
+    "metadata.source_url",
+    "assistant_id",
+    "municipality_id",
+)
+
 
 class QdrantError(Exception):
     pass
@@ -231,6 +238,8 @@ class QdrantService:
             except httpx.RequestError as e:
                 raise QdrantError(f"Qdrant connection failed: {e}") from e
 
+            await self._ensure_payload_indexes(name, DEFAULT_PAYLOAD_INDEX_FIELDS)
+
             self._validated_collections.add((name, schema_signature))
             log.info("qdrant_collection_created", collection=name, vectors=list(vectors_config.keys()), sparse=sparse)
             return True
@@ -250,9 +259,9 @@ class QdrantService:
 
         Guarantees on return:
         - Collection exists with a single unnamed vector of the requested dim.
-        - Keyword payload indexes are present on ``metadata.source_id`` and
-          ``metadata.source_url`` (required for strict-mode delete-by-filter
-          used during idempotent re-ingest).
+        - Keyword payload indexes are present on default filter fields
+          (required for strict-mode delete-by-filter used during idempotent
+          re-ingest and tenant-scoped filtering).
 
         If the collection already exists with a different vector dim, raises
         :class:`QdrantError` rather than silently proceeding (the upsert would
@@ -309,28 +318,34 @@ class QdrantService:
                 except httpx.HTTPStatusError as e:
                     raise QdrantError(f"Failed to inspect AT collection '{name}': {e.response.text}") from e
 
-            # Payload indexes are idempotent on Qdrant's side; a repeat PUT on
-            # an existing index returns success without side effects.
-            for field in ("metadata.source_id", "metadata.source_url"):
-                try:
-                    idx_resp = await self._client.put(
-                        f"/collections/{name}/index",
-                        json={"field_name": field, "field_schema": "keyword"},
-                    )
-                    idx_resp.raise_for_status()
-                except httpx.HTTPStatusError as e:
-                    log.warning(
-                        "qdrant_at_index_skipped",
-                        collection=name,
-                        field=field,
-                        status=e.response.status_code,
-                        body=e.response.text,
-                    )
-                except httpx.RequestError as e:
-                    raise QdrantError(f"Qdrant connection failed: {e}") from e
+            await self._ensure_payload_indexes(name, DEFAULT_PAYLOAD_INDEX_FIELDS)
 
             self._validated_collections.add(cache_key)
             return created
+
+    async def _ensure_payload_indexes(self, collection: str, fields: tuple[str, ...]) -> None:
+        if not self._client:
+            raise QdrantError("Qdrant client not initialized")
+
+        # Payload indexes are idempotent on Qdrant's side; a repeat PUT on an
+        # existing index returns success without side effects.
+        for field in fields:
+            try:
+                idx_resp = await self._client.put(
+                    f"/collections/{collection}/index",
+                    json={"field_name": field, "field_schema": "keyword"},
+                )
+                idx_resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                log.warning(
+                    "qdrant_payload_index_skipped",
+                    collection=collection,
+                    field=field,
+                    status=e.response.status_code,
+                    body=e.response.text,
+                )
+            except httpx.RequestError as e:
+                raise QdrantError(f"Qdrant connection failed: {e}") from e
 
     @staticmethod
     def _schema_signature(vectors_config: dict, sparse: bool) -> str:
