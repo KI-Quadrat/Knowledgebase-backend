@@ -14,6 +14,8 @@ from app.utils.logger import get_logger
 
 log = get_logger(__name__)
 
+TARGET_NOT_FOUND_TITLE = "404 Target URL not found"
+
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -158,6 +160,8 @@ class ScraperClient:
                         result.scraper_used = "jina"
                         log.info("jina_scrape_success", url=url, primary=(scraper == "jina"))
                         return result
+                    if _is_target_not_found_error(result.error):
+                        return result
                     log.warning("jina_scrape_failed", url=url, error=result.error)
                 except Exception as exc:
                     log.warning("jina_scrape_error", url=url, error=str(exc))
@@ -177,6 +181,8 @@ class ScraperClient:
                     if result.success:
                         result.scraper_used = "firecrawl"
                         log.info("firecrawl_scrape_success", url=url, primary=(scraper == "firecrawl"))
+                        return result
+                    if _is_target_not_found_error(result.error):
                         return result
                     log.warning("firecrawl_scrape_failed", url=url, error=result.error)
                 except Exception as exc:
@@ -241,12 +247,17 @@ class ScraperClient:
         except httpx.TimeoutException:
             return CrawlResult(success=False, error=f"Jina timeout after {timeout}s")
         except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return _target_not_found_result("Jina HTTP 404 Not Found")
             return CrawlResult(success=False, error=f"Jina HTTP {exc.response.status_code}")
         except Exception as exc:
             return CrawlResult(success=False, error=f"Jina error: {exc}")
 
         data = resp.json()
         data_section = data.get("data", {}) if isinstance(data.get("data"), dict) else {}
+        warning = data_section.get("warning") or data.get("warning")
+        if _is_target_not_found_error(warning):
+            return _target_not_found_result(str(warning))
         content = data_section.get("content", "")
         title_value = data_section.get("title")
         title = title_value.strip() if isinstance(title_value, str) and title_value.strip() else None
@@ -323,13 +334,19 @@ class ScraperClient:
         except httpx.TimeoutException:
             return CrawlResult(success=False, error=f"Firecrawl timeout after {timeout}s")
         except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                error = _extract_response_error(exc.response) or "Firecrawl HTTP 404 Not Found"
+                return _target_not_found_result(error)
             return CrawlResult(success=False, error=f"Firecrawl HTTP {exc.response.status_code}")
         except Exception as exc:
             return CrawlResult(success=False, error=f"Firecrawl error: {exc}")
 
         data = resp.json()
         if not data.get("success", True):
-            return CrawlResult(success=False, error=str(data.get("error") or "Firecrawl returned success=false"))
+            error = str(data.get("error") or "Firecrawl returned success=false")
+            if _is_target_not_found_error(error):
+                return _target_not_found_result(error)
+            return CrawlResult(success=False, error=error)
 
         result_data = data.get("data") if isinstance(data.get("data"), dict) else {}
         markdown_value = result_data.get("markdown")
@@ -490,6 +507,8 @@ class ScraperClient:
         except httpx.TimeoutException:
             return CrawlResult(success=False, error=f"Timeout after {timeout}s")
         except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return _target_not_found_result("HTTP 404 Not Found")
             return CrawlResult(success=False, error=f"HTTP {exc.response.status_code}")
         except Exception as exc:
             return CrawlResult(success=False, error=str(exc))
@@ -580,6 +599,35 @@ def _extract_firecrawl_credits(data: dict, result_data: dict | None) -> float:
             if isinstance(value, (int, float)) and value > 0:
                 return float(value)
     return 0.0
+
+
+def _is_target_not_found_error(value: object) -> bool:
+    """True for backend signals that the target URL itself returned 404."""
+    if not isinstance(value, str):
+        return False
+    text = value.lower()
+    return (
+        "404" in text and "not found" in text
+    ) or text.strip() == "not found"
+
+
+def _target_not_found_result(detail: str) -> CrawlResult:
+    return CrawlResult(
+        title=TARGET_NOT_FOUND_TITLE,
+        success=False,
+        error=f"{TARGET_NOT_FOUND_TITLE}: {detail}",
+    )
+
+
+def _extract_response_error(response: httpx.Response) -> str | None:
+    try:
+        data = response.json()
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get("error")
+    return value if isinstance(value, str) and value.strip() else None
 
 
 def _extract_jina_links(data: dict, base_url: str) -> list[str]:

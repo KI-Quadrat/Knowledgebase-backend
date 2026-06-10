@@ -270,6 +270,7 @@ class ScraperService:
                     url=url,
                     status=ScrapeStatus.FAILED,
                     error=crawl_result.error or "Crawl failed",
+                    metadata=PageMetadata(title=crawl_result.title),
                     duration_ms=duration_ms,
                 )
 
