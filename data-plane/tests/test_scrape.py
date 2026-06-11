@@ -18,7 +18,11 @@ from app.services.parsing.models import (
     ParseStatus,
 )
 from app.routers.online.scrape import _is_thin_output
-from app.services.scraping.scraper_client import _extract_jina_images, _extract_jina_links
+from app.services.scraping.scraper_client import (
+    TARGET_NOT_FOUND_TITLE,
+    _extract_jina_images,
+    _extract_jina_links,
+)
 from app.services.scraping.scraper_service import (
     DiscoveredDocument,
     PageMetadata,
@@ -176,6 +180,25 @@ def test_scrape_failed(client, mock_scraper):
     data = response.json()
     assert data["success"] is False
     assert data["error"] == "SCRAPE_FAILED"
+
+
+def test_scrape_target_not_found_returns_title(client, mock_scraper):
+    mock_scraper.scrape_url.return_value = ScrapeResult(
+        url="https://example.gv.at/missing",
+        status=ScrapeStatus.FAILED,
+        error=TARGET_NOT_FOUND_TITLE,
+        metadata=PageMetadata(title=TARGET_NOT_FOUND_TITLE),
+    )
+
+    response = client.post("/api/v1/online/scrape", json={"url": "https://example.gv.at/missing"})
+    data = response.json()
+    assert data["success"] is False
+    assert data["error"] == "SCRAPE_FAILED"
+    assert data["detail"] == TARGET_NOT_FOUND_TITLE
+    assert data["data"]["url"] == "https://example.gv.at/missing"
+    assert data["data"]["title"] == TARGET_NOT_FOUND_TITLE
+    assert data["data"]["content"] == ""
+    assert data["data"]["content_length"] == 0
 
 
 def test_scrape_timeout(client, mock_scraper):

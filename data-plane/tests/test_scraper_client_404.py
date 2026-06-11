@@ -39,8 +39,7 @@ async def test_jina_warning_404_is_terminal_not_found():
 
     assert result.success is False
     assert result.title == TARGET_NOT_FOUND_TITLE
-    assert TARGET_NOT_FOUND_TITLE in (result.error or "")
-    assert "Target URL returned error 404: Not Found" in (result.error or "")
+    assert result.error == TARGET_NOT_FOUND_TITLE
     assert len(requests) == 1
     assert requests[0].method == "GET"
 
@@ -71,7 +70,7 @@ async def test_firecrawl_json_not_found_is_terminal_not_found():
 
     assert result.success is False
     assert result.title == TARGET_NOT_FOUND_TITLE
-    assert result.error == f"{TARGET_NOT_FOUND_TITLE}: Not Found"
+    assert result.error == TARGET_NOT_FOUND_TITLE
     assert len(requests) == 1
     assert requests[0].method == "POST"
 
@@ -91,4 +90,4 @@ async def test_httpx_404_returns_standard_not_found_failure():
 
     assert result.success is False
     assert result.title == TARGET_NOT_FOUND_TITLE
-    assert result.error == f"{TARGET_NOT_FOUND_TITLE}: HTTP 404 Not Found"
+    assert result.error == TARGET_NOT_FOUND_TITLE
