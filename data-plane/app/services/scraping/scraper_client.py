@@ -14,7 +14,7 @@ from app.utils.logger import get_logger
 
 log = get_logger(__name__)
 
-TARGET_NOT_FOUND_TITLE = "404 Target URL not found"
+TARGET_NOT_FOUND_TITLE = "404 Target URL Not Found"
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -615,7 +615,7 @@ def _target_not_found_result(detail: str) -> CrawlResult:
     return CrawlResult(
         title=TARGET_NOT_FOUND_TITLE,
         success=False,
-        error=f"{TARGET_NOT_FOUND_TITLE}: {detail}",
+        error=TARGET_NOT_FOUND_TITLE,
     )
 
 
