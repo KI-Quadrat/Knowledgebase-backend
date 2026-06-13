@@ -251,8 +251,19 @@ async def scrape(body: ScrapeRequest, request: Request) -> ResponseEnvelope[Scra
 
     if result.status != ScrapeStatus.SUCCESS:
         error_code = _map_scrape_error(result.status, result.error)
+        error_data = None
+        if result.metadata.title:
+            error_data = ScrapeData(
+                url=result.url,
+                title=result.metadata.title,
+                content="",
+                content_length=0,
+                language=result.metadata.language,
+                links_found=len(result.discovered_links),
+            )
         return ResponseEnvelope(
             success=False,
+            data=error_data,
             error=error_code,
             detail=result.error,
             request_id=request_id,
